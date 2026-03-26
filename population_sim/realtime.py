@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
+from typing import Callable
 
 import pygame
 
@@ -18,30 +19,64 @@ class VisualAgent:
     vy: float
 
 
+@dataclass
+class UISlider:
+    label: str
+    min_value: float
+    max_value: float
+    getter: Callable[[], float]
+    setter: Callable[[float], None]
+    rect: pygame.Rect
+    active: bool = False
+
+    def current(self) -> float:
+        return self.getter()
+
+    def normalized(self) -> float:
+        value = self.current()
+        if self.max_value <= self.min_value:
+            return 0.0
+        return max(0.0, min(1.0, (value - self.min_value) / (self.max_value - self.min_value)))
+
+    def set_from_x(self, x: int) -> None:
+        t = (x - self.rect.left) / max(1, self.rect.width)
+        t = max(0.0, min(1.0, t))
+        value = self.min_value + t * (self.max_value - self.min_value)
+        self.setter(value)
+
+
 class RealtimeVisualizer:
-    def __init__(self, engine: SimulationEngine, width: int = 1280, height: int = 800) -> None:
+    def __init__(self, engine: SimulationEngine, width: int = 1440, height: int = 860) -> None:
         self.engine = engine
         self.width = width
         self.height = height
+        self.panel_width = 340
         self.year = 0
         self.running = True
         self.paused = False
         self.show_labels = False
-        self.step_every_frames = 8
+        self.step_every_frames = 6
         self.frame_counter = 0
         self.rng = random.Random(engine.config.random_seed + 999)
         self.visual_state: dict[int, VisualAgent] = {}
+        self.sliders: list[UISlider] = []
+        self.dragging_slider: UISlider | None = None
 
-        self.region_colors = [(70, 70, 70), (55, 55, 80), (80, 55, 55)]
-        self.bg_color = (18, 18, 22)
-        self.grid_color = (35, 35, 40)
+        self.region_colors = [(72, 96, 70), (76, 86, 108), (106, 82, 80)]
+        self.bg_color = (140, 185, 235)
+        self.grid_color = (90, 120, 90)
+        self.ground_color = (62, 130, 72)
+        self.panel_color = (25, 27, 32)
+        self.panel_text_color = (235, 235, 238)
+        self._build_sliders()
 
     def run(self) -> None:
         pygame.init()
         screen = pygame.display.set_mode((self.width, self.height))
-        pygame.display.set_caption("Population Dynamics Realtime View")
+        pygame.display.set_caption("Population Dynamics - 2D Human Agents")
         clock = pygame.time.Clock()
         font = pygame.font.SysFont("consolas", 18)
+        small_font = pygame.font.SysFont("consolas", 15)
 
         while self.running:
             dt = clock.tick(60) / 1000.0
@@ -49,7 +84,7 @@ class RealtimeVisualizer:
             if not self.paused:
                 self._tick_simulation()
                 self._move_agents(dt)
-            self._draw(screen, font)
+            self._draw(screen, font, small_font)
             pygame.display.flip()
 
         pygame.quit()
@@ -65,32 +100,23 @@ class RealtimeVisualizer:
                     self.paused = not self.paused
                 elif event.key == pygame.K_l:
                     self.show_labels = not self.show_labels
-                elif event.key == pygame.K_UP:
-                    self.engine.config.environment.base_food_per_capita += 0.05
-                elif event.key == pygame.K_DOWN:
-                    self.engine.config.environment.base_food_per_capita = max(
-                        0.2, self.engine.config.environment.base_food_per_capita - 0.05
-                    )
-                elif event.key == pygame.K_RIGHT:
-                    self.engine.config.demographics.base_birth_rate = min(
-                        0.95, self.engine.config.demographics.base_birth_rate + 0.02
-                    )
-                elif event.key == pygame.K_LEFT:
-                    self.engine.config.demographics.base_birth_rate = max(
-                        0.01, self.engine.config.demographics.base_birth_rate - 0.02
-                    )
-                elif event.key == pygame.K_i and self.engine.config.pathogens:
-                    self.engine.config.pathogens[0].infection_rate = min(
-                        0.95, self.engine.config.pathogens[0].infection_rate + 0.02
-                    )
-                elif event.key == pygame.K_k and self.engine.config.pathogens:
-                    self.engine.config.pathogens[0].infection_rate = max(
-                        0.01, self.engine.config.pathogens[0].infection_rate - 0.02
-                    )
                 elif event.key == pygame.K_PERIOD:
                     self.step_every_frames = max(1, self.step_every_frames - 1)
                 elif event.key == pygame.K_COMMA:
                     self.step_every_frames = min(30, self.step_every_frames + 1)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for slider in self.sliders:
+                    if slider.rect.collidepoint(event.pos):
+                        slider.active = True
+                        self.dragging_slider = slider
+                        slider.set_from_x(event.pos[0])
+                        break
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if self.dragging_slider is not None:
+                    self.dragging_slider.active = False
+                self.dragging_slider = None
+            elif event.type == pygame.MOUSEMOTION and self.dragging_slider is not None:
+                self.dragging_slider.set_from_x(event.pos[0])
 
     def _tick_simulation(self) -> None:
         self.frame_counter += 1
@@ -104,14 +130,16 @@ class RealtimeVisualizer:
 
     def _region_rect(self, region_id: int) -> pygame.Rect:
         regions = max(1, self.engine.config.demographics.region_count)
-        region_width = self.width / regions
+        world_width = self.width - self.panel_width
+        region_width = world_width / regions
         x0 = int(region_id * region_width + 10)
-        return pygame.Rect(x0, 60, int(region_width - 20), self.height - 80)
+        return pygame.Rect(x0, 80, int(region_width - 20), self.height - 110)
 
     def _spawn_visual_agent(self, person_id: int, region_id: int) -> VisualAgent:
+        del person_id
         rect = self._region_rect(region_id)
-        x = self.rng.uniform(rect.left + 6, rect.right - 6)
-        y = self.rng.uniform(rect.top + 6, rect.bottom - 6)
+        x = self.rng.uniform(rect.left + 8, rect.right - 8)
+        y = self.rng.uniform(rect.top + 8, rect.bottom - 8)
         angle = self.rng.uniform(0, math.tau)
         speed = self.rng.uniform(20, 45)
         return VisualAgent(x=x, y=y, vx=math.cos(angle) * speed, vy=math.sin(angle) * speed)
@@ -135,7 +163,7 @@ class RealtimeVisualizer:
             agent.vx += self.rng.uniform(-noise, noise) * dt
             agent.vy += self.rng.uniform(-noise, noise) * dt
             speed = math.hypot(agent.vx, agent.vy)
-            max_speed = 55.0
+            max_speed = 62.0
             if speed > max_speed:
                 factor = max_speed / speed
                 agent.vx *= factor
@@ -168,7 +196,7 @@ class RealtimeVisualizer:
             return (240, 180, 60)
         return (190, 95, 35)
 
-    def _draw(self, screen: pygame.Surface, font: pygame.font.Font) -> None:
+    def _draw(self, screen: pygame.Surface, font: pygame.font.Font, small_font: pygame.font.Font) -> None:
         screen.fill(self.bg_color)
         self._draw_regions(screen)
 
@@ -194,28 +222,28 @@ class RealtimeVisualizer:
             agent = self.visual_state.get(person.person_id)
             if agent is None:
                 continue
-            radius = max(2, min(9, int(2 + person.age / 14)))
-            fill_color = self._health_color(person)
-            pygame.draw.circle(screen, fill_color, (int(agent.x), int(agent.y)), radius)
-
-            # Gender marker via border color while keeping circle shape.
-            border = (95, 165, 245) if person.gender == Gender.MALE else (230, 120, 210)
-            pygame.draw.circle(screen, border, (int(agent.x), int(agent.y)), radius, 1)
+            self._draw_human(screen, person, agent)
 
             if self.show_labels and person.person_id % 20 == 0:
                 label = f"{person.person_id}:{person.health:.2f}"
-                text = font.render(label, True, (210, 210, 220))
-                screen.blit(text, (int(agent.x) + radius + 2, int(agent.y) - radius - 2))
+                text = small_font.render(label, True, (16, 18, 22))
+                screen.blit(text, (int(agent.x) + 8, int(agent.y) - 26))
 
         self._draw_hud(screen, font, alive_people)
+        self._draw_control_panel(screen, font, small_font)
 
     def _draw_regions(self, screen: pygame.Surface) -> None:
+        world_rect = pygame.Rect(0, 0, self.width - self.panel_width, self.height)
+        pygame.draw.rect(screen, self.bg_color, world_rect)
+        ground_rect = pygame.Rect(0, 70, self.width - self.panel_width, self.height - 70)
+        pygame.draw.rect(screen, self.ground_color, ground_rect)
+
         for region_id in range(self.engine.config.demographics.region_count):
             rect = self._region_rect(region_id)
             region_color = self.region_colors[region_id % len(self.region_colors)]
             pygame.draw.rect(screen, region_color, rect, 1)
-            for x in range(rect.left, rect.right, 28):
-                pygame.draw.line(screen, self.grid_color, (x, rect.top), (x, rect.bottom), 1)
+            for x in range(rect.left, rect.right, 32):
+                pygame.draw.line(screen, self.grid_color, (x, rect.bottom - 24), (x + 16, rect.bottom), 1)
 
     def _draw_hud(self, screen: pygame.Surface, font: pygame.font.Font, alive_people: list) -> None:
         pop = len(alive_people)
@@ -227,12 +255,130 @@ class RealtimeVisualizer:
         pathogen_rate = self.engine.config.pathogens[0].infection_rate if self.engine.config.pathogens else 0.0
         lines = [
             f"Year: {self.year}/{self.engine.config.years}   Population: {pop}   Infected: {infected}   Vaccinated: {vaccinated}",
-            f"Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}",
-            "Controls: SPACE pause | UP/DOWN food | LEFT/RIGHT birth | I/K infection | ,/. speed | L labels | ESC quit",
+            f"Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}   Speed: {self.step_every_frames}",
+            "Controls: SPACE pause | mouse drag sliders | ,/. speed | L labels | ESC quit",
         ]
         y = 8
         for line in lines:
-            text = font.render(line, True, (235, 235, 240))
+            text = font.render(line, True, (20, 22, 30))
             screen.blit(text, (12, y))
             y += 22
+
+    def _draw_human(self, screen: pygame.Surface, person, agent: VisualAgent) -> None:
+        body_color = self._health_color(person)
+        accent = (35, 90, 180) if person.gender == Gender.MALE else (180, 65, 150)
+        scale = max(4, min(14, int(4 + person.age / 10)))
+        x = int(agent.x)
+        y = int(agent.y)
+
+        head_r = max(2, scale // 3)
+        head_y = y - scale
+        pygame.draw.circle(screen, body_color, (x, head_y), head_r)
+
+        torso_top = (x, head_y + head_r)
+        torso_bottom = (x, y + scale)
+        pygame.draw.line(screen, body_color, torso_top, torso_bottom, 2)
+
+        pygame.draw.line(screen, body_color, (x - scale // 2, y - scale // 4), (x + scale // 2, y - scale // 4), 2)
+        pygame.draw.line(screen, body_color, torso_bottom, (x - scale // 2, y + scale + scale // 2), 2)
+        pygame.draw.line(screen, body_color, torso_bottom, (x + scale // 2, y + scale + scale // 2), 2)
+
+        if person.gender == Gender.FEMALE:
+            skirt = [(x, y + scale // 2), (x - scale // 2, y + scale + 2), (x + scale // 2, y + scale + 2)]
+            pygame.draw.polygon(screen, accent, skirt, 1)
+        else:
+            pygame.draw.circle(screen, accent, (x, y - scale // 2), 2)
+
+    def _build_sliders(self) -> None:
+        left = self.width - self.panel_width + 24
+        top = 110
+        w = self.panel_width - 48
+        h = 14
+        gap = 64
+
+        self.sliders = [
+            UISlider(
+                label="Food supply",
+                min_value=0.2,
+                max_value=2.0,
+                getter=lambda: self.engine.config.environment.base_food_per_capita,
+                setter=lambda v: setattr(self.engine.config.environment, "base_food_per_capita", v),
+                rect=pygame.Rect(left, top + gap * 0, w, h),
+            ),
+            UISlider(
+                label="Birth rate",
+                min_value=0.01,
+                max_value=0.9,
+                getter=lambda: self.engine.config.demographics.base_birth_rate,
+                setter=lambda v: setattr(self.engine.config.demographics, "base_birth_rate", v),
+                rect=pygame.Rect(left, top + gap * 1, w, h),
+            ),
+            UISlider(
+                label="Infection rate",
+                min_value=0.01,
+                max_value=0.9,
+                getter=lambda: self.engine.config.pathogens[0].infection_rate if self.engine.config.pathogens else 0.01,
+                setter=lambda v: self._set_pathogen_value("infection_rate", v),
+                rect=pygame.Rect(left, top + gap * 2, w, h),
+            ),
+            UISlider(
+                label="Disease mortality",
+                min_value=0.001,
+                max_value=0.3,
+                getter=lambda: self.engine.config.pathogens[0].mortality_rate if self.engine.config.pathogens else 0.001,
+                setter=lambda v: self._set_pathogen_value("mortality_rate", v),
+                rect=pygame.Rect(left, top + gap * 3, w, h),
+            ),
+            UISlider(
+                label="Migration rate",
+                min_value=0.0,
+                max_value=0.2,
+                getter=lambda: self.engine.config.migration.migration_rate,
+                setter=lambda v: setattr(self.engine.config.migration, "migration_rate", v),
+                rect=pygame.Rect(left, top + gap * 4, w, h),
+            ),
+            UISlider(
+                label="Vaccination coverage",
+                min_value=0.0,
+                max_value=0.5,
+                getter=lambda: self.engine.config.vaccination.annual_coverage_fraction,
+                setter=lambda v: setattr(self.engine.config.vaccination, "annual_coverage_fraction", v),
+                rect=pygame.Rect(left, top + gap * 5, w, h),
+            ),
+        ]
+
+    def _set_pathogen_value(self, key: str, value: float) -> None:
+        if not self.engine.config.pathogens:
+            return
+        setattr(self.engine.config.pathogens[0], key, value)
+
+    def _draw_control_panel(
+        self,
+        screen: pygame.Surface,
+        font: pygame.font.Font,
+        small_font: pygame.font.Font,
+    ) -> None:
+        panel_rect = pygame.Rect(self.width - self.panel_width, 0, self.panel_width, self.height)
+        pygame.draw.rect(screen, self.panel_color, panel_rect)
+        pygame.draw.line(screen, (60, 62, 72), (panel_rect.left, 0), (panel_rect.left, self.height), 2)
+
+        title = font.render("Realtime Controls", True, self.panel_text_color)
+        screen.blit(title, (panel_rect.left + 20, 22))
+        subtitle = small_font.render("Drag sliders to tune parameters live", True, (190, 190, 198))
+        screen.blit(subtitle, (panel_rect.left + 20, 48))
+
+        for slider in self.sliders:
+            label = small_font.render(f"{slider.label}: {slider.current():.3f}", True, self.panel_text_color)
+            screen.blit(label, (slider.rect.left, slider.rect.top - 22))
+
+            pygame.draw.rect(screen, (80, 82, 92), slider.rect, border_radius=6)
+            fill_width = int(slider.rect.width * slider.normalized())
+            if fill_width > 0:
+                fill_rect = pygame.Rect(slider.rect.left, slider.rect.top, fill_width, slider.rect.height)
+                pygame.draw.rect(screen, (88, 160, 235), fill_rect, border_radius=6)
+
+            handle_x = slider.rect.left + fill_width
+            handle = pygame.Rect(handle_x - 6, slider.rect.top - 4, 12, slider.rect.height + 8)
+            color = (245, 245, 250) if slider.active else (220, 220, 230)
+            pygame.draw.rect(screen, color, handle, border_radius=4)
 

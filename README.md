@@ -47,9 +47,7 @@ python realtime_view.py
 
 Realtime controls:
 - `SPACE`: pause/resume simulation
-- `UP` / `DOWN`: increase/decrease food supply
-- `LEFT` / `RIGHT`: decrease/increase birth rate
-- `I` / `K`: increase/decrease infection rate (first pathogen)
+- Mouse drag on sliders: change parameters instantly (food, birth, infection, disease mortality, migration, vaccination)
 - `,` / `.`: slower/faster simulation stepping
 - `L`: toggle labels
 - `ESC`: quit
