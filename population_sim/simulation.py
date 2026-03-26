@@ -6,7 +6,15 @@ from collections import defaultdict
 from population_sim.config import SimulationConfig
 from population_sim.disease import MultiDiseaseModel
 from population_sim.environment import Environment
-from population_sim.models import DiseaseState, Gender, Individual, inherit_traits, random_traits
+from population_sim.models import (
+    DiseaseState,
+    Gender,
+    Individual,
+    inherit_social_profile,
+    inherit_traits,
+    random_social_profile,
+    random_traits,
+)
 from population_sim.stats import StatsTracker
 
 
@@ -22,6 +30,8 @@ class SimulationEngine:
         self.contact_graph: dict[int, list[int]] = {}
         self.current_era = "hunter-gatherer"
         self.last_step_events: dict[str, int] = {"births": 0, "deaths": 0, "new_infections": 0}
+        self.civilization_index = 0.0
+        self.cult_count = 0
         self.next_person_id = 1
         self._initialize_population()
 
@@ -31,6 +41,7 @@ class SimulationEngine:
             founders = [Gender.MALE, Gender.FEMALE]
             for gender in founders:
                 traits = random_traits(self.rng)
+                knowledge, tool_skill, spiritual, belief_group = random_social_profile(self.rng)
                 person = Individual(
                     person_id=self.next_person_id,
                     age=self.rng.randint(18, 24),
@@ -43,6 +54,10 @@ class SimulationEngine:
                     vaccinated=False,
                     disease_states={name: DiseaseState.SUSCEPTIBLE for name in pathogen_names},
                     immunity_levels={name: 0.0 for name in pathogen_names},
+                    knowledge=knowledge,
+                    tool_skill=tool_skill,
+                    spiritual_tendency=spiritual,
+                    belief_group=belief_group,
                 )
                 self.population.append(person)
                 self.next_person_id += 1
@@ -51,6 +66,7 @@ class SimulationEngine:
                 age = self.rng.randint(0, 70)
                 gender = Gender.FEMALE if self.rng.random() < 0.5 else Gender.MALE
                 traits = random_traits(self.rng)
+                knowledge, tool_skill, spiritual, belief_group = random_social_profile(self.rng)
                 person = Individual(
                     person_id=self.next_person_id,
                     age=age,
@@ -63,6 +79,10 @@ class SimulationEngine:
                     vaccinated=False,
                     disease_states={name: DiseaseState.SUSCEPTIBLE for name in pathogen_names},
                     immunity_levels={name: 0.0 for name in pathogen_names},
+                    knowledge=knowledge,
+                    tool_skill=tool_skill,
+                    spiritual_tendency=spiritual,
+                    belief_group=belief_group,
                 )
                 self.population.append(person)
                 self.next_person_id += 1
@@ -97,6 +117,7 @@ class SimulationEngine:
         self._apply_migration(alive)
         self._apply_vaccination_policy(alive, year)
         self.contact_graph = self._rewire_contact_graph(alive, self.contact_graph)
+        self._apply_social_learning(alive)
         self.disease_model.apply_transmission_from_contacts(
             alive,
             self.contact_graph,
@@ -108,7 +129,8 @@ class SimulationEngine:
 
             nutrition_delta = (food_ratio_by_region.get(person.region_id, 1.0) - 1.0) * 0.12 * era["food_effect"]
             resilience = person.genetic_traits.get("resilience", 0.5)
-            person.health = max(0.0, min(1.0, person.health + nutrition_delta * (0.8 + resilience)))
+            tech_bonus = 1.0 + (person.tool_skill * 0.25)
+            person.health = max(0.0, min(1.0, person.health + nutrition_delta * (0.8 + resilience) * tech_bonus))
 
             disease_deaths = self.disease_model.apply_progression_and_mutation(person)
             if disease_deaths:
@@ -126,6 +148,7 @@ class SimulationEngine:
 
             if person.health < 0.25:
                 natural_mortality += (0.25 - person.health) * 0.9
+            natural_mortality *= max(0.6, 1.0 - (person.knowledge * 0.18 + person.tool_skill * 0.12))
 
             if self.rng.random() < natural_mortality:
                 person.alive = False
@@ -137,6 +160,7 @@ class SimulationEngine:
 
         alive_now = [p for p in self.population if p.alive]
         self.contact_graph = self._build_contact_graph(alive_now)
+        self._update_civilization_metrics(alive_now)
         new_infections_after = self._count_any_infected()
         self.last_step_events = {
             "births": births,
@@ -189,11 +213,13 @@ class SimulationEngine:
                 stress_penalty = (food_pressure + disease_pressure) * bcfg.stress_birth_penalty_weight
                 fertility_score *= max(0.15, 1.0 - stress_penalty)
             fertility_score *= era_birth_multiplier
+            fertility_score *= 1.0 + ((mother.knowledge + father.knowledge) * 0.08)
             fertility_score = max(0.0, min(1.0, fertility_score))
             if self.rng.random() >= fertility_score:
                 continue
 
             traits = inherit_traits(mother, father, self.rng)
+            knowledge, tool_skill, spiritual, belief_group = inherit_social_profile(mother, father, self.rng)
             child = Individual(
                 person_id=self.next_person_id,
                 age=0,
@@ -206,6 +232,10 @@ class SimulationEngine:
                 vaccinated=False,
                 disease_states={name: DiseaseState.SUSCEPTIBLE for name in pathogen_names},
                 immunity_levels={name: 0.0 for name in pathogen_names},
+                knowledge=knowledge,
+                tool_skill=tool_skill,
+                spiritual_tendency=spiritual,
+                belief_group=belief_group,
             )
             self.next_person_id += 1
 
@@ -388,4 +418,33 @@ class SimulationEngine:
             "birth_multiplier": 0.92,
             "mortality_multiplier": 0.72,
         }
+
+    def _apply_social_learning(self, alive: list[Individual]) -> None:
+        if not alive:
+            return
+        id_map = {p.person_id: p for p in alive}
+        for person in alive:
+            neighbors = [id_map[n] for n in self.contact_graph.get(person.person_id, []) if n in id_map]
+            if not neighbors:
+                continue
+            teacher = max(neighbors, key=lambda n: n.knowledge + n.tool_skill)
+            person.knowledge = min(1.0, person.knowledge + 0.012 * teacher.knowledge)
+            person.tool_skill = min(1.0, person.tool_skill + 0.01 * teacher.tool_skill)
+
+            # Belief diffusion: high-spiritual groups can form stable cults/religions.
+            if self.rng.random() < 0.03 * person.spiritual_tendency:
+                person.belief_group = teacher.belief_group
+            if self.rng.random() < 0.002 and person.spiritual_tendency > 0.7:
+                person.belief_group = f"cult_{person.person_id}"
+
+    def _update_civilization_metrics(self, alive: list[Individual]) -> None:
+        if not alive:
+            self.civilization_index = 0.0
+            self.cult_count = 0
+            return
+        avg_knowledge = sum(p.knowledge for p in alive) / len(alive)
+        avg_tools = sum(p.tool_skill for p in alive) / len(alive)
+        self.civilization_index = (avg_knowledge * 0.55) + (avg_tools * 0.45)
+        cult_names = {p.belief_group for p in alive if p.belief_group.startswith("cult_")}
+        self.cult_count = len(cult_names)
 

@@ -69,6 +69,8 @@ class RealtimeVisualizer:
         self.panel_color = (25, 27, 32)
         self.panel_text_color = (235, 235, 238)
         self.recent_messages: list[tuple[str, int]] = []
+        self.terrain_seed = random.Random(engine.config.random_seed + 2026)
+        self.hills = self._build_hills()
         self._build_sliders()
 
     def run(self) -> None:
@@ -247,7 +249,9 @@ class RealtimeVisualizer:
 
     def _draw_regions(self, screen: pygame.Surface) -> None:
         world_rect = pygame.Rect(0, 0, self.width - self.panel_width, self.height)
-        pygame.draw.rect(screen, self.bg_color, world_rect)
+        self._draw_sky_gradient(screen, world_rect)
+        self._draw_sun_and_clouds(screen, world_rect)
+        self._draw_hills(screen, world_rect)
         ground_rect = pygame.Rect(0, 70, self.width - self.panel_width, self.height - 70)
         pygame.draw.rect(screen, self.ground_color, ground_rect)
 
@@ -268,7 +272,8 @@ class RealtimeVisualizer:
         pathogen_rate = self.engine.config.pathogens[0].infection_rate if self.engine.config.pathogens else 0.0
         lines = [
             f"Year: {self.year}/{self.engine.config.years}   Population: {pop}   Infected: {infected}   Vaccinated: {vaccinated}",
-            f"Era: {self.engine.current_era}   Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}",
+            f"Era: {self.engine.current_era}   CivIndex: {self.engine.civilization_index:.2f}   Cults: {self.engine.cult_count}",
+            f"Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}",
             "Controls: SPACE pause | mouse drag sliders | ,/. speed | L labels | ESC quit",
         ]
         y = 8
@@ -309,6 +314,14 @@ class RealtimeVisualizer:
             pygame.draw.polygon(screen, accent, skirt, 1)
         else:
             pygame.draw.circle(screen, accent, (x, y - scale // 2), 2)
+
+        # Strategy-game iconography for knowledge/tools/spiritual role.
+        if person.tool_skill > 0.6:
+            pygame.draw.rect(screen, (175, 175, 185), pygame.Rect(x - 1, y + scale + 3, 3, 5))
+        if person.knowledge > 0.6:
+            pygame.draw.circle(screen, (230, 230, 180), (x + scale // 2 + 2, y - scale), 2)
+        if person.spiritual_tendency > 0.75:
+            pygame.draw.circle(screen, (210, 150, 230), (x - scale // 2 - 2, y - scale), 2, 1)
 
     def _build_sliders(self) -> None:
         left = self.width - self.panel_width + 24
@@ -403,6 +416,59 @@ class RealtimeVisualizer:
             color = (245, 245, 250) if slider.active else (220, 220, 230)
             pygame.draw.rect(screen, color, handle, border_radius=4)
 
+        tips = [
+            "Icons: yellow=scholar, gray=toolmaker, purple=spiritual",
+            "Lines show social interaction links.",
+        ]
+        y = self.height - 52
+        for tip in tips:
+            t = small_font.render(tip, True, (180, 182, 190))
+            screen.blit(t, (panel_rect.left + 20, y))
+            y += 18
+
     def _push_message(self, msg: str) -> None:
         self.recent_messages.append((msg, 240))
+
+    def _build_hills(self) -> list[list[tuple[int, int]]]:
+        world_width = self.width - self.panel_width
+        layers = []
+        for layer_idx in range(3):
+            points = []
+            base_y = 230 + layer_idx * 55
+            for x in range(0, world_width + 40, 40):
+                y = base_y + self.terrain_seed.randint(-25, 25)
+                points.append((x, y))
+            points.extend([(world_width, self.height), (0, self.height)])
+            layers.append(points)
+        return layers
+
+    def _draw_sky_gradient(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
+        top = (86, 146, 230)
+        bottom = (196, 226, 255)
+        height = max(1, rect.height)
+        for i in range(height):
+            t = i / height
+            color = (
+                int(top[0] + (bottom[0] - top[0]) * t),
+                int(top[1] + (bottom[1] - top[1]) * t),
+                int(top[2] + (bottom[2] - top[2]) * t),
+            )
+            pygame.draw.line(screen, color, (rect.left, i), (rect.right, i))
+
+    def _draw_sun_and_clouds(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
+        sun_x = rect.right - 120
+        sun_y = 88
+        pygame.draw.circle(screen, (255, 232, 140), (sun_x, sun_y), 38)
+        pygame.draw.circle(screen, (255, 244, 190), (sun_x - 10, sun_y - 10), 12)
+        cloud_color = (245, 250, 255)
+        for cx, cy in [(160, 90), (320, 120), (520, 95)]:
+            pygame.draw.circle(screen, cloud_color, (cx, cy), 18)
+            pygame.draw.circle(screen, cloud_color, (cx + 20, cy - 4), 16)
+            pygame.draw.circle(screen, cloud_color, (cx + 38, cy), 14)
+
+    def _draw_hills(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
+        del rect
+        layer_colors = [(78, 128, 92), (68, 112, 82), (60, 102, 72)]
+        for color, points in zip(layer_colors, self.hills):
+            pygame.draw.polygon(screen, color, points)
 

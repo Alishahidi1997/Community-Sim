@@ -25,6 +25,11 @@ class YearStats:
     mean_fertility: float
     mean_immunity: float
     genetic_diversity: float
+    avg_knowledge: float
+    avg_tool_skill: float
+    civilization_index: float
+    belief_groups: int
+    cults: int
     region_0: int
     region_1: int
     region_2: int
@@ -63,6 +68,11 @@ class StatsTracker:
                     mean_fertility=0.0,
                     mean_immunity=0.0,
                     genetic_diversity=0.0,
+                    avg_knowledge=0.0,
+                    avg_tool_skill=0.0,
+                    civilization_index=0.0,
+                    belief_groups=0,
+                    cults=0,
                     region_0=0,
                     region_1=0,
                     region_2=0,
@@ -100,6 +110,11 @@ class StatsTracker:
             var_val = sum((v - mean_val) ** 2 for v in values) / count
             diversity_components.append(var_val)
         genetic_diversity = sum(diversity_components) / len(diversity_components)
+        avg_knowledge = sum(p.knowledge for p in alive) / count
+        avg_tool_skill = sum(p.tool_skill for p in alive) / count
+        civilization_index = (avg_knowledge * 0.55) + (avg_tool_skill * 0.45)
+        belief_groups = len({p.belief_group for p in alive})
+        cults = len({p.belief_group for p in alive if p.belief_group.startswith("cult_")})
 
         self.history.append(
             YearStats(
@@ -118,6 +133,11 @@ class StatsTracker:
                 mean_fertility=mean_fertility,
                 mean_immunity=mean_immunity,
                 genetic_diversity=genetic_diversity,
+                avg_knowledge=avg_knowledge,
+                avg_tool_skill=avg_tool_skill,
+                civilization_index=civilization_index,
+                belief_groups=belief_groups,
+                cults=cults,
                 region_0=region_0,
                 region_1=region_1,
                 region_2=region_2,
