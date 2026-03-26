@@ -104,6 +104,11 @@ def print_final_summary(stats_rows: list[dict]) -> None:
     )
     print(f"Vaccinated: {int(last['vaccinated'])}")
     print(
+        f"Emotion averages (happiness/stress/aggression): "
+        f"{last['avg_happiness']:.2f}/{last['avg_stress']:.2f}/{last['avg_aggression']:.2f}"
+    )
+    print(f"Relations (friendships/enmities): {int(last['friendships'])}/{int(last['enmities'])}")
+    print(
         f"Regional population (r0/r1/r2): "
         f"{int(last['region_0'])}/{int(last['region_1'])}/{int(last['region_2'])}"
     )

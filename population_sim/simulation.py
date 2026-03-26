@@ -10,8 +10,10 @@ from population_sim.models import (
     DiseaseState,
     Gender,
     Individual,
+    inherit_emotions,
     inherit_social_profile,
     inherit_traits,
+    random_emotional_profile,
     random_social_profile,
     random_traits,
 )
@@ -47,6 +49,8 @@ class SimulationEngine:
         self.temp_birth_penalty = 0.0
         self.temp_mortality_penalty = 0.0
         self.temp_effect_years_left = 0
+        self.friendships: set[tuple[int, int]] = set()
+        self.enmities: set[tuple[int, int]] = set()
         self.next_person_id = 1
         self._initialize_population()
 
@@ -57,6 +61,7 @@ class SimulationEngine:
             for gender in founders:
                 traits = random_traits(self.rng)
                 knowledge, tool_skill, spiritual, belief_group = random_social_profile(self.rng)
+                happiness, stress, aggression = random_emotional_profile(self.rng)
                 person = Individual(
                     person_id=self.next_person_id,
                     age=self.rng.randint(18, 24),
@@ -73,6 +78,9 @@ class SimulationEngine:
                     tool_skill=tool_skill,
                     spiritual_tendency=spiritual,
                     belief_group=belief_group,
+                    happiness=happiness,
+                    stress=stress,
+                    aggression=aggression,
                 )
                 self.population.append(person)
                 self.next_person_id += 1
@@ -82,6 +90,7 @@ class SimulationEngine:
                 gender = Gender.FEMALE if self.rng.random() < 0.5 else Gender.MALE
                 traits = random_traits(self.rng)
                 knowledge, tool_skill, spiritual, belief_group = random_social_profile(self.rng)
+                happiness, stress, aggression = random_emotional_profile(self.rng)
                 person = Individual(
                     person_id=self.next_person_id,
                     age=age,
@@ -98,6 +107,9 @@ class SimulationEngine:
                     tool_skill=tool_skill,
                     spiritual_tendency=spiritual,
                     belief_group=belief_group,
+                    happiness=happiness,
+                    stress=stress,
+                    aggression=aggression,
                 )
                 self.population.append(person)
                 self.next_person_id += 1
@@ -108,7 +120,15 @@ class SimulationEngine:
     def run(self) -> StatsTracker:
         for year in range(self.config.years):
             births, deaths, available_food = self.step(year)
-            self.stats.record(year, self.population, births, deaths, available_food)
+            self.stats.record(
+                year,
+                self.population,
+                births,
+                deaths,
+                available_food,
+                friendships=len(self.friendships),
+                enmities=len(self.enmities),
+            )
 
             if not any(p.alive for p in self.population):
                 break
@@ -135,6 +155,8 @@ class SimulationEngine:
         self._apply_migration(alive)
         self._apply_vaccination_policy(alive, year)
         self.contact_graph = self._rewire_contact_graph(alive, self.contact_graph)
+        self._prune_social_edges(alive)
+        self._simulate_social_dynamics(alive)
         self._apply_social_learning(alive)
         self.disease_model.apply_transmission_from_contacts(
             alive,
@@ -147,7 +169,8 @@ class SimulationEngine:
 
             nutrition_delta = (food_ratio_by_region.get(person.region_id, 1.0) - 1.0) * 0.12 * era["food_effect"]
             resilience = person.genetic_traits.get("resilience", 0.5)
-            tech_bonus = 1.0 + (person.tool_skill * 0.25)
+            productivity = self._individual_productivity(person)
+            tech_bonus = 1.0 + (person.tool_skill * 0.25) + productivity * 0.2
             person.health = max(0.0, min(1.0, person.health + nutrition_delta * (0.8 + resilience) * tech_bonus))
 
             disease_deaths = self.disease_model.apply_progression_and_mutation(person)
@@ -239,12 +262,14 @@ class SimulationEngine:
                 fertility_score *= max(0.15, 1.0 - stress_penalty)
             fertility_score *= era_birth_multiplier
             fertility_score *= 1.0 + ((mother.knowledge + father.knowledge) * 0.08)
+            fertility_score *= max(0.4, 0.8 + (self._individual_productivity(mother) + self._individual_productivity(father)) * 0.15)
             fertility_score = max(0.0, min(1.0, fertility_score))
             if self.rng.random() >= fertility_score:
                 continue
 
             traits = inherit_traits(mother, father, self.rng)
             knowledge, tool_skill, spiritual, belief_group = inherit_social_profile(mother, father, self.rng)
+            happiness, stress, aggression = inherit_emotions(mother, father, self.rng)
             child = Individual(
                 person_id=self.next_person_id,
                 age=0,
@@ -261,6 +286,9 @@ class SimulationEngine:
                 tool_skill=tool_skill,
                 spiritual_tendency=spiritual,
                 belief_group=belief_group,
+                happiness=happiness,
+                stress=stress,
+                aggression=aggression,
             )
             self.next_person_id += 1
 
@@ -473,6 +501,57 @@ class SimulationEngine:
         self.civilization_index = (avg_knowledge * 0.55) + (avg_tools * 0.45)
         cult_names = {p.belief_group for p in alive if p.belief_group.startswith("cult_")}
         self.cult_count = len(cult_names)
+
+    def _simulate_social_dynamics(self, alive: list[Individual]) -> None:
+        id_map = {p.person_id: p for p in alive}
+        for person in alive:
+            for nid in self.contact_graph.get(person.person_id, []):
+                if person.person_id >= nid:
+                    continue
+                other = id_map.get(nid)
+                if other is None:
+                    continue
+                pair = (person.person_id, other.person_id)
+                similarity = 1.0 - abs(person.spiritual_tendency - other.spiritual_tendency)
+                trust_signal = (
+                    similarity * 0.45
+                    + (1.0 - abs(person.happiness - other.happiness)) * 0.25
+                    + (1.0 - abs(person.aggression - other.aggression)) * 0.3
+                )
+                conflict_signal = (person.aggression + other.aggression) * 0.5 + abs(person.stress - other.stress) * 0.5
+
+                if trust_signal > 0.65 and self.rng.random() < 0.08:
+                    self.friendships.add(pair)
+                    if pair in self.enmities:
+                        self.enmities.discard(pair)
+                elif conflict_signal > 0.62 and self.rng.random() < 0.06:
+                    self.enmities.add(pair)
+                    if pair in self.friendships:
+                        self.friendships.discard(pair)
+
+                if pair in self.friendships:
+                    person.happiness = min(1.0, person.happiness + 0.01)
+                    other.happiness = min(1.0, other.happiness + 0.01)
+                    person.stress = max(0.0, person.stress - 0.008)
+                    other.stress = max(0.0, other.stress - 0.008)
+                if pair in self.enmities:
+                    person.stress = min(1.0, person.stress + 0.012)
+                    other.stress = min(1.0, other.stress + 0.012)
+                    person.aggression = min(1.0, person.aggression + 0.005)
+                    other.aggression = min(1.0, other.aggression + 0.005)
+
+    def _prune_social_edges(self, alive: list[Individual]) -> None:
+        alive_ids = {p.person_id for p in alive}
+        self.friendships = {pair for pair in self.friendships if pair[0] in alive_ids and pair[1] in alive_ids}
+        self.enmities = {pair for pair in self.enmities if pair[0] in alive_ids and pair[1] in alive_ids}
+
+    def _individual_productivity(self, person: Individual) -> float:
+        friend_count = sum(1 for a, b in self.friendships if a == person.person_id or b == person.person_id)
+        enemy_count = sum(1 for a, b in self.enmities if a == person.person_id or b == person.person_id)
+        social_bonus = min(0.2, friend_count * 0.01) - min(0.18, enemy_count * 0.015)
+        emotional = person.happiness * 0.45 - person.stress * 0.35 - person.aggression * 0.15
+        skill = person.knowledge * 0.22 + person.tool_skill * 0.28
+        return max(-0.4, min(0.8, social_bonus + emotional + skill))
 
     def _process_world_events(self, year: int, alive: list[Individual]) -> tuple[int, list[str]]:
         stories: list[str] = []

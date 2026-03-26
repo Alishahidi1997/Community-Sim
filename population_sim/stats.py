@@ -27,6 +27,11 @@ class YearStats:
     genetic_diversity: float
     avg_knowledge: float
     avg_tool_skill: float
+    avg_happiness: float
+    avg_stress: float
+    avg_aggression: float
+    friendships: int
+    enmities: int
     civilization_index: float
     belief_groups: int
     cults: int
@@ -47,6 +52,8 @@ class StatsTracker:
         births: int,
         deaths: int,
         available_food: float,
+        friendships: int = 0,
+        enmities: int = 0,
     ) -> None:
         alive = [p for p in population if p.alive]
         count = len(alive)
@@ -70,6 +77,11 @@ class StatsTracker:
                     genetic_diversity=0.0,
                     avg_knowledge=0.0,
                     avg_tool_skill=0.0,
+                    avg_happiness=0.0,
+                    avg_stress=0.0,
+                    avg_aggression=0.0,
+                    friendships=0,
+                    enmities=0,
                     civilization_index=0.0,
                     belief_groups=0,
                     cults=0,
@@ -112,6 +124,9 @@ class StatsTracker:
         genetic_diversity = sum(diversity_components) / len(diversity_components)
         avg_knowledge = sum(p.knowledge for p in alive) / count
         avg_tool_skill = sum(p.tool_skill for p in alive) / count
+        avg_happiness = sum(p.happiness for p in alive) / count
+        avg_stress = sum(p.stress for p in alive) / count
+        avg_aggression = sum(p.aggression for p in alive) / count
         civilization_index = (avg_knowledge * 0.55) + (avg_tool_skill * 0.45)
         belief_groups = len({p.belief_group for p in alive})
         cults = len({p.belief_group for p in alive if p.belief_group.startswith("cult_")})
@@ -135,6 +150,11 @@ class StatsTracker:
                 genetic_diversity=genetic_diversity,
                 avg_knowledge=avg_knowledge,
                 avg_tool_skill=avg_tool_skill,
+                avg_happiness=avg_happiness,
+                avg_stress=avg_stress,
+                avg_aggression=avg_aggression,
+                friendships=friendships,
+                enmities=enmities,
                 civilization_index=civilization_index,
                 belief_groups=belief_groups,
                 cults=cults,

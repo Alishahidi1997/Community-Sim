@@ -129,7 +129,15 @@ class RealtimeVisualizer:
         if self.frame_counter % self.step_every_frames != 0:
             return
         births, deaths, available_food = self.engine.step(self.year)
-        self.engine.stats.record(self.year, self.engine.population, births, deaths, available_food)
+        self.engine.stats.record(
+            self.year,
+            self.engine.population,
+            births,
+            deaths,
+            available_food,
+            friendships=len(self.engine.friendships),
+            enmities=len(self.engine.enmities),
+        )
         events = self.engine.last_step_events
         if events.get("births", 0) > 0:
             self._push_message(f"+{events['births']} births")
@@ -279,10 +287,13 @@ class RealtimeVisualizer:
         )
         vaccinated = sum(1 for p in alive_people if p.vaccinated)
         avg_health = (sum(p.health for p in alive_people) / pop) if pop else 0.0
+        avg_happiness = (sum(p.happiness for p in alive_people) / pop) if pop else 0.0
+        avg_stress = (sum(p.stress for p in alive_people) / pop) if pop else 0.0
         pathogen_rate = self.engine.config.pathogens[0].infection_rate if self.engine.config.pathogens else 0.0
         lines = [
             f"Year: {self.year}/{self.engine.config.years}   Population: {pop}   Infected: {infected}   Vaccinated: {vaccinated}",
             f"Era: {self.engine.current_era}   CivIndex: {self.engine.civilization_index:.2f}   Cults: {self.engine.cult_count}",
+            f"Emotion H/S: {avg_happiness:.2f}/{avg_stress:.2f}   Friends: {len(self.engine.friendships)}   Enemies: {len(self.engine.enmities)}",
             f"Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}",
             "Controls: SPACE pause | mouse drag sliders | ,/. speed | L labels | ESC quit",
         ]

@@ -34,6 +34,9 @@ class Individual:
     tool_skill: float
     spiritual_tendency: float
     belief_group: str
+    happiness: float
+    stress: float
+    aggression: float
 
     def age_one_year(self) -> None:
         self.age += 1
@@ -54,6 +57,14 @@ def random_social_profile(rng: random.Random) -> tuple[float, float, float, str]
         rng.uniform(0.1, 0.35),  # tool skill
         rng.uniform(0.2, 0.8),   # spiritual tendency
         rng.choice(beliefs),
+    )
+
+
+def random_emotional_profile(rng: random.Random) -> tuple[float, float, float]:
+    return (
+        rng.uniform(0.45, 0.7),   # happiness
+        rng.uniform(0.2, 0.5),    # stress
+        rng.uniform(0.1, 0.4),    # aggression
     )
 
 
@@ -84,4 +95,15 @@ def inherit_social_profile(
     )
     belief_group = mother.belief_group if rng.random() < 0.5 else father.belief_group
     return knowledge, tool_skill, spiritual, belief_group
+
+
+def inherit_emotions(
+    mother: Individual,
+    father: Individual,
+    rng: random.Random,
+) -> tuple[float, float, float]:
+    happiness = max(0.0, min(1.0, rng.gauss((mother.happiness + father.happiness) / 2.0, 0.07)))
+    stress = max(0.0, min(1.0, rng.gauss((mother.stress + father.stress) / 2.0, 0.07)))
+    aggression = max(0.0, min(1.0, rng.gauss((mother.aggression + father.aggression) / 2.0, 0.07)))
+    return happiness, stress, aggression
 
