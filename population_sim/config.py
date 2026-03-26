@@ -55,6 +55,11 @@ class BehaviorConfig:
 
 
 @dataclass
+class ConflictConfig:
+    preset: str = "balanced"  # balanced | high_conflict
+
+
+@dataclass
 class DemographicsConfig:
     initial_population: int = 500
     region_count: int = 3
@@ -79,5 +84,6 @@ class SimulationConfig:
     vaccination: VaccinationPolicyConfig = field(default_factory=VaccinationPolicyConfig)
     contact_network: ContactNetworkConfig = field(default_factory=ContactNetworkConfig)
     behavior: BehaviorConfig = field(default_factory=BehaviorConfig)
+    conflict: ConflictConfig = field(default_factory=ConflictConfig)
     pathogens: list[PathogenConfig] = field(default_factory=lambda: [PathogenConfig()])
 

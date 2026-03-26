@@ -3,6 +3,7 @@ from pathlib import Path
 from population_sim.config import (
     BehaviorConfig,
     ContactNetworkConfig,
+    ConflictConfig,
     DemographicsConfig,
     EnvironmentConfig,
     MigrationConfig,
@@ -16,7 +17,7 @@ from population_sim.visualize import plot_stats
 
 def build_default_config() -> SimulationConfig:
     return SimulationConfig(
-        years=200,
+        years=1000,
         random_seed=7,
         demographics=DemographicsConfig(
             initial_population=2,
@@ -61,6 +62,9 @@ def build_default_config() -> SimulationConfig:
             migration_infection_weight=0.28,
             contact_avoid_infected_bias=0.68,
             stress_birth_penalty_weight=0.55,
+        ),
+        conflict=ConflictConfig(
+            preset="balanced",
         ),
         pathogens=[
             PathogenConfig(
@@ -119,7 +123,20 @@ def print_final_summary(stats_rows: list[dict]) -> None:
     print(f"Genetic diversity index: {last['genetic_diversity']:.4f}")
 
 
-def print_decadal_logs(stats_rows: list[dict], step: int = 10, max_year: int = 200) -> None:
+def print_city_summary(engine: SimulationEngine) -> None:
+    if not engine.city_summaries:
+        print("Cities: none yet.")
+        return
+    print(f"Cities: {len(engine.city_summaries)}")
+    for city in engine.city_summaries[:10]:
+        print(
+            f"- {city['name']} | pop={city['population']} | "
+            f"culture={city['culture']} | religion={city['religion']} | "
+            f"faction={city['faction']} | language={city['language']}"
+        )
+
+
+def print_decadal_logs(stats_rows: list[dict], step: int = 25, max_year: int = 1000) -> None:
     if not stats_rows:
         return
     print(f"\nProgress log (every {step} years):")
@@ -139,7 +156,7 @@ def print_decadal_logs(stats_rows: list[dict], step: int = 10, max_year: int = 2
         )
 
 
-def print_event_summary(engine: SimulationEngine, max_items: int = 20) -> None:
+def print_event_summary(engine: SimulationEngine, max_items: int = 60) -> None:
     if not engine.major_events:
         print("\nMajor world events: none recorded this run.")
         return
@@ -162,8 +179,9 @@ def main() -> None:
     stats.export_csv(csv_path)
     plot_stats(stats, chart_path)
     rows = stats.to_rows()
-    print_decadal_logs(rows, step=10, max_year=200)
+    print_decadal_logs(rows, step=25, max_year=config.years)
     print_event_summary(engine)
+    print_city_summary(engine)
     print_final_summary(rows)
     print(f"CSV saved to: {csv_path}")
     print(f"Chart saved to: {chart_path}")

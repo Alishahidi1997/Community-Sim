@@ -2,6 +2,14 @@
 
 This project simulates a human population from early hunter-gatherer origins toward organized civilization, with realtime strategy-style visualization and event-driven world changes.
 
+## Realtime View Screenshot
+
+![Realtime Strategy View](C:/Users/shahi/.cursor/projects/c-Users-shahi-Desktop-net-AI/assets/c__Users_shahi_AppData_Roaming_Cursor_User_workspaceStorage_6654ca197e68c959b355b5c500896697_images_image-800da252-2eb6-47a4-abf0-00cbebe4ccc8.png)
+
+## Demo
+
+![Demo](Demo.gif)
+
 ## What The Simulation Includes
 
 ### Population and Biology

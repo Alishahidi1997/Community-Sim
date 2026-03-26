@@ -43,6 +43,7 @@ class SimulationEngine:
         self.world_structures: list[dict[str, int | str | float]] = []
         self.agriculture_unlocked = False
         self.timeline_events: list[dict[str, str | int]] = []
+        self.city_summaries: list[dict[str, str | int]] = []
         self.major_events: list[dict[str, str | int]] = []
         self.unlocked_milestones: set[str] = set()
         self.food_system_bonus = 0.0
@@ -55,6 +56,8 @@ class SimulationEngine:
         self.friendships: set[tuple[int, int]] = set()
         self.enmities: set[tuple[int, int]] = set()
         self.alliances: set[tuple[str, str]] = set()
+        self.faction_names = ["River Clan", "Sun Pact", "Iron League", "Oak Circle", "Sky Union"]
+        self.language_names = ["Proto", "Asteric", "Vardenic", "Lunari", "Nordic"]
         self.total_tools_crafted = 0
         self.total_books_written = 0
         self.next_person_id = 1
@@ -68,6 +71,8 @@ class SimulationEngine:
                 traits = random_traits(self.rng)
                 knowledge, tool_skill, spiritual, belief_group = random_social_profile(self.rng)
                 happiness, stress, aggression = random_emotional_profile(self.rng)
+                faction = self.rng.choice(self.faction_names[:2])
+                language = self.language_names[0]
                 person = Individual(
                     person_id=self.next_person_id,
                     age=self.rng.randint(18, 24),
@@ -87,6 +92,8 @@ class SimulationEngine:
                     happiness=happiness,
                     stress=stress,
                     aggression=aggression,
+                    faction=faction,
+                    language=language,
                     personal_tools=0,
                     books_authored=0,
                     mutation_burden=0.0,
@@ -100,6 +107,8 @@ class SimulationEngine:
                 traits = random_traits(self.rng)
                 knowledge, tool_skill, spiritual, belief_group = random_social_profile(self.rng)
                 happiness, stress, aggression = random_emotional_profile(self.rng)
+                faction = self.rng.choice(self.faction_names)
+                language = self.rng.choice(self.language_names[:3])
                 person = Individual(
                     person_id=self.next_person_id,
                     age=age,
@@ -119,6 +128,8 @@ class SimulationEngine:
                     happiness=happiness,
                     stress=stress,
                     aggression=aggression,
+                    faction=faction,
+                    language=language,
                     personal_tools=0,
                     books_authored=0,
                     mutation_burden=0.0,
@@ -290,6 +301,10 @@ class SimulationEngine:
             traits = inherit_traits(mother, father, self.rng)
             knowledge, tool_skill, spiritual, belief_group = inherit_social_profile(mother, father, self.rng)
             happiness, stress, aggression = inherit_emotions(mother, father, self.rng)
+            faction = mother.faction if self.rng.random() < 0.5 else father.faction
+            language = mother.language if self.rng.random() < 0.65 else father.language
+            if "digital_age" in self.unlocked_milestones and self.rng.random() < 0.08:
+                language = self.rng.choice(self.language_names)
             child = Individual(
                 person_id=self.next_person_id,
                 age=0,
@@ -309,6 +324,8 @@ class SimulationEngine:
                 happiness=happiness,
                 stress=stress,
                 aggression=aggression,
+                faction=faction,
+                language=language,
                 personal_tools=0,
                 books_authored=0,
                 mutation_burden=0.0,
@@ -468,32 +485,39 @@ class SimulationEngine:
         )
 
     def _era_profile(self, year: int) -> dict[str, float | str]:
-        if year < 60:
+        if year < 120:
             return {
                 "name": "hunter-gatherer",
                 "food_effect": 1.15,
                 "birth_multiplier": 1.2,
                 "mortality_multiplier": 1.1,
             }
-        if year < 120:
+        if year < 280:
             return {
                 "name": "agrarian",
                 "food_effect": 1.0,
                 "birth_multiplier": 1.0,
                 "mortality_multiplier": 1.0,
             }
-        if year < 170:
+        if year < 480:
             return {
                 "name": "industrial",
                 "food_effect": 0.9,
                 "birth_multiplier": 1.15,
                 "mortality_multiplier": 0.85,
             }
+        if year < 760:
+            return {
+                "name": "modern",
+                "food_effect": 0.85,
+                "birth_multiplier": 0.92,
+                "mortality_multiplier": 0.72,
+            }
         return {
-            "name": "modern",
+            "name": "information age",
             "food_effect": 0.85,
-            "birth_multiplier": 0.92,
-            "mortality_multiplier": 0.72,
+            "birth_multiplier": 0.84,
+            "mortality_multiplier": 0.64,
         }
 
     def _apply_social_learning(self, alive: list[Individual]) -> None:
@@ -526,6 +550,11 @@ class SimulationEngine:
         self.cult_count = len(cult_names)
 
     def _simulate_social_dynamics(self, alive: list[Individual]) -> None:
+        cfg = self._conflict_params()
+        if self.config.conflict.preset.lower().strip() == "high_conflict":
+            for p in alive:
+                p.aggression = min(1.0, p.aggression + 0.004)
+                p.stress = min(1.0, p.stress + 0.002)
         id_map = {p.person_id: p for p in alive}
         for person in alive:
             for nid in self.contact_graph.get(person.person_id, []):
@@ -543,11 +572,15 @@ class SimulationEngine:
                 )
                 conflict_signal = (person.aggression + other.aggression) * 0.5 + abs(person.stress - other.stress) * 0.5
 
-                if trust_signal > 0.65 and self.rng.random() < 0.08:
+                faction_tension = cfg["faction_tension"] if person.faction != other.faction else -0.02
+                language_tension = cfg["language_tension"] if person.language != other.language else -0.01
+                conflict_signal += faction_tension + language_tension
+
+                if trust_signal > cfg["friend_trust_threshold"] and self.rng.random() < cfg["friend_prob"]:
                     self.friendships.add(pair)
                     if pair in self.enmities:
                         self.enmities.discard(pair)
-                elif conflict_signal > 0.62 and self.rng.random() < 0.06:
+                elif conflict_signal > cfg["enemy_conflict_threshold"] and self.rng.random() < cfg["enemy_prob"]:
                     self.enmities.add(pair)
                     if pair in self.friendships:
                         self.friendships.discard(pair)
@@ -588,6 +621,7 @@ class SimulationEngine:
         avg_knowledge = sum(p.knowledge for p in alive) / pop
         avg_tools = sum(p.tool_skill for p in alive) / pop
         belief_groups = len({p.belief_group for p in alive})
+        stories.extend(self._historical_milestones(year, pop, avg_knowledge, avg_tools))
 
         if "fire" not in self.unlocked_milestones and avg_tools > 0.25 and pop >= 3:
             self.unlocked_milestones.add("fire")
@@ -641,6 +675,99 @@ class SimulationEngine:
 
         return event_deaths, stories
 
+    def _historical_milestones(
+        self,
+        year: int,
+        population: int,
+        avg_knowledge: float,
+        avg_tools: float,
+    ) -> list[str]:
+        stories: list[str] = []
+
+        def trigger(key: str, cond: bool, title: str, details: str, *,
+                    food: float = 0.0, mortality: float = 0.0, knowledge: float = 0.0) -> None:
+            if key in self.unlocked_milestones or not cond:
+                return
+            self.unlocked_milestones.add(key)
+            self.food_system_bonus += food
+            self.mortality_reduction_bonus += mortality
+            self.knowledge_boost += knowledge
+            stories.append(self._register_event(year, title, details))
+
+        trigger(
+            "bronze_age",
+            year >= 180 and avg_tools > 0.42 and population >= 40,
+            "Bronze craft era",
+            "Metal tools improve farming and construction.",
+            food=0.03,
+        )
+        trigger(
+            "iron_age",
+            year >= 260 and avg_tools > 0.5 and population >= 70,
+            "Iron tools spread",
+            "Stronger tools increase productivity and defense.",
+            food=0.035,
+        )
+        trigger(
+            "road_network",
+            year >= 320 and population >= 100 and self.civilization_index > 0.45,
+            "Road network expanded",
+            "Trade and coordination improve between settlements.",
+            knowledge=0.0006,
+        )
+        trigger(
+            "paper_record",
+            year >= 430 and avg_knowledge > 0.56 and population >= 120,
+            "Record-keeping expands",
+            "Administrative memory improves continuity.",
+            knowledge=0.001,
+        )
+        trigger(
+            "printing",
+            year >= 540 and avg_knowledge > 0.62 and self.total_books_written >= 8,
+            "Printing tradition emerges",
+            "Books multiply and literacy accelerates.",
+            knowledge=0.0018,
+        )
+        trigger(
+            "public_sanitation",
+            year >= 620 and population >= 160 and self.civilization_index > 0.62,
+            "Public sanitation reforms",
+            "Urban health measures reduce preventable disease.",
+            mortality=0.05,
+        )
+        trigger(
+            "modern_medicine",
+            year >= 710 and avg_knowledge > 0.68 and population >= 220,
+            "Modern medicine established",
+            "Clinical care lowers mortality and mutation burden impact.",
+            mortality=0.08,
+        )
+        trigger(
+            "electric_grid",
+            year >= 760 and self.civilization_index > 0.7 and population >= 260,
+            "Electric infrastructure built",
+            "Powered production and communication boost growth.",
+            food=0.02,
+            knowledge=0.0012,
+        )
+        trigger(
+            "digital_age",
+            year >= 860 and avg_knowledge > 0.76 and self.total_books_written >= 30,
+            "Digital communication age",
+            "Information access scales across the society.",
+            knowledge=0.0022,
+        )
+        trigger(
+            "space_age",
+            year >= 940 and self.civilization_index > 0.82 and population >= 320,
+            "Early space age",
+            "Long-horizon planning improves resilience.",
+            mortality=0.04,
+        )
+
+        return stories
+
     def _apply_direct_deaths(self, alive: list[Individual], fraction: float, minimum: int) -> int:
         candidates = [p for p in alive if p.alive]
         if not candidates:
@@ -668,10 +795,13 @@ class SimulationEngine:
             self.world_structures.append(
                 {
                     "id": f"settlement_{region_id}",
+                    "name": self._generate_settlement_name(region_id),
                     "kind": "settlement",
                     "level": "camp",
                     "region_id": region_id,
                     "slot": 0.5,
+                    "culture": "tribal",
+                    "religion": "ancestor",
                 }
             )
 
@@ -708,10 +838,12 @@ class SimulationEngine:
                 next_level = "city"
             if next_level:
                 settlement["level"] = next_level
+                if next_level == "city":
+                    settlement["name"] = f"{settlement['name']} City"
                 stories.append(
                     self._register_timeline_transition(
                         year,
-                        f"Settlement evolved: {level} -> {next_level}",
+                        f"Settlement evolved: {settlement['name']} {level} -> {next_level}",
                         f"Population and organization enabled a {next_level}.",
                     )
                 )
@@ -778,6 +910,7 @@ class SimulationEngine:
                 )
             )
 
+        self._refresh_settlement_identities(alive)
         return stories
 
     def _register_timeline_transition(self, year: int, title: str, details: str) -> str:
@@ -794,6 +927,88 @@ class SimulationEngine:
             if structure["kind"] == "settlement" and structure["region_id"] == region_id:
                 return structure
         return None
+
+    def _generate_settlement_name(self, region_id: int) -> str:
+        base = [
+            "Aster",
+            "Rivermark",
+            "Sunhold",
+            "Varden",
+            "Oakhaven",
+            "Northmere",
+            "Grayfield",
+            "Lunaris",
+        ]
+        if region_id < len(base):
+            return base[region_id]
+        return f"Frontier-{region_id}"
+
+    def _refresh_settlement_identities(self, alive: list[Individual]) -> None:
+        self.city_summaries = []
+        by_region: dict[int, list[Individual]] = defaultdict(list)
+        for person in alive:
+            by_region[person.region_id].append(person)
+
+        for structure in self.world_structures:
+            if structure.get("kind") != "settlement":
+                continue
+            region_id = int(structure.get("region_id", 0))
+            residents = by_region.get(region_id, [])
+            if not residents:
+                continue
+            pop = len(residents)
+            avg_knowledge = sum(p.knowledge for p in residents) / pop
+            avg_tools = sum(p.tool_skill for p in residents) / pop
+            religion = self._dominant_belief(residents)
+            faction = self._dominant_label(residents, "faction")
+            language = self._dominant_label(residents, "language")
+            culture = self._culture_label(avg_knowledge, avg_tools, structure.get("level", "camp"))
+            structure["religion"] = religion
+            structure["culture"] = culture
+            structure["faction"] = faction
+            structure["language"] = language
+            if structure.get("level") == "city":
+                self.city_summaries.append(
+                    {
+                        "name": str(structure.get("name", "Unknown")),
+                        "culture": str(culture),
+                        "religion": str(religion),
+                        "faction": str(faction),
+                        "language": str(language),
+                        "population": pop,
+                    }
+                )
+
+    def _dominant_belief(self, residents: list[Individual]) -> str:
+        counts: dict[str, int] = defaultdict(int)
+        for p in residents:
+            counts[p.belief_group] += 1
+        if not counts:
+            return "mixed"
+        return max(counts.items(), key=lambda x: x[1])[0]
+
+    def _culture_label(self, avg_knowledge: float, avg_tools: float, level: str | int) -> str:
+        if level == "camp":
+            return "tribal"
+        if avg_knowledge > 0.72:
+            return "scholastic"
+        if avg_tools > 0.72:
+            return "industrial"
+        if avg_knowledge > 0.55 and avg_tools > 0.55:
+            return "civic"
+        if level == "village":
+            return "agrarian"
+        if level == "town":
+            return "mercantile"
+        return "urban"
+
+    def _dominant_label(self, residents: list[Individual], field: str) -> str:
+        counts: dict[str, int] = defaultdict(int)
+        for p in residents:
+            counts[str(getattr(p, field, "unknown"))] += 1
+        if not counts:
+            return "mixed"
+        return max(counts.items(), key=lambda x: x[1])[0]
 
     def _auto_adjust_parameters(self, alive: list[Individual], available_food: float) -> list[str]:
         """Autonomous parameter adaptation based on simulation state."""
@@ -904,6 +1119,7 @@ class SimulationEngine:
     def _simulate_alliances_and_war(self, alive: list[Individual], year: int) -> tuple[list[str], int]:
         stories: list[str] = []
         deaths = 0
+        cfg = self._conflict_params()
         if len(alive) < 40:
             return stories, deaths
 
@@ -924,7 +1140,7 @@ class SimulationEngine:
                 a2 = sum(p.aggression for p in by_belief[g2]) / len(by_belief[g2])
                 s1 = sum(p.stress for p in by_belief[g1]) / len(by_belief[g1])
                 s2 = sum(p.stress for p in by_belief[g2]) / len(by_belief[g2])
-                if (a1 + a2) < 0.72 and abs(s1 - s2) < 0.2 and self.rng.random() < 0.02:
+                if (a1 + a2) < 0.72 and abs(s1 - s2) < 0.2 and self.rng.random() < cfg["alliance_prob"]:
                     self.alliances.add(key)
                     msg = self._register_timeline_transition(
                         year,
@@ -937,9 +1153,9 @@ class SimulationEngine:
         pop = len(alive)
         avg_stress = sum(p.stress for p in alive) / pop
         food_pc = self._available_food_total(alive) / pop if pop else 1.0
-        alliance_factor = max(0.0, 1.0 - len(self.alliances) * 0.06)
+        alliance_factor = max(0.0, 1.0 - len(self.alliances) * cfg["alliance_damp"])
         war_pressure = max(0.0, (avg_stress - 0.45) + max(0.0, 1.0 - food_pc) + (len(groups) - 2) * 0.08)
-        war_chance = min(0.18, war_pressure * 0.06 * alliance_factor)
+        war_chance = min(cfg["war_cap"], war_pressure * cfg["war_scale"] * alliance_factor)
         if year > 70 and self.rng.random() < war_chance:
             casualty_fraction = min(0.12, 0.02 + war_pressure * 0.04)
             deaths = self._apply_direct_deaths(alive, casualty_fraction, 1)
@@ -953,4 +1169,32 @@ class SimulationEngine:
             stories.append(msg)
 
         return stories, deaths
+
+    def _conflict_params(self) -> dict[str, float]:
+        preset = self.config.conflict.preset.lower().strip()
+        if preset == "high_conflict":
+            return {
+                "friend_trust_threshold": 0.78,
+                "friend_prob": 0.03,
+                "enemy_conflict_threshold": 0.48,
+                "enemy_prob": 0.22,
+                "alliance_prob": 0.006,
+                "alliance_damp": 0.03,
+                "war_scale": 0.14,
+                "war_cap": 0.36,
+                "faction_tension": 0.16,
+                "language_tension": 0.12,
+            }
+        return {
+            "friend_trust_threshold": 0.65,
+            "friend_prob": 0.08,
+            "enemy_conflict_threshold": 0.62,
+            "enemy_prob": 0.06,
+            "alliance_prob": 0.02,
+            "alliance_damp": 0.06,
+            "war_scale": 0.06,
+            "war_cap": 0.18,
+            "faction_tension": 0.08,
+            "language_tension": 0.06,
+        }
 

@@ -37,6 +37,8 @@ class Individual:
     happiness: float
     stress: float
     aggression: float
+    faction: str
+    language: str
     personal_tools: int
     books_authored: int
     mutation_burden: float

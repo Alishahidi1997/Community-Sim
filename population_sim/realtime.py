@@ -46,17 +46,18 @@ class UISlider:
 
 
 class RealtimeVisualizer:
-    def __init__(self, engine: SimulationEngine, width: int = 1440, height: int = 860) -> None:
+    def __init__(self, engine: SimulationEngine, width: int = 1820, height: int = 1020) -> None:
         self.engine = engine
         self.width = width
         self.height = height
-        self.left_panel_width = 300
-        self.panel_width = 340
+        self.left_panel_width = 360
+        self.panel_width = 380
         self.year = 0
         self.running = True
         self.paused = False
         self.show_labels = False
-        self.step_every_frames = 20
+        # At ~60 FPS, 600 frames is about 10 seconds per simulation year.
+        self.step_every_frames = 600
         self.frame_counter = 0
         self.rng = random.Random(engine.config.random_seed + 999)
         self.visual_state: dict[int, VisualAgent] = {}
@@ -72,6 +73,7 @@ class RealtimeVisualizer:
         self.recent_messages: list[tuple[str, int]] = []
         self.timeline_cache: list[str] = []
         self.last_major_event_count = 0
+        self.city_scroll_offset = 0
         self.terrain_seed = random.Random(engine.config.random_seed + 2026)
         self.hills = self._build_hills()
         self._build_sliders()
@@ -107,9 +109,13 @@ class RealtimeVisualizer:
                 elif event.key == pygame.K_l:
                     self.show_labels = not self.show_labels
                 elif event.key == pygame.K_PERIOD:
-                    self.step_every_frames = max(1, self.step_every_frames - 1)
+                    self.step_every_frames = max(1, self.step_every_frames - 60)
                 elif event.key == pygame.K_COMMA:
-                    self.step_every_frames = min(30, self.step_every_frames + 1)
+                    self.step_every_frames = min(1800, self.step_every_frames + 60)
+                elif event.key == pygame.K_PAGEUP:
+                    self._scroll_city_ledger(-3)
+                elif event.key == pygame.K_PAGEDOWN:
+                    self._scroll_city_ledger(3)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 for slider in self.sliders:
                     if slider.rect.collidepoint(event.pos):
@@ -123,6 +129,8 @@ class RealtimeVisualizer:
                 self.dragging_slider = None
             elif event.type == pygame.MOUSEMOTION and self.dragging_slider is not None:
                 self.dragging_slider.set_from_x(event.pos[0])
+            elif event.type == pygame.MOUSEWHEEL:
+                self._scroll_city_ledger(-event.y)
 
     def _tick_simulation(self) -> None:
         self.frame_counter += 1
@@ -278,6 +286,7 @@ class RealtimeVisualizer:
         self._draw_sky_gradient(screen, world_rect)
         self._draw_sun_and_clouds(screen, world_rect)
         self._draw_hills(screen, world_rect)
+        self._draw_river(screen, world_rect)
         ground_rect = pygame.Rect(self.left_panel_width, 70, self.width - self.panel_width - self.left_panel_width, self.height - 70)
         pygame.draw.rect(screen, self.ground_color, ground_rect)
 
@@ -288,6 +297,7 @@ class RealtimeVisualizer:
             for x in range(rect.left, rect.right, 32):
                 pygame.draw.line(screen, self.grid_color, (x, rect.bottom - 24), (x + 16, rect.bottom), 1)
         self._draw_world_structures(screen)
+        self._draw_roads(screen)
 
     def _draw_hud(self, screen: pygame.Surface, font: pygame.font.Font, alive_people: list) -> None:
         pop = len(alive_people)
@@ -304,6 +314,8 @@ class RealtimeVisualizer:
             f"Era: {self.engine.current_era}   CivIndex: {self.engine.civilization_index:.2f}   Cults: {self.engine.cult_count}",
             f"Emotion H/S: {avg_happiness:.2f}/{avg_stress:.2f}   Friends: {len(self.engine.friendships)}   Enemies: {len(self.engine.enmities)}   Alliances: {len(self.engine.alliances)}",
             f"Tools: {self.engine.total_tools_crafted}   Books: {self.engine.total_books_written}",
+            f"Cities: {len(self.engine.city_summaries)} {self._city_line_summary()}",
+            f"Factions: {self._faction_summary_line()}   Conflict preset: {self.engine.config.conflict.preset}",
             f"Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}",
             "Controls: SPACE pause | mouse drag sliders | ,/. speed | L labels | ESC quit",
         ]
@@ -413,9 +425,9 @@ class RealtimeVisualizer:
             UISlider(
                 label="Simulation speed",
                 min_value=1.0,
-                max_value=30.0,
+                max_value=1800.0,
                 getter=lambda: float(self.step_every_frames),
-                setter=lambda v: setattr(self, "step_every_frames", max(1, min(30, int(round(v))))),
+                setter=lambda v: setattr(self, "step_every_frames", max(1, min(1800, int(round(v))))),
                 rect=pygame.Rect(left, top + gap * 6, w, h),
             ),
         ]
@@ -487,8 +499,18 @@ class RealtimeVisualizer:
         return layers
 
     def _draw_sky_gradient(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
-        top = (86, 146, 230)
-        bottom = (196, 226, 255)
+        cycle = (self.year % 240) / 240.0
+        day_factor = max(0.2, 1.0 - abs(cycle - 0.5) * 1.7)
+        top = (
+            int(36 + 70 * day_factor),
+            int(56 + 90 * day_factor),
+            int(90 + 140 * day_factor),
+        )
+        bottom = (
+            int(76 + 120 * day_factor),
+            int(96 + 130 * day_factor),
+            int(120 + 135 * day_factor),
+        )
         height = max(1, rect.height)
         for i in range(height):
             t = i / height
@@ -500,15 +522,19 @@ class RealtimeVisualizer:
             pygame.draw.line(screen, color, (rect.left, i), (rect.right, i))
 
     def _draw_sun_and_clouds(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
-        sun_x = rect.right - 120
-        sun_y = 88
-        pygame.draw.circle(screen, (255, 232, 140), (sun_x, sun_y), 38)
-        pygame.draw.circle(screen, (255, 244, 190), (sun_x - 10, sun_y - 10), 12)
+        cycle = (self.year % 240) / 240.0
+        sun_x = int(rect.left + 80 + cycle * (rect.width - 160))
+        sun_y = int(120 - max(0.0, 1.0 - abs(cycle - 0.5) * 2.0) * 55)
+        pygame.draw.circle(screen, (255, 232, 140), (sun_x, sun_y), 34)
+        pygame.draw.circle(screen, (255, 244, 190), (sun_x - 8, sun_y - 8), 10)
         cloud_color = (245, 250, 255)
         for cx, cy in [(160, 90), (320, 120), (520, 95)]:
             pygame.draw.circle(screen, cloud_color, (cx, cy), 18)
             pygame.draw.circle(screen, cloud_color, (cx + 20, cy - 4), 16)
             pygame.draw.circle(screen, cloud_color, (cx + 38, cy), 14)
+        if cycle < 0.16 or cycle > 0.84:
+            for sx in range(rect.left + 40, rect.right - 40, 90):
+                pygame.draw.circle(screen, (240, 240, 255), (sx, 42 + (sx % 20)), 1)
 
     def _draw_hills(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
         del rect
@@ -516,12 +542,37 @@ class RealtimeVisualizer:
         for color, points in zip(layer_colors, self.hills):
             pygame.draw.polygon(screen, color, points)
 
+    def _draw_river(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
+        points = []
+        y_base = rect.top + int(rect.height * 0.64)
+        for x in range(rect.left, rect.right + 1, 20):
+            wave = int(18 * math.sin((x + self.year * 2.2) * 0.01))
+            points.append((x, y_base + wave))
+        for idx in range(len(points) - 1):
+            pygame.draw.line(screen, (76, 154, 220), points[idx], points[idx + 1], 10)
+            pygame.draw.line(screen, (102, 178, 235), points[idx], points[idx + 1], 4)
+
+    def _draw_roads(self, screen: pygame.Surface) -> None:
+        structures = [s for s in self.engine.world_structures if s.get("kind") in ("settlement", "school", "workshop", "temple")]
+        if not structures:
+            return
+        settlement = next((s for s in structures if s.get("kind") == "settlement"), None)
+        if settlement is None:
+            return
+        sx, sy = self._structure_screen_pos(settlement)
+        for s in structures:
+            if s is settlement:
+                continue
+            x, y = self._structure_screen_pos(s)
+            pygame.draw.line(screen, (128, 114, 86), (sx, sy), (x, y), 2)
+            pygame.draw.line(screen, (158, 142, 108), (sx, sy), (x, y), 1)
+
     def _update_timeline_cache(self) -> None:
         if len(self.engine.timeline_events) == self.last_major_event_count:
             return
         self.timeline_cache = [
             f"Y{event['year']}: {event['title']}"
-            for event in self.engine.timeline_events[-15:]
+            for event in self.engine.timeline_events[-30:]
         ]
         self.last_major_event_count = len(self.engine.timeline_events)
 
@@ -540,16 +591,85 @@ class RealtimeVisualizer:
         subtitle = small_font.render("Major simulation events", True, (170, 175, 188))
         screen.blit(subtitle, (16, 42))
 
+        city_header = small_font.render(
+            f"Cities: {len(self.engine.city_summaries)}",
+            True,
+            (206, 212, 228),
+        )
+        screen.blit(city_header, (16, 64))
+        y_city = 84
+        for city in self.engine.city_summaries[:3]:
+            line = f"{city['name']} ({city['culture']}/{city['religion']})"
+            txt = small_font.render(line[:42], True, (176, 188, 220))
+            screen.blit(txt, (16, y_city))
+            y_city += 18
+
         if not self.timeline_cache:
             msg = small_font.render("No major events yet.", True, (150, 155, 170))
-            screen.blit(msg, (16, 78))
+            screen.blit(msg, (16, 190))
+        else:
+            y = 190
+            for item in self.timeline_cache[:12]:
+                bullet = small_font.render(f"- {item}", True, (210, 214, 224))
+                screen.blit(bullet, (16, y))
+                y += 22
+
+        # Dedicated scrollable city ledger area.
+        ledger_top = self.height - 310
+        ledger_rect = pygame.Rect(10, ledger_top, self.left_panel_width - 20, 292)
+        pygame.draw.rect(screen, (24, 29, 36), ledger_rect, border_radius=6)
+        pygame.draw.rect(screen, (54, 62, 76), ledger_rect, 1, border_radius=6)
+        title = small_font.render("City Ledger (scroll: wheel / PgUp PgDn)", True, (220, 224, 236))
+        screen.blit(title, (ledger_rect.left + 8, ledger_rect.top + 8))
+        self._draw_city_ledger_rows(screen, small_font, ledger_rect)
+
+    def _city_line_summary(self) -> str:
+        if not self.engine.city_summaries:
+            return ""
+        preview = ", ".join(str(c["name"]) for c in self.engine.city_summaries[:3])
+        return f"[{preview}]"
+
+    def _faction_summary_line(self) -> str:
+        if not self.engine.city_summaries:
+            return "none"
+        factions = sorted({str(c.get("faction", "unknown")) for c in self.engine.city_summaries})
+        return ", ".join(factions[:4])
+
+    def _scroll_city_ledger(self, delta: int) -> None:
+        max_offset = max(0, len(self.engine.city_summaries) - 10)
+        self.city_scroll_offset = max(0, min(max_offset, self.city_scroll_offset + delta))
+
+    def _draw_city_ledger_rows(
+        self,
+        screen: pygame.Surface,
+        small_font: pygame.font.Font,
+        ledger_rect: pygame.Rect,
+    ) -> None:
+        cities = sorted(self.engine.city_summaries, key=lambda c: int(c.get("population", 0)), reverse=True)
+        if not cities:
+            txt = small_font.render("No cities founded yet.", True, (164, 170, 184))
+            screen.blit(txt, (ledger_rect.left + 10, ledger_rect.top + 36))
             return
 
-        y = 78
-        for item in self.timeline_cache:
-            bullet = small_font.render(f"- {item}", True, (210, 214, 224))
-            screen.blit(bullet, (16, y))
-            y += 22
+        start = self.city_scroll_offset
+        rows = cities[start : start + 10]
+        y = ledger_rect.top + 34
+        for idx, city in enumerate(rows, start=start + 1):
+            line = (
+                f"{idx:>2}. {city['name']} | pop {city['population']} | "
+                f"{city['culture']} | {city['religion']} | "
+                f"{city.get('faction','?')} | {city.get('language','?')}"
+            )
+            txt = small_font.render(line[:56], True, (202, 208, 223))
+            screen.blit(txt, (ledger_rect.left + 8, y))
+            y += 24
+
+        footer = small_font.render(
+            f"Showing {start + 1}-{start + len(rows)} of {len(cities)}",
+            True,
+            (150, 156, 172),
+        )
+        screen.blit(footer, (ledger_rect.left + 8, ledger_rect.bottom - 22))
 
     def _world_rect(self) -> pygame.Rect:
         return pygame.Rect(self.left_panel_width, 0, self.width - self.panel_width - self.left_panel_width, self.height)
