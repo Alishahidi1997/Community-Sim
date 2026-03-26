@@ -188,7 +188,7 @@ Dependencies:
 - Explicit economy (production, storage, demand)
 - Save/load simulation state and replay mode
 
-## Portfolio And AI-Assist Notes
+## Disclaimer
 
 I built this project with AI assistance and my own engineering decisions.
 
@@ -201,7 +201,3 @@ What I personally focused on:
 - manually tuning parameters, balancing systems, and fixing edge cases
 - improving realtime UX and visualization flow
 - validating outputs with logs, charts, and scenario runs
-
-Suggested short statement for portfolio use:
-
-> "This project was developed with AI-assisted tooling and prompt engineering, then refined by me through architecture decisions, feature iteration, debugging, tuning, and validation."

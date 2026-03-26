@@ -359,7 +359,7 @@ class RealtimeVisualizer:
         top = 110
         w = self.panel_width - 48
         h = 14
-        gap = 64
+        gap = 56
 
         self.sliders = [
             UISlider(
@@ -409,6 +409,14 @@ class RealtimeVisualizer:
                 getter=lambda: self.engine.config.vaccination.annual_coverage_fraction,
                 setter=lambda v: setattr(self.engine.config.vaccination, "annual_coverage_fraction", v),
                 rect=pygame.Rect(left, top + gap * 5, w, h),
+            ),
+            UISlider(
+                label="Simulation speed",
+                min_value=1.0,
+                max_value=30.0,
+                getter=lambda: float(self.step_every_frames),
+                setter=lambda v: setattr(self, "step_every_frames", max(1, min(30, int(round(v))))),
+                rect=pygame.Rect(left, top + gap * 6, w, h),
             ),
         ]
 
