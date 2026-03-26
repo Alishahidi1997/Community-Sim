@@ -20,30 +20,52 @@ class SimulationEngine:
 
         self.population: list[Individual] = []
         self.contact_graph: dict[int, list[int]] = {}
+        self.current_era = "hunter-gatherer"
+        self.last_step_events: dict[str, int] = {"births": 0, "deaths": 0, "new_infections": 0}
         self.next_person_id = 1
         self._initialize_population()
 
     def _initialize_population(self) -> None:
-        for _ in range(self.config.demographics.initial_population):
-            age = self.rng.randint(0, 70)
-            gender = Gender.FEMALE if self.rng.random() < 0.5 else Gender.MALE
-            traits = random_traits(self.rng)
-            pathogen_names = [p.name for p in self.config.pathogens]
-            person = Individual(
-                person_id=self.next_person_id,
-                age=age,
-                gender=gender,
-                region_id=self.rng.randint(0, self.config.demographics.region_count - 1),
-                alive=True,
-                health=self.rng.uniform(0.6, 1.0),
-                disease_susceptibility=self.rng.uniform(0.6, 1.4),
-                genetic_traits=traits,
-                vaccinated=False,
-                disease_states={name: DiseaseState.SUSCEPTIBLE for name in pathogen_names},
-                immunity_levels={name: 0.0 for name in pathogen_names},
-            )
-            self.population.append(person)
-            self.next_person_id += 1
+        pathogen_names = [p.name for p in self.config.pathogens]
+        if self.config.demographics.initial_population == 2:
+            founders = [Gender.MALE, Gender.FEMALE]
+            for gender in founders:
+                traits = random_traits(self.rng)
+                person = Individual(
+                    person_id=self.next_person_id,
+                    age=self.rng.randint(18, 24),
+                    gender=gender,
+                    region_id=0,
+                    alive=True,
+                    health=self.rng.uniform(0.8, 1.0),
+                    disease_susceptibility=self.rng.uniform(0.8, 1.2),
+                    genetic_traits=traits,
+                    vaccinated=False,
+                    disease_states={name: DiseaseState.SUSCEPTIBLE for name in pathogen_names},
+                    immunity_levels={name: 0.0 for name in pathogen_names},
+                )
+                self.population.append(person)
+                self.next_person_id += 1
+        else:
+            for _ in range(self.config.demographics.initial_population):
+                age = self.rng.randint(0, 70)
+                gender = Gender.FEMALE if self.rng.random() < 0.5 else Gender.MALE
+                traits = random_traits(self.rng)
+                person = Individual(
+                    person_id=self.next_person_id,
+                    age=age,
+                    gender=gender,
+                    region_id=self.rng.randint(0, self.config.demographics.region_count - 1),
+                    alive=True,
+                    health=self.rng.uniform(0.6, 1.0),
+                    disease_susceptibility=self.rng.uniform(0.6, 1.4),
+                    genetic_traits=traits,
+                    vaccinated=False,
+                    disease_states={name: DiseaseState.SUSCEPTIBLE for name in pathogen_names},
+                    immunity_levels={name: 0.0 for name in pathogen_names},
+                )
+                self.population.append(person)
+                self.next_person_id += 1
 
         self.disease_model.seed_initial_infections(self.population)
         self.contact_graph = self._build_contact_graph([p for p in self.population if p.alive])
@@ -60,10 +82,13 @@ class SimulationEngine:
     def step(self, year: int) -> tuple[int, int, float]:
         births = 0
         deaths = 0
+        new_infections_before = self._count_any_infected()
         alive = [p for p in self.population if p.alive]
         if not alive:
             return 0, 0, 0.0
 
+        era = self._era_profile(year)
+        self.current_era = era["name"]
         for env in self.environments:
             env.update()
         available_food = self._available_food_total(alive)
@@ -81,7 +106,7 @@ class SimulationEngine:
         for person in alive:
             person.age_one_year()
 
-            nutrition_delta = (food_ratio_by_region.get(person.region_id, 1.0) - 1.0) * 0.2
+            nutrition_delta = (food_ratio_by_region.get(person.region_id, 1.0) - 1.0) * 0.12 * era["food_effect"]
             resilience = person.genetic_traits.get("resilience", 0.5)
             person.health = max(0.0, min(1.0, person.health + nutrition_delta * (0.8 + resilience)))
 
@@ -95,6 +120,7 @@ class SimulationEngine:
                 self.config.demographics.natural_mortality_base
                 + max(0, person.age - 40) * self.config.demographics.natural_mortality_age_factor
             )
+            natural_mortality *= era["mortality_multiplier"]
             if person.age > self.config.demographics.max_age:
                 natural_mortality = 1.0
 
@@ -105,15 +131,21 @@ class SimulationEngine:
                 person.alive = False
                 deaths += 1
 
-        newborns = self._generate_births()
+        newborns = self._generate_births(era["birth_multiplier"])
         births = len(newborns)
         self.population.extend(newborns)
 
         alive_now = [p for p in self.population if p.alive]
         self.contact_graph = self._build_contact_graph(alive_now)
+        new_infections_after = self._count_any_infected()
+        self.last_step_events = {
+            "births": births,
+            "deaths": deaths,
+            "new_infections": max(0, new_infections_after - new_infections_before),
+        }
         return births, deaths, available_food
 
-    def _generate_births(self) -> list[Individual]:
+    def _generate_births(self, era_birth_multiplier: float = 1.0) -> list[Individual]:
         cfg = self.config.demographics
         pathogen_names = [p.name for p in self.config.pathogens]
         food_ratio_by_region = self._food_ratio_by_region([p for p in self.population if p.alive])
@@ -156,6 +188,7 @@ class SimulationEngine:
                 disease_pressure = infection_ratio_by_region.get(mother.region_id, 0.0)
                 stress_penalty = (food_pressure + disease_pressure) * bcfg.stress_birth_penalty_weight
                 fertility_score *= max(0.15, 1.0 - stress_penalty)
+            fertility_score *= era_birth_multiplier
             fertility_score = max(0.0, min(1.0, fertility_score))
             if self.rng.random() >= fertility_score:
                 continue
@@ -318,5 +351,41 @@ class SimulationEngine:
         return {
             region_id: (infected[region_id] / count if count else 0.0)
             for region_id, count in counts.items()
+        }
+
+    def _count_any_infected(self) -> int:
+        return sum(
+            1
+            for p in self.population
+            if p.alive and any(state == DiseaseState.INFECTED for state in p.disease_states.values())
+        )
+
+    def _era_profile(self, year: int) -> dict[str, float | str]:
+        if year < 60:
+            return {
+                "name": "hunter-gatherer",
+                "food_effect": 1.15,
+                "birth_multiplier": 1.2,
+                "mortality_multiplier": 1.1,
+            }
+        if year < 120:
+            return {
+                "name": "agrarian",
+                "food_effect": 1.0,
+                "birth_multiplier": 1.0,
+                "mortality_multiplier": 1.0,
+            }
+        if year < 170:
+            return {
+                "name": "industrial",
+                "food_effect": 0.9,
+                "birth_multiplier": 1.15,
+                "mortality_multiplier": 0.85,
+            }
+        return {
+            "name": "modern",
+            "food_effect": 0.85,
+            "birth_multiplier": 0.92,
+            "mortality_multiplier": 0.72,
         }
 

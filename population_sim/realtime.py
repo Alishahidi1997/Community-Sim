@@ -55,7 +55,7 @@ class RealtimeVisualizer:
         self.running = True
         self.paused = False
         self.show_labels = False
-        self.step_every_frames = 6
+        self.step_every_frames = 20
         self.frame_counter = 0
         self.rng = random.Random(engine.config.random_seed + 999)
         self.visual_state: dict[int, VisualAgent] = {}
@@ -68,6 +68,7 @@ class RealtimeVisualizer:
         self.ground_color = (62, 130, 72)
         self.panel_color = (25, 27, 32)
         self.panel_text_color = (235, 235, 238)
+        self.recent_messages: list[tuple[str, int]] = []
         self._build_sliders()
 
     def run(self) -> None:
@@ -124,6 +125,13 @@ class RealtimeVisualizer:
             return
         births, deaths, available_food = self.engine.step(self.year)
         self.engine.stats.record(self.year, self.engine.population, births, deaths, available_food)
+        events = self.engine.last_step_events
+        if events.get("births", 0) > 0:
+            self._push_message(f"+{events['births']} births")
+        if events.get("deaths", 0) > 0:
+            self._push_message(f"-{events['deaths']} deaths")
+        if events.get("new_infections", 0) > 0:
+            self._push_message(f"+{events['new_infections']} new infections")
         self.year += 1
         if self.year >= self.engine.config.years:
             self.paused = True
@@ -202,7 +210,7 @@ class RealtimeVisualizer:
 
         alive_people = [p for p in self.engine.population if p.alive]
         sample_lines = 0
-        max_lines = 500
+        max_lines = 80
         for person in alive_people:
             if sample_lines > max_lines:
                 break
@@ -213,7 +221,11 @@ class RealtimeVisualizer:
                 dst = self.visual_state.get(neighbor_id)
                 if dst is None:
                     continue
-                pygame.draw.line(screen, (65, 65, 75), (int(src.x), int(src.y)), (int(dst.x), int(dst.y)), 1)
+                dx = src.x - dst.x
+                dy = src.y - dst.y
+                if (dx * dx + dy * dy) > 140 * 140:
+                    continue
+                pygame.draw.line(screen, (56, 74, 92), (int(src.x), int(src.y)), (int(dst.x), int(dst.y)), 1)
                 sample_lines += 1
                 if sample_lines > max_lines:
                     break
@@ -230,6 +242,7 @@ class RealtimeVisualizer:
                 screen.blit(text, (int(agent.x) + 8, int(agent.y) - 26))
 
         self._draw_hud(screen, font, alive_people)
+        self._draw_messages(screen, small_font)
         self._draw_control_panel(screen, font, small_font)
 
     def _draw_regions(self, screen: pygame.Surface) -> None:
@@ -255,7 +268,7 @@ class RealtimeVisualizer:
         pathogen_rate = self.engine.config.pathogens[0].infection_rate if self.engine.config.pathogens else 0.0
         lines = [
             f"Year: {self.year}/{self.engine.config.years}   Population: {pop}   Infected: {infected}   Vaccinated: {vaccinated}",
-            f"Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}   Speed: {self.step_every_frames}",
+            f"Era: {self.engine.current_era}   Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}",
             "Controls: SPACE pause | mouse drag sliders | ,/. speed | L labels | ESC quit",
         ]
         y = 8
@@ -263,6 +276,14 @@ class RealtimeVisualizer:
             text = font.render(line, True, (20, 22, 30))
             screen.blit(text, (12, y))
             y += 22
+
+    def _draw_messages(self, screen: pygame.Surface, small_font: pygame.font.Font) -> None:
+        self.recent_messages = [(m, ttl - 1) for m, ttl in self.recent_messages if ttl > 1]
+        y = 86
+        for msg, _ in self.recent_messages[-6:]:
+            t = small_font.render(msg, True, (18, 20, 28))
+            screen.blit(t, (12, y))
+            y += 18
 
     def _draw_human(self, screen: pygame.Surface, person, agent: VisualAgent) -> None:
         body_color = self._health_color(person)
@@ -381,4 +402,7 @@ class RealtimeVisualizer:
             handle = pygame.Rect(handle_x - 6, slider.rect.top - 4, 12, slider.rect.height + 8)
             color = (245, 245, 250) if slider.active else (220, 220, 230)
             pygame.draw.rect(screen, color, handle, border_radius=4)
+
+    def _push_message(self, msg: str) -> None:
+        self.recent_messages.append((msg, 240))
 
