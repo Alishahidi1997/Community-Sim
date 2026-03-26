@@ -40,6 +40,9 @@ class SimulationEngine:
         }
         self.civilization_index = 0.0
         self.cult_count = 0
+        self.world_structures: list[dict[str, int | str | float]] = []
+        self.agriculture_unlocked = False
+        self.timeline_events: list[dict[str, str | int]] = []
         self.major_events: list[dict[str, str | int]] = []
         self.unlocked_milestones: set[str] = set()
         self.food_system_bonus = 0.0
@@ -116,6 +119,7 @@ class SimulationEngine:
 
         self.disease_model.seed_initial_infections(self.population)
         self.contact_graph = self._build_contact_graph([p for p in self.population if p.alive])
+        self._initialize_world_structures()
 
     def run(self) -> StatsTracker:
         for year in range(self.config.years):
@@ -203,6 +207,8 @@ class SimulationEngine:
         alive_now = [p for p in self.population if p.alive]
         self.contact_graph = self._build_contact_graph(alive_now)
         self._update_civilization_metrics(alive_now)
+        transition_stories = self._update_world_structures(year, alive_now)
+        stories.extend(transition_stories)
         adjustments = self._auto_adjust_parameters(alive_now, available_food)
         event_deaths, event_stories = self._process_world_events(year, alive_now)
         deaths += event_deaths
@@ -575,6 +581,7 @@ class SimulationEngine:
         if "agriculture" not in self.unlocked_milestones and self.current_era in ("agrarian", "industrial", "modern"):
             self.unlocked_milestones.add("agriculture")
             self.food_system_bonus += 0.09
+            self.agriculture_unlocked = True
             stories.append(self._register_event(year, "Agriculture emerges", "Farming stabilizes settlements."))
         if "writing" not in self.unlocked_milestones and avg_knowledge > 0.48 and pop >= 20:
             self.unlocked_milestones.add("writing")
@@ -636,6 +643,138 @@ class SimulationEngine:
         self.temp_food_penalty *= 0.85
         self.temp_birth_penalty *= 0.85
         self.temp_mortality_penalty *= 0.85
+
+    def _initialize_world_structures(self) -> None:
+        for region_id in range(self.config.demographics.region_count):
+            self.world_structures.append(
+                {
+                    "id": f"settlement_{region_id}",
+                    "kind": "settlement",
+                    "level": "camp",
+                    "region_id": region_id,
+                    "slot": 0.5,
+                }
+            )
+
+    def _update_world_structures(self, year: int, alive: list[Individual]) -> list[str]:
+        stories: list[str] = []
+        pop = len(alive)
+        if pop == 0:
+            return stories
+        avg_knowledge = sum(p.knowledge for p in alive) / pop
+        avg_tools = sum(p.tool_skill for p in alive) / pop
+        belief_groups = len({p.belief_group for p in alive})
+        avg_spiritual = sum(p.spiritual_tendency for p in alive) / pop
+
+        if (not self.agriculture_unlocked) and (self.current_era != "hunter-gatherer" or avg_tools > 0.42):
+            self.agriculture_unlocked = True
+            stories.append(
+                self._register_timeline_transition(
+                    year,
+                    "Agriculture practice adopted",
+                    "Food production shifted from gathering to cultivation.",
+                )
+            )
+
+        # Settlement progression as concrete state transitions.
+        settlement = self._get_settlement_structure(0)
+        if settlement is not None:
+            level = settlement["level"]
+            next_level = None
+            if level == "camp" and pop >= 18 and self.agriculture_unlocked:
+                next_level = "village"
+            elif level == "village" and pop >= 70 and self.civilization_index > 0.32:
+                next_level = "town"
+            elif level == "town" and pop >= 170 and self.civilization_index > 0.5:
+                next_level = "city"
+            if next_level:
+                settlement["level"] = next_level
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"Settlement evolved: {level} -> {next_level}",
+                        f"Population and organization enabled a {next_level}.",
+                    )
+                )
+
+        # Agriculture fields become visible structures after agriculture unlock.
+        if self.agriculture_unlocked:
+            existing_fields = len([s for s in self.world_structures if s["kind"] == "field"])
+            target_fields = min(14, max(2, int(pop / 18)))
+            while existing_fields < target_fields:
+                slot = 0.12 + (existing_fields % 8) * 0.1
+                self.world_structures.append(
+                    {
+                        "id": f"field_{existing_fields}",
+                        "kind": "field",
+                        "level": 1,
+                        "region_id": 0,
+                        "slot": max(0.08, min(0.92, slot)),
+                    }
+                )
+                existing_fields += 1
+            if existing_fields == target_fields and target_fields >= 2:
+                # Register first-time field establishment only once.
+                if not any(e["title"] == "Agricultural fields established" for e in self.timeline_events):
+                    stories.append(
+                        self._register_timeline_transition(
+                            year,
+                            "Agricultural fields established",
+                            "Farms appeared around the settlement.",
+                        )
+                    )
+
+        # Institutions based on social practice.
+        if avg_knowledge > 0.55 and pop >= 80 and not self._has_structure("school"):
+            self.world_structures.append(
+                {"id": "school_0", "kind": "school", "level": 1, "region_id": 0, "slot": 0.3}
+            )
+            stories.append(
+                self._register_timeline_transition(
+                    year,
+                    "School founded",
+                    "Knowledge density supports formal learning.",
+                )
+            )
+        if avg_tools > 0.58 and pop >= 70 and not self._has_structure("workshop"):
+            self.world_structures.append(
+                {"id": "workshop_0", "kind": "workshop", "level": 1, "region_id": 0, "slot": 0.68}
+            )
+            stories.append(
+                self._register_timeline_transition(
+                    year,
+                    "Workshop district formed",
+                    "Craft specialization creates workshops.",
+                )
+            )
+        if (avg_spiritual > 0.55 or belief_groups >= 3) and pop >= 65 and not self._has_structure("temple"):
+            self.world_structures.append(
+                {"id": "temple_0", "kind": "temple", "level": 1, "region_id": 0, "slot": 0.5}
+            )
+            stories.append(
+                self._register_timeline_transition(
+                    year,
+                    "Temple built",
+                    "Shared ritual practices establish a temple.",
+                )
+            )
+
+        return stories
+
+    def _register_timeline_transition(self, year: int, title: str, details: str) -> str:
+        record = {"year": year + 1, "title": title, "details": details}
+        self.timeline_events.append(record)
+        self.major_events.append(record)
+        return f"Y{year + 1}: {title}"
+
+    def _has_structure(self, kind: str) -> bool:
+        return any(s["kind"] == kind for s in self.world_structures)
+
+    def _get_settlement_structure(self, region_id: int) -> dict[str, int | str | float] | None:
+        for structure in self.world_structures:
+            if structure["kind"] == "settlement" and structure["region_id"] == region_id:
+                return structure
+        return None
 
     def _auto_adjust_parameters(self, alive: list[Individual], available_food: float) -> list[str]:
         """Autonomous parameter adaptation based on simulation state."""

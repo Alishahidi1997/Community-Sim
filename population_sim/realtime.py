@@ -196,6 +196,14 @@ class RealtimeVisualizer:
                 agent.vx *= factor
                 agent.vy *= factor
 
+            target = self._preferred_structure_target(person)
+            if target is not None:
+                tx, ty = target
+                steer_x = (tx - agent.x) * 0.45 * dt
+                steer_y = (ty - agent.y) * 0.45 * dt
+                agent.vx += steer_x
+                agent.vy += steer_y
+
             agent.x += agent.vx * dt
             agent.y += agent.vy * dt
 
@@ -279,6 +287,7 @@ class RealtimeVisualizer:
             pygame.draw.rect(screen, region_color, rect, 1)
             for x in range(rect.left, rect.right, 32):
                 pygame.draw.line(screen, self.grid_color, (x, rect.bottom - 24), (x + 16, rect.bottom), 1)
+        self._draw_world_structures(screen)
 
     def _draw_hud(self, screen: pygame.Surface, font: pygame.font.Font, alive_people: list) -> None:
         pop = len(alive_people)
@@ -499,13 +508,13 @@ class RealtimeVisualizer:
             pygame.draw.polygon(screen, color, points)
 
     def _update_timeline_cache(self) -> None:
-        if len(self.engine.major_events) == self.last_major_event_count:
+        if len(self.engine.timeline_events) == self.last_major_event_count:
             return
         self.timeline_cache = [
             f"Y{event['year']}: {event['title']}"
-            for event in self.engine.major_events[-15:]
+            for event in self.engine.timeline_events[-15:]
         ]
-        self.last_major_event_count = len(self.engine.major_events)
+        self.last_major_event_count = len(self.engine.timeline_events)
 
     def _draw_timeline_panel(
         self,
@@ -532,4 +541,76 @@ class RealtimeVisualizer:
             bullet = small_font.render(f"- {item}", True, (210, 214, 224))
             screen.blit(bullet, (16, y))
             y += 22
+
+    def _world_rect(self) -> pygame.Rect:
+        return pygame.Rect(self.left_panel_width, 0, self.width - self.panel_width - self.left_panel_width, self.height)
+
+    def _structure_screen_pos(self, structure: dict) -> tuple[int, int]:
+        region_id = int(structure.get("region_id", 0))
+        rect = self._region_rect(region_id)
+        slot = float(structure.get("slot", 0.5))
+        x = int(rect.left + slot * rect.width)
+        kind = structure.get("kind")
+        if kind == "field":
+            y = int(rect.bottom - 14)
+        elif kind == "settlement":
+            y = int(rect.bottom - 30)
+        elif kind in ("school", "workshop", "temple"):
+            y = int(rect.bottom - 52)
+        else:
+            y = int(rect.bottom - 26)
+        return x, y
+
+    def _draw_world_structures(self, screen: pygame.Surface) -> None:
+        for structure in self.engine.world_structures:
+            kind = structure.get("kind")
+            x, y = self._structure_screen_pos(structure)
+            if kind == "field":
+                pygame.draw.rect(screen, (160, 190, 90), pygame.Rect(x - 12, y - 4, 24, 8))
+                pygame.draw.line(screen, (130, 160, 70), (x - 10, y), (x + 10, y), 1)
+            elif kind == "settlement":
+                level = structure.get("level", "camp")
+                if level == "camp":
+                    pygame.draw.polygon(screen, (156, 117, 82), [(x - 10, y + 3), (x, y - 10), (x + 10, y + 3)])
+                elif level == "village":
+                    pygame.draw.rect(screen, (150, 122, 95), pygame.Rect(x - 12, y - 12, 24, 14))
+                elif level == "town":
+                    pygame.draw.rect(screen, (142, 128, 120), pygame.Rect(x - 15, y - 16, 30, 18))
+                    pygame.draw.rect(screen, (120, 108, 104), pygame.Rect(x - 8, y - 24, 16, 8))
+                else:  # city
+                    pygame.draw.rect(screen, (125, 125, 132), pygame.Rect(x - 16, y - 20, 32, 22))
+                    pygame.draw.rect(screen, (112, 112, 120), pygame.Rect(x - 4, y - 34, 8, 14))
+            elif kind == "school":
+                pygame.draw.rect(screen, (204, 214, 235), pygame.Rect(x - 10, y - 14, 20, 12))
+                pygame.draw.line(screen, (95, 105, 130), (x - 8, y - 3), (x + 8, y - 3), 2)
+            elif kind == "workshop":
+                pygame.draw.rect(screen, (168, 168, 176), pygame.Rect(x - 10, y - 14, 20, 12))
+                pygame.draw.rect(screen, (110, 110, 116), pygame.Rect(x + 4, y - 20, 4, 8))
+            elif kind == "temple":
+                pygame.draw.polygon(screen, (184, 160, 205), [(x - 11, y - 2), (x, y - 16), (x + 11, y - 2)])
+                pygame.draw.rect(screen, (168, 144, 190), pygame.Rect(x - 8, y - 2, 16, 10))
+
+    def _preferred_structure_target(self, person) -> tuple[float, float] | None:
+        best: tuple[float, float] | None = None
+        best_score = -10.0
+        for structure in self.engine.world_structures:
+            if int(structure.get("region_id", 0)) != person.region_id:
+                continue
+            kind = structure.get("kind")
+            score = 0.05
+            if kind == "field":
+                score = 0.3 + person.tool_skill * 0.25
+            elif kind == "school":
+                score = 0.2 + person.knowledge * 0.6
+            elif kind == "workshop":
+                score = 0.2 + person.tool_skill * 0.6
+            elif kind == "temple":
+                score = 0.15 + person.spiritual_tendency * 0.6
+            elif kind == "settlement":
+                score = 0.2
+            if score > best_score:
+                sx, sy = self._structure_screen_pos(structure)
+                best = (float(sx), float(sy))
+                best_score = score
+        return best
 
