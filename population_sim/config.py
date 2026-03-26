@@ -46,6 +46,15 @@ class ContactNetworkConfig:
 
 
 @dataclass
+class BehaviorConfig:
+    enabled: bool = True
+    migration_food_weight: float = 0.7
+    migration_infection_weight: float = 0.3
+    contact_avoid_infected_bias: float = 0.65
+    stress_birth_penalty_weight: float = 0.55
+
+
+@dataclass
 class DemographicsConfig:
     initial_population: int = 500
     region_count: int = 3
@@ -69,5 +78,6 @@ class SimulationConfig:
     migration: MigrationConfig = field(default_factory=MigrationConfig)
     vaccination: VaccinationPolicyConfig = field(default_factory=VaccinationPolicyConfig)
     contact_network: ContactNetworkConfig = field(default_factory=ContactNetworkConfig)
+    behavior: BehaviorConfig = field(default_factory=BehaviorConfig)
     pathogens: list[PathogenConfig] = field(default_factory=lambda: [PathogenConfig()])
 

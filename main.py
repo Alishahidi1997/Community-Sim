@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from population_sim.config import (
+    BehaviorConfig,
     ContactNetworkConfig,
     DemographicsConfig,
     EnvironmentConfig,
@@ -53,6 +54,13 @@ def build_default_config() -> SimulationConfig:
         contact_network=ContactNetworkConfig(
             avg_contacts=12,
             rewiring_rate=0.12,
+        ),
+        behavior=BehaviorConfig(
+            enabled=True,
+            migration_food_weight=0.72,
+            migration_infection_weight=0.28,
+            contact_avoid_infected_bias=0.68,
+            stress_birth_penalty_weight=0.55,
         ),
         pathogens=[
             PathogenConfig(

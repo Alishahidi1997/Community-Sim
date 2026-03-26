@@ -116,6 +116,9 @@ class SimulationEngine:
     def _generate_births(self) -> list[Individual]:
         cfg = self.config.demographics
         pathogen_names = [p.name for p in self.config.pathogens]
+        food_ratio_by_region = self._food_ratio_by_region([p for p in self.population if p.alive])
+        infection_ratio_by_region = self._infection_ratio_by_region([p for p in self.population if p.alive])
+        bcfg = self.config.behavior
         females = [
             p
             for p in self.population
@@ -148,6 +151,11 @@ class SimulationEngine:
                 * (0.6 + father.genetic_traits.get("fertility", 0.5) * cfg.fertility_trait_weight)
                 * mother.health
             )
+            if bcfg.enabled:
+                food_pressure = max(0.0, 1.0 - food_ratio_by_region.get(mother.region_id, 1.0))
+                disease_pressure = infection_ratio_by_region.get(mother.region_id, 0.0)
+                stress_penalty = (food_pressure + disease_pressure) * bcfg.stress_birth_penalty_weight
+                fertility_score *= max(0.15, 1.0 - stress_penalty)
             fertility_score = max(0.0, min(1.0, fertility_score))
             if self.rng.random() >= fertility_score:
                 continue
@@ -197,10 +205,36 @@ class SimulationEngine:
         mcfg = self.config.migration
         if not mcfg.enabled or self.config.demographics.region_count <= 1:
             return
+        infection_by_region = self._infection_ratio_by_region(alive)
+        food_ratio_by_region = self._food_ratio_by_region(alive)
+        bcfg = self.config.behavior
         for person in alive:
-            if self.rng.random() < mcfg.migration_rate:
-                options = [r for r in range(self.config.demographics.region_count) if r != person.region_id]
-                person.region_id = self.rng.choice(options)
+            migrate_prob = mcfg.migration_rate
+            target_region = person.region_id
+
+            if bcfg.enabled:
+                best_score = -10.0
+                for region_id in range(self.config.demographics.region_count):
+                    food_score = food_ratio_by_region.get(region_id, 1.0)
+                    inf_score = 1.0 - infection_by_region.get(region_id, 0.0)
+                    score = food_score * bcfg.migration_food_weight + inf_score * bcfg.migration_infection_weight
+                    if score > best_score:
+                        best_score = score
+                        target_region = region_id
+
+                current_score = (
+                    food_ratio_by_region.get(person.region_id, 1.0) * bcfg.migration_food_weight
+                    + (1.0 - infection_by_region.get(person.region_id, 0.0)) * bcfg.migration_infection_weight
+                )
+                if target_region != person.region_id and best_score > current_score:
+                    migrate_prob = min(1.0, migrate_prob * 1.8)
+
+            if self.rng.random() < migrate_prob:
+                if bcfg.enabled and target_region != person.region_id:
+                    person.region_id = target_region
+                else:
+                    options = [r for r in range(self.config.demographics.region_count) if r != person.region_id]
+                    person.region_id = self.rng.choice(options)
 
     def _apply_vaccination_policy(self, alive: list[Individual], year: int) -> None:
         vcfg = self.config.vaccination
@@ -222,12 +256,31 @@ class SimulationEngine:
         avg = max(1, self.config.contact_network.avg_contacts)
         people = alive[:]
         self.rng.shuffle(people)
+        bcfg = self.config.behavior
         for i, person in enumerate(people):
             candidates = people[max(0, i - avg * 2): i] + people[i + 1: i + 1 + avg * 2]
             if not candidates:
                 continue
             self.rng.shuffle(candidates)
-            for neighbor in candidates[:avg]:
+            selected: list[Individual] = []
+            if bcfg.enabled:
+                safe = [
+                    c
+                    for c in candidates
+                    if not any(state == DiseaseState.INFECTED for state in c.disease_states.values())
+                ]
+                risky = [c for c in candidates if c not in safe]
+                safe_quota = int(avg * bcfg.contact_avoid_infected_bias)
+                selected.extend(safe[:safe_quota])
+                remaining = avg - len(selected)
+                if remaining > 0:
+                    selected.extend(risky[:remaining])
+                if len(selected) < avg:
+                    selected.extend(safe[safe_quota : safe_quota + (avg - len(selected))])
+            else:
+                selected = candidates[:avg]
+
+            for neighbor in selected[:avg]:
                 if neighbor.person_id == person.person_id:
                     continue
                 graph[person.person_id].add(neighbor.person_id)
@@ -254,4 +307,16 @@ class SimulationEngine:
                     graph_sets[pid].add(replacement)
                     graph_sets.setdefault(replacement, set()).add(pid)
         return {k: list(v) for k, v in graph_sets.items()}
+
+    def _infection_ratio_by_region(self, alive: list[Individual]) -> dict[int, float]:
+        counts = defaultdict(int)
+        infected = defaultdict(int)
+        for person in alive:
+            counts[person.region_id] += 1
+            if any(state == DiseaseState.INFECTED for state in person.disease_states.values()):
+                infected[person.region_id] += 1
+        return {
+            region_id: (infected[region_id] / count if count else 0.0)
+            for region_id, count in counts.items()
+        }
 
