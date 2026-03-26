@@ -39,6 +39,21 @@ python run_sweep.py
 
 This writes grid results to `outputs/sensitivity_sweep.csv`.
 
+Realtime visualization (Pygame 2D circles):
+
+```bash
+python realtime_view.py
+```
+
+Realtime controls:
+- `SPACE`: pause/resume simulation
+- `UP` / `DOWN`: increase/decrease food supply
+- `LEFT` / `RIGHT`: decrease/increase birth rate
+- `I` / `K`: increase/decrease infection rate (first pathogen)
+- `,` / `.`: slower/faster simulation stepping
+- `L`: toggle labels
+- `ESC`: quit
+
 ## Project Structure
 
 - `main.py`: Run script and default scenario
@@ -50,7 +65,9 @@ This writes grid results to `outputs/sensitivity_sweep.csv`.
 - `population_sim/simulation.py`: Main simulation engine
 - `population_sim/visualize.py`: Plotting utilities
 - `population_sim/sweep.py`: Parameter-grid sensitivity runner
+- `population_sim/realtime.py`: Realtime Pygame renderer
 - `run_sweep.py`: Example sweep entrypoint
+- `realtime_view.py`: Realtime viewer entrypoint
 
 ## Tuning Parameters
 
