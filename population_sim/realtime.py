@@ -50,6 +50,7 @@ class RealtimeVisualizer:
         self.engine = engine
         self.width = width
         self.height = height
+        self.left_panel_width = 300
         self.panel_width = 340
         self.year = 0
         self.running = True
@@ -69,6 +70,8 @@ class RealtimeVisualizer:
         self.panel_color = (25, 27, 32)
         self.panel_text_color = (235, 235, 238)
         self.recent_messages: list[tuple[str, int]] = []
+        self.timeline_cache: list[str] = []
+        self.last_major_event_count = 0
         self.terrain_seed = random.Random(engine.config.random_seed + 2026)
         self.hills = self._build_hills()
         self._build_sliders()
@@ -134,15 +137,21 @@ class RealtimeVisualizer:
             self._push_message(f"-{events['deaths']} deaths")
         if events.get("new_infections", 0) > 0:
             self._push_message(f"+{events['new_infections']} new infections")
+        for note in events.get("adjustments", [])[:2]:
+            self._push_message(f"Policy: {note}")
+        for story in events.get("stories", [])[-3:]:
+            self._push_message(story)
+        self._update_timeline_cache()
         self.year += 1
         if self.year >= self.engine.config.years:
             self.paused = True
 
     def _region_rect(self, region_id: int) -> pygame.Rect:
         regions = max(1, self.engine.config.demographics.region_count)
-        world_width = self.width - self.panel_width
+        world_left = self.left_panel_width
+        world_width = self.width - self.panel_width - self.left_panel_width
         region_width = world_width / regions
-        x0 = int(region_id * region_width + 10)
+        x0 = int(world_left + region_id * region_width + 10)
         return pygame.Rect(x0, 80, int(region_width - 20), self.height - 110)
 
     def _spawn_visual_agent(self, person_id: int, region_id: int) -> VisualAgent:
@@ -209,6 +218,7 @@ class RealtimeVisualizer:
     def _draw(self, screen: pygame.Surface, font: pygame.font.Font, small_font: pygame.font.Font) -> None:
         screen.fill(self.bg_color)
         self._draw_regions(screen)
+        self._draw_timeline_panel(screen, font, small_font)
 
         alive_people = [p for p in self.engine.population if p.alive]
         sample_lines = 0
@@ -248,11 +258,11 @@ class RealtimeVisualizer:
         self._draw_control_panel(screen, font, small_font)
 
     def _draw_regions(self, screen: pygame.Surface) -> None:
-        world_rect = pygame.Rect(0, 0, self.width - self.panel_width, self.height)
+        world_rect = pygame.Rect(self.left_panel_width, 0, self.width - self.panel_width - self.left_panel_width, self.height)
         self._draw_sky_gradient(screen, world_rect)
         self._draw_sun_and_clouds(screen, world_rect)
         self._draw_hills(screen, world_rect)
-        ground_rect = pygame.Rect(0, 70, self.width - self.panel_width, self.height - 70)
+        ground_rect = pygame.Rect(self.left_panel_width, 70, self.width - self.panel_width - self.left_panel_width, self.height - 70)
         pygame.draw.rect(screen, self.ground_color, ground_rect)
 
         for region_id in range(self.engine.config.demographics.region_count):
@@ -279,7 +289,7 @@ class RealtimeVisualizer:
         y = 8
         for line in lines:
             text = font.render(line, True, (20, 22, 30))
-            screen.blit(text, (12, y))
+            screen.blit(text, (self.left_panel_width + 12, y))
             y += 22
 
     def _draw_messages(self, screen: pygame.Surface, small_font: pygame.font.Font) -> None:
@@ -287,7 +297,7 @@ class RealtimeVisualizer:
         y = 86
         for msg, _ in self.recent_messages[-6:]:
             t = small_font.render(msg, True, (18, 20, 28))
-            screen.blit(t, (12, y))
+            screen.blit(t, (self.left_panel_width + 12, y))
             y += 18
 
     def _draw_human(self, screen: pygame.Surface, person, agent: VisualAgent) -> None:
@@ -430,15 +440,20 @@ class RealtimeVisualizer:
         self.recent_messages.append((msg, 240))
 
     def _build_hills(self) -> list[list[tuple[int, int]]]:
-        world_width = self.width - self.panel_width
+        world_width = self.width - self.panel_width - self.left_panel_width
         layers = []
         for layer_idx in range(3):
             points = []
             base_y = 230 + layer_idx * 55
             for x in range(0, world_width + 40, 40):
                 y = base_y + self.terrain_seed.randint(-25, 25)
-                points.append((x, y))
-            points.extend([(world_width, self.height), (0, self.height)])
+                points.append((self.left_panel_width + x, y))
+            points.extend(
+                [
+                    (self.left_panel_width + world_width, self.height),
+                    (self.left_panel_width, self.height),
+                ]
+            )
             layers.append(points)
         return layers
 
@@ -471,4 +486,39 @@ class RealtimeVisualizer:
         layer_colors = [(78, 128, 92), (68, 112, 82), (60, 102, 72)]
         for color, points in zip(layer_colors, self.hills):
             pygame.draw.polygon(screen, color, points)
+
+    def _update_timeline_cache(self) -> None:
+        if len(self.engine.major_events) == self.last_major_event_count:
+            return
+        self.timeline_cache = [
+            f"Y{event['year']}: {event['title']}"
+            for event in self.engine.major_events[-15:]
+        ]
+        self.last_major_event_count = len(self.engine.major_events)
+
+    def _draw_timeline_panel(
+        self,
+        screen: pygame.Surface,
+        font: pygame.font.Font,
+        small_font: pygame.font.Font,
+    ) -> None:
+        panel_rect = pygame.Rect(0, 0, self.left_panel_width, self.height)
+        pygame.draw.rect(screen, (20, 24, 30), panel_rect)
+        pygame.draw.line(screen, (55, 60, 72), (panel_rect.right - 2, 0), (panel_rect.right - 2, self.height), 2)
+
+        title = font.render("World Timeline", True, (235, 235, 240))
+        screen.blit(title, (16, 16))
+        subtitle = small_font.render("Major simulation events", True, (170, 175, 188))
+        screen.blit(subtitle, (16, 42))
+
+        if not self.timeline_cache:
+            msg = small_font.render("No major events yet.", True, (150, 155, 170))
+            screen.blit(msg, (16, 78))
+            return
+
+        y = 78
+        for item in self.timeline_cache:
+            bullet = small_font.render(f"- {item}", True, (210, 214, 224))
+            screen.blit(bullet, (16, y))
+            y += 22
 

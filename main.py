@@ -134,6 +134,17 @@ def print_decadal_logs(stats_rows: list[dict], step: int = 10, max_year: int = 2
         )
 
 
+def print_event_summary(engine: SimulationEngine, max_items: int = 20) -> None:
+    if not engine.major_events:
+        print("\nMajor world events: none recorded this run.")
+        return
+    print("\nMajor world events:")
+    for event in engine.major_events[:max_items]:
+        print(f"- Year {event['year']}: {event['title']} - {event['details']}")
+    if len(engine.major_events) > max_items:
+        print(f"- ... and {len(engine.major_events) - max_items} more events")
+
+
 def main() -> None:
     config = build_default_config()
     engine = SimulationEngine(config)
@@ -147,6 +158,7 @@ def main() -> None:
     plot_stats(stats, chart_path)
     rows = stats.to_rows()
     print_decadal_logs(rows, step=10, max_year=200)
+    print_event_summary(engine)
     print_final_summary(rows)
     print(f"CSV saved to: {csv_path}")
     print(f"Chart saved to: {chart_path}")

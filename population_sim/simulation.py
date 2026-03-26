@@ -29,9 +29,24 @@ class SimulationEngine:
         self.population: list[Individual] = []
         self.contact_graph: dict[int, list[int]] = {}
         self.current_era = "hunter-gatherer"
-        self.last_step_events: dict[str, int] = {"births": 0, "deaths": 0, "new_infections": 0}
+        self.last_step_events: dict[str, int | list[str]] = {
+            "births": 0,
+            "deaths": 0,
+            "new_infections": 0,
+            "stories": [],
+            "adjustments": [],
+        }
         self.civilization_index = 0.0
         self.cult_count = 0
+        self.major_events: list[dict[str, str | int]] = []
+        self.unlocked_milestones: set[str] = set()
+        self.food_system_bonus = 0.0
+        self.mortality_reduction_bonus = 0.0
+        self.knowledge_boost = 0.0
+        self.temp_food_penalty = 0.0
+        self.temp_birth_penalty = 0.0
+        self.temp_mortality_penalty = 0.0
+        self.temp_effect_years_left = 0
         self.next_person_id = 1
         self._initialize_population()
 
@@ -102,6 +117,7 @@ class SimulationEngine:
     def step(self, year: int) -> tuple[int, int, float]:
         births = 0
         deaths = 0
+        stories: list[str] = []
         new_infections_before = self._count_any_infected()
         alive = [p for p in self.population if p.alive]
         if not alive:
@@ -111,7 +127,9 @@ class SimulationEngine:
         self.current_era = era["name"]
         for env in self.environments:
             env.update()
+        self._decay_temporal_effects()
         available_food = self._available_food_total(alive)
+        available_food *= max(0.2, 1.0 + self.food_system_bonus - self.temp_food_penalty)
         food_ratio_by_region = self._food_ratio_by_region(alive)
 
         self._apply_migration(alive)
@@ -149,23 +167,30 @@ class SimulationEngine:
             if person.health < 0.25:
                 natural_mortality += (0.25 - person.health) * 0.9
             natural_mortality *= max(0.6, 1.0 - (person.knowledge * 0.18 + person.tool_skill * 0.12))
+            natural_mortality *= 1.0 + self.temp_mortality_penalty - self.mortality_reduction_bonus
 
             if self.rng.random() < natural_mortality:
                 person.alive = False
                 deaths += 1
 
-        newborns = self._generate_births(era["birth_multiplier"])
+        newborns = self._generate_births(era["birth_multiplier"] * (1.0 - self.temp_birth_penalty))
         births = len(newborns)
         self.population.extend(newborns)
 
         alive_now = [p for p in self.population if p.alive]
         self.contact_graph = self._build_contact_graph(alive_now)
         self._update_civilization_metrics(alive_now)
+        adjustments = self._auto_adjust_parameters(alive_now, available_food)
+        event_deaths, event_stories = self._process_world_events(year, alive_now)
+        deaths += event_deaths
+        stories.extend(event_stories)
         new_infections_after = self._count_any_infected()
         self.last_step_events = {
             "births": births,
             "deaths": deaths,
             "new_infections": max(0, new_infections_after - new_infections_before),
+            "stories": stories,
+            "adjustments": adjustments,
         }
         return births, deaths, available_food
 
@@ -261,7 +286,8 @@ class SimulationEngine:
         ratios: dict[int, float] = {}
         for region_id, count in by_region.items():
             available = self.environments[region_id].available_food(count)
-            ratios[region_id] = available / count if count else 0.0
+            modifier = max(0.2, 1.0 + self.food_system_bonus - self.temp_food_penalty)
+            ratios[region_id] = (available * modifier) / count if count else 0.0
         return ratios
 
     def _apply_migration(self, alive: list[Individual]) -> None:
@@ -428,7 +454,7 @@ class SimulationEngine:
             if not neighbors:
                 continue
             teacher = max(neighbors, key=lambda n: n.knowledge + n.tool_skill)
-            person.knowledge = min(1.0, person.knowledge + 0.012 * teacher.knowledge)
+            person.knowledge = min(1.0, person.knowledge + 0.012 * teacher.knowledge + self.knowledge_boost)
             person.tool_skill = min(1.0, person.tool_skill + 0.01 * teacher.tool_skill)
 
             # Belief diffusion: high-spiritual groups can form stable cults/religions.
@@ -447,4 +473,156 @@ class SimulationEngine:
         self.civilization_index = (avg_knowledge * 0.55) + (avg_tools * 0.45)
         cult_names = {p.belief_group for p in alive if p.belief_group.startswith("cult_")}
         self.cult_count = len(cult_names)
+
+    def _process_world_events(self, year: int, alive: list[Individual]) -> tuple[int, list[str]]:
+        stories: list[str] = []
+        event_deaths = 0
+        pop = len(alive)
+        if pop == 0:
+            return 0, stories
+
+        avg_knowledge = sum(p.knowledge for p in alive) / pop
+        avg_tools = sum(p.tool_skill for p in alive) / pop
+        belief_groups = len({p.belief_group for p in alive})
+
+        if "fire" not in self.unlocked_milestones and avg_tools > 0.25 and pop >= 3:
+            self.unlocked_milestones.add("fire")
+            self.food_system_bonus += 0.06
+            stories.append(self._register_event(year, "Fire mastered", "Cooking and warmth improve survival."))
+        if "tools" not in self.unlocked_milestones and avg_tools > 0.38 and pop >= 8:
+            self.unlocked_milestones.add("tools")
+            self.food_system_bonus += 0.05
+            stories.append(self._register_event(year, "Advanced tools", "Tool use boosts food gathering efficiency."))
+        if "agriculture" not in self.unlocked_milestones and self.current_era in ("agrarian", "industrial", "modern"):
+            self.unlocked_milestones.add("agriculture")
+            self.food_system_bonus += 0.09
+            stories.append(self._register_event(year, "Agriculture emerges", "Farming stabilizes settlements."))
+        if "writing" not in self.unlocked_milestones and avg_knowledge > 0.48 and pop >= 20:
+            self.unlocked_milestones.add("writing")
+            self.knowledge_boost += 0.002
+            stories.append(self._register_event(year, "Writing invented", "Knowledge now spreads faster across generations."))
+        if "state" not in self.unlocked_milestones and pop >= 90 and self.civilization_index > 0.42:
+            self.unlocked_milestones.add("state")
+            self.mortality_reduction_bonus += 0.05
+            stories.append(self._register_event(year, "City-state formed", "Organized governance improves social stability."))
+        if "country" not in self.unlocked_milestones and pop >= 220 and self.civilization_index > 0.58:
+            self.unlocked_milestones.add("country")
+            self.mortality_reduction_bonus += 0.07
+            stories.append(self._register_event(year, "Country founded", "Institutions reduce preventable deaths."))
+
+        # Natural disasters with real effects.
+        if self.rng.random() < 0.018:
+            self.temp_food_penalty += 0.25
+            self.temp_effect_years_left = max(self.temp_effect_years_left, 5)
+            stories.append(self._register_event(year, "Great drought", "Harvest collapse reduces food for several years."))
+        if self.rng.random() < 0.01:
+            self.temp_mortality_penalty += 0.12
+            self.temp_effect_years_left = max(self.temp_effect_years_left, 3)
+            direct = self._apply_direct_deaths(alive, 0.03, 1)
+            event_deaths += direct
+            stories.append(self._register_event(year, "Major flood", f"Flooding causes {direct} direct deaths."))
+        if self.rng.random() < 0.008:
+            self.temp_birth_penalty += 0.2
+            self.temp_effect_years_left = max(self.temp_effect_years_left, 4)
+            stories.append(self._register_event(year, "Volcanic winter", "Cold years reduce fertility and food."))
+
+        # Conflict events, only after society gets larger/fragmented.
+        if pop >= 120 and belief_groups >= 4 and year > 80 and self.rng.random() < 0.025:
+            direct = self._apply_direct_deaths(alive, self.rng.uniform(0.04, 0.1), 2)
+            event_deaths += direct
+            self.temp_birth_penalty += 0.1
+            self.temp_effect_years_left = max(self.temp_effect_years_left, 3)
+            stories.append(self._register_event(year, "Regional war", f"Conflict breaks out and kills {direct} people."))
+
+        return event_deaths, stories
+
+    def _apply_direct_deaths(self, alive: list[Individual], fraction: float, minimum: int) -> int:
+        candidates = [p for p in alive if p.alive]
+        if not candidates:
+            return 0
+        kill_count = min(len(candidates), max(minimum, int(len(candidates) * fraction)))
+        self.rng.shuffle(candidates)
+        for person in candidates[:kill_count]:
+            person.alive = False
+        return kill_count
+
+    def _register_event(self, year: int, title: str, details: str) -> str:
+        self.major_events.append({"year": year + 1, "title": title, "details": details})
+        return f"Y{year + 1}: {title}"
+
+    def _decay_temporal_effects(self) -> None:
+        if self.temp_effect_years_left <= 0:
+            return
+        self.temp_effect_years_left -= 1
+        self.temp_food_penalty *= 0.85
+        self.temp_birth_penalty *= 0.85
+        self.temp_mortality_penalty *= 0.85
+
+    def _auto_adjust_parameters(self, alive: list[Individual], available_food: float) -> list[str]:
+        """Autonomous parameter adaptation based on simulation state."""
+        if not alive:
+            return []
+
+        adjustments: list[str] = []
+        pop = len(alive)
+        infected = sum(
+            1
+            for p in alive
+            if any(state == DiseaseState.INFECTED for state in p.disease_states.values())
+        )
+        infection_ratio = infected / pop
+        avg_health = sum(p.health for p in alive) / pop
+        food_per_capita = available_food / pop if pop else 0.0
+        civ = self.civilization_index
+
+        def _nudge_attr(obj, key: str, delta: float, lo: float, hi: float) -> float:
+            old = getattr(obj, key)
+            new = max(lo, min(hi, old + delta))
+            setattr(obj, key, new)
+            return new - old
+
+        # Food policy reacts to scarcity/surplus.
+        if food_per_capita < 0.92:
+            d = _nudge_attr(self.config.environment, "base_food_per_capita", 0.015, 0.2, 2.5)
+            if abs(d) > 1e-9:
+                adjustments.append("Food policy increases supply")
+        elif food_per_capita > 1.35 and pop > 80:
+            d = _nudge_attr(self.config.environment, "base_food_per_capita", -0.008, 0.2, 2.5)
+            if abs(d) > 1e-9:
+                adjustments.append("Food policy trims oversupply")
+
+        # Birth policy responds to stress vs stability.
+        if avg_health < 0.45 or food_per_capita < 0.9:
+            d = _nudge_attr(self.config.demographics, "base_birth_rate", -0.01, 0.05, 0.95)
+            if abs(d) > 1e-9:
+                adjustments.append("Birth policy tightened")
+        elif avg_health > 0.62 and food_per_capita > 1.0 and pop < 300:
+            d = _nudge_attr(self.config.demographics, "base_birth_rate", 0.006, 0.05, 0.95)
+            if abs(d) > 1e-9:
+                adjustments.append("Birth policy eased")
+
+        # Disease response policy.
+        if self.config.pathogens:
+            pathogen = self.config.pathogens[0]
+            if infection_ratio > 0.12:
+                d1 = _nudge_attr(pathogen, "infection_rate", -0.01, 0.01, 0.95)
+                d2 = _nudge_attr(self.config.vaccination, "annual_coverage_fraction", 0.01, 0.0, 0.8)
+                if abs(d1) > 1e-9 or abs(d2) > 1e-9:
+                    adjustments.append("Public health intervention escalates")
+            elif infection_ratio < 0.02 and civ > 0.45:
+                d = _nudge_attr(self.config.vaccination, "annual_coverage_fraction", -0.004, 0.0, 0.8)
+                if abs(d) > 1e-9:
+                    adjustments.append("Vaccination pressure relaxed")
+
+        # Migration policy reacts to crowding and civilization maturity.
+        if pop > 220 and civ > 0.5:
+            d = _nudge_attr(self.config.migration, "migration_rate", 0.003, 0.0, 0.35)
+            if abs(d) > 1e-9:
+                adjustments.append("Migration policy opens mobility")
+        elif pop < 80:
+            d = _nudge_attr(self.config.migration, "migration_rate", -0.002, 0.0, 0.35)
+            if abs(d) > 1e-9:
+                adjustments.append("Migration policy consolidates settlements")
+
+        return adjustments[:3]
 
