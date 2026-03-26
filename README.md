@@ -187,3 +187,21 @@ Dependencies:
 - Occupation system (farmers, artisans, scholars, soldiers, priests)
 - Explicit economy (production, storage, demand)
 - Save/load simulation state and replay mode
+
+## Portfolio And AI-Assist Notes
+
+I built this project with AI assistance and my own engineering decisions.
+
+I used AI tools for rapid scaffolding and iteration, then fine-tuned the system through prompt engineering, code review, manual adjustments, and repeated simulation testing.
+
+What I personally focused on:
+
+- designing the architecture and module boundaries
+- refining behavior rules and event logic through iterative prompts
+- manually tuning parameters, balancing systems, and fixing edge cases
+- improving realtime UX and visualization flow
+- validating outputs with logs, charts, and scenario runs
+
+Suggested short statement for portfolio use:
+
+> "This project was developed with AI-assisted tooling and prompt engineering, then refined by me through architecture decisions, feature iteration, debugging, tuning, and validation."

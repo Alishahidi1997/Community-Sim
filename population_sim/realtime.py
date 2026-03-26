@@ -302,7 +302,8 @@ class RealtimeVisualizer:
         lines = [
             f"Year: {self.year}/{self.engine.config.years}   Population: {pop}   Infected: {infected}   Vaccinated: {vaccinated}",
             f"Era: {self.engine.current_era}   CivIndex: {self.engine.civilization_index:.2f}   Cults: {self.engine.cult_count}",
-            f"Emotion H/S: {avg_happiness:.2f}/{avg_stress:.2f}   Friends: {len(self.engine.friendships)}   Enemies: {len(self.engine.enmities)}",
+            f"Emotion H/S: {avg_happiness:.2f}/{avg_stress:.2f}   Friends: {len(self.engine.friendships)}   Enemies: {len(self.engine.enmities)}   Alliances: {len(self.engine.alliances)}",
+            f"Tools: {self.engine.total_tools_crafted}   Books: {self.engine.total_books_written}",
             f"Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}",
             "Controls: SPACE pause | mouse drag sliders | ,/. speed | L labels | ESC quit",
         ]

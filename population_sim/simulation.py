@@ -54,6 +54,9 @@ class SimulationEngine:
         self.temp_effect_years_left = 0
         self.friendships: set[tuple[int, int]] = set()
         self.enmities: set[tuple[int, int]] = set()
+        self.alliances: set[tuple[str, str]] = set()
+        self.total_tools_crafted = 0
+        self.total_books_written = 0
         self.next_person_id = 1
         self._initialize_population()
 
@@ -84,6 +87,9 @@ class SimulationEngine:
                     happiness=happiness,
                     stress=stress,
                     aggression=aggression,
+                    personal_tools=0,
+                    books_authored=0,
+                    mutation_burden=0.0,
                 )
                 self.population.append(person)
                 self.next_person_id += 1
@@ -113,6 +119,9 @@ class SimulationEngine:
                     happiness=happiness,
                     stress=stress,
                     aggression=aggression,
+                    personal_tools=0,
+                    books_authored=0,
+                    mutation_burden=0.0,
                 )
                 self.population.append(person)
                 self.next_person_id += 1
@@ -162,6 +171,10 @@ class SimulationEngine:
         self._prune_social_edges(alive)
         self._simulate_social_dynamics(alive)
         self._apply_social_learning(alive)
+        self._craft_tools_and_books(alive, year)
+        alliance_stories, alliance_deaths = self._simulate_alliances_and_war(alive, year)
+        stories.extend(alliance_stories)
+        deaths += alliance_deaths
         self.disease_model.apply_transmission_from_contacts(
             alive,
             self.contact_graph,
@@ -176,6 +189,7 @@ class SimulationEngine:
             productivity = self._individual_productivity(person)
             tech_bonus = 1.0 + (person.tool_skill * 0.25) + productivity * 0.2
             person.health = max(0.0, min(1.0, person.health + nutrition_delta * (0.8 + resilience) * tech_bonus))
+            self._apply_biological_mutation(person, year)
 
             disease_deaths = self.disease_model.apply_progression_and_mutation(person)
             if disease_deaths:
@@ -295,6 +309,9 @@ class SimulationEngine:
                 happiness=happiness,
                 stress=stress,
                 aggression=aggression,
+                personal_tools=0,
+                books_authored=0,
+                mutation_burden=0.0,
             )
             self.next_person_id += 1
 
@@ -557,7 +574,9 @@ class SimulationEngine:
         social_bonus = min(0.2, friend_count * 0.01) - min(0.18, enemy_count * 0.015)
         emotional = person.happiness * 0.45 - person.stress * 0.35 - person.aggression * 0.15
         skill = person.knowledge * 0.22 + person.tool_skill * 0.28
-        return max(-0.4, min(0.8, social_bonus + emotional + skill))
+        assets = min(0.15, person.personal_tools * 0.01 + person.books_authored * 0.015)
+        mutation_penalty = min(0.25, person.mutation_burden * 0.3)
+        return max(-0.45, min(0.9, social_bonus + emotional + skill + assets - mutation_penalty))
 
     def _process_world_events(self, year: int, alive: list[Individual]) -> tuple[int, list[str]]:
         stories: list[str] = []
@@ -843,4 +862,95 @@ class SimulationEngine:
                 adjustments.append("Migration policy consolidates settlements")
 
         return adjustments[:3]
+
+    def _apply_biological_mutation(self, person: Individual, year: int) -> None:
+        pre_medicine = "country" not in self.unlocked_milestones
+        base_rate = 0.006 if pre_medicine else 0.0015
+        if self.rng.random() >= base_rate:
+            return
+        delta = self.rng.gauss(0.0, 0.06)
+        person.mutation_burden = max(0.0, min(1.0, person.mutation_burden + abs(delta) * 0.35))
+        # Most mutations are neutral/slightly harmful; some are beneficial.
+        person.genetic_traits["resilience"] = max(0.0, min(1.0, person.genetic_traits.get("resilience", 0.5) + delta))
+        person.genetic_traits["immunity"] = max(0.0, min(1.0, person.genetic_traits.get("immunity", 0.5) + delta * 0.7))
+        person.disease_susceptibility = max(0.2, min(2.2, person.disease_susceptibility + (-delta * 0.35)))
+        person.health = max(0.0, min(1.0, person.health - person.mutation_burden * 0.01))
+
+        if delta > 0.04:
+            self.major_events.append(
+                {"year": year + 1, "title": "Beneficial mutation spread", "details": "A resilient lineage gained survival advantage."}
+            )
+
+    def _craft_tools_and_books(self, alive: list[Individual], year: int) -> None:
+        for person in alive:
+            if person.tool_skill > 0.45 and self.rng.random() < (0.01 + person.tool_skill * 0.02):
+                person.personal_tools += 1
+                self.total_tools_crafted += 1
+
+            writing_unlocked = "writing" in self.unlocked_milestones
+            if writing_unlocked and person.knowledge > 0.6 and self.rng.random() < (0.004 + person.knowledge * 0.01):
+                person.books_authored += 1
+                self.total_books_written += 1
+                self.knowledge_boost = min(0.01, self.knowledge_boost + 0.00008)
+                if person.books_authored == 1 and self.rng.random() < 0.25:
+                    self.timeline_events.append(
+                        {
+                            "year": year + 1,
+                            "title": "Book authored",
+                            "details": "Recorded knowledge increases long-term learning capacity.",
+                        }
+                    )
+
+    def _simulate_alliances_and_war(self, alive: list[Individual], year: int) -> tuple[list[str], int]:
+        stories: list[str] = []
+        deaths = 0
+        if len(alive) < 40:
+            return stories, deaths
+
+        by_belief: dict[str, list[Individual]] = defaultdict(list)
+        for p in alive:
+            by_belief[p.belief_group].append(p)
+        groups = sorted(by_belief.keys())
+        if len(groups) < 2:
+            return stories, deaths
+
+        # Form alliances when groups share low aggression and similar stress.
+        for i, g1 in enumerate(groups):
+            for g2 in groups[i + 1 :]:
+                key = tuple(sorted((g1, g2)))
+                if key in self.alliances:
+                    continue
+                a1 = sum(p.aggression for p in by_belief[g1]) / len(by_belief[g1])
+                a2 = sum(p.aggression for p in by_belief[g2]) / len(by_belief[g2])
+                s1 = sum(p.stress for p in by_belief[g1]) / len(by_belief[g1])
+                s2 = sum(p.stress for p in by_belief[g2]) / len(by_belief[g2])
+                if (a1 + a2) < 0.72 and abs(s1 - s2) < 0.2 and self.rng.random() < 0.02:
+                    self.alliances.add(key)
+                    msg = self._register_timeline_transition(
+                        year,
+                        "Alliance formed",
+                        f"Groups {g1} and {g2} formed a defensive pact.",
+                    )
+                    stories.append(msg)
+
+        # Need-based war: high stress + low food + group fragmentation, reduced by alliances.
+        pop = len(alive)
+        avg_stress = sum(p.stress for p in alive) / pop
+        food_pc = self._available_food_total(alive) / pop if pop else 1.0
+        alliance_factor = max(0.0, 1.0 - len(self.alliances) * 0.06)
+        war_pressure = max(0.0, (avg_stress - 0.45) + max(0.0, 1.0 - food_pc) + (len(groups) - 2) * 0.08)
+        war_chance = min(0.18, war_pressure * 0.06 * alliance_factor)
+        if year > 70 and self.rng.random() < war_chance:
+            casualty_fraction = min(0.12, 0.02 + war_pressure * 0.04)
+            deaths = self._apply_direct_deaths(alive, casualty_fraction, 1)
+            self.temp_birth_penalty += 0.08
+            self.temp_effect_years_left = max(self.temp_effect_years_left, 3)
+            msg = self._register_timeline_transition(
+                year,
+                "Resource war",
+                f"Conflict over scarcity causes {deaths} deaths.",
+            )
+            stories.append(msg)
+
+        return stories, deaths
 

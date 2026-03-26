@@ -37,6 +37,9 @@ class Individual:
     happiness: float
     stress: float
     aggression: float
+    personal_tools: int
+    books_authored: int
+    mutation_burden: float
 
     def age_one_year(self) -> None:
         self.age += 1
