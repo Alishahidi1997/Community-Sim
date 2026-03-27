@@ -315,6 +315,7 @@ class RealtimeVisualizer:
             f"Emotion H/S: {avg_happiness:.2f}/{avg_stress:.2f}   Friends: {len(self.engine.friendships)}   Enemies: {len(self.engine.enmities)}   Alliances: {len(self.engine.alliances)}",
             f"Tools: {self.engine.total_tools_crafted}   Books: {self.engine.total_books_written}",
             f"Cities: {len(self.engine.city_summaries)} {self._city_line_summary()}",
+            f"Politics: {self._politics_summary()}",
             f"Factions: {self._faction_summary_line()}   Conflict preset: {self.engine.config.conflict.preset}",
             f"Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}",
             "Controls: SPACE pause | mouse drag sliders | ,/. speed | L labels | ESC quit",
@@ -365,6 +366,20 @@ class RealtimeVisualizer:
             pygame.draw.circle(screen, (230, 230, 180), (x + scale // 2 + 2, y - scale), 2)
         if person.spiritual_tendency > 0.75:
             pygame.draw.circle(screen, (210, 150, 230), (x - scale // 2 - 2, y - scale), 2, 1)
+
+        pol = self.engine.politics_by_region.get(person.region_id, {})
+        if pol.get("leader_id") == person.person_id:
+            pygame.draw.circle(screen, (218, 186, 52), (x, head_y), head_r + 4, 2)
+
+    def _politics_summary(self) -> str:
+        pol = self.engine.politics_by_region.get(0, {})
+        gov = pol.get("government", "informal")
+        lid = pol.get("leader_id")
+        title = pol.get("leader_title") or ""
+        mode = self.engine.config.politics.government_mode
+        if lid is None:
+            return f"{gov} (pref: {mode})"
+        return f"{gov} — {title} #{lid} (pref: {mode})"
 
     def _build_sliders(self) -> None:
         left = self.width - self.panel_width + 24
@@ -636,7 +651,7 @@ class RealtimeVisualizer:
         return ", ".join(factions[:4])
 
     def _scroll_city_ledger(self, delta: int) -> None:
-        max_offset = max(0, len(self.engine.city_summaries) - 10)
+        max_offset = max(0, len(self.engine.city_summaries) - 6)
         self.city_scroll_offset = max(0, min(max_offset, self.city_scroll_offset + delta))
 
     def _draw_city_ledger_rows(
@@ -652,7 +667,7 @@ class RealtimeVisualizer:
             return
 
         start = self.city_scroll_offset
-        rows = cities[start : start + 10]
+        rows = cities[start : start + 6]
         y = ledger_rect.top + 34
         for idx, city in enumerate(rows, start=start + 1):
             line = (
@@ -662,7 +677,14 @@ class RealtimeVisualizer:
             )
             txt = small_font.render(line[:56], True, (202, 208, 223))
             screen.blit(txt, (ledger_rect.left + 8, y))
-            y += 24
+            y += 18
+            gov = city.get("government", "?")
+            lt = city.get("leader_title", "") or "Leader"
+            lid = city.get("leader_id")
+            sub = f"     {gov}" + (f" — {lt} #{lid}" if lid is not None else "")
+            sub_t = small_font.render(sub[:56], True, (160, 176, 198))
+            screen.blit(sub_t, (ledger_rect.left + 8, y))
+            y += 22
 
         footer = small_font.render(
             f"Showing {start + 1}-{start + len(rows)} of {len(cities)}",

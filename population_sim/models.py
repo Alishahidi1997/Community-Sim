@@ -42,6 +42,7 @@ class Individual:
     personal_tools: int
     books_authored: int
     mutation_burden: float
+    political_power: float  # 0–1; wealth, skill, age, and office compound over time
 
     def age_one_year(self) -> None:
         self.age += 1

@@ -8,6 +8,7 @@ from population_sim.config import (
     EnvironmentConfig,
     MigrationConfig,
     PathogenConfig,
+    PoliticsConfig,
     SimulationConfig,
     VaccinationPolicyConfig,
 )
@@ -65,6 +66,11 @@ def build_default_config() -> SimulationConfig:
         ),
         conflict=ConflictConfig(
             preset="balanced",
+        ),
+        politics=PoliticsConfig(
+            government_mode="auto",
+            election_interval_years=12,
+            elite_fraction=0.12,
         ),
         pathogens=[
             PathogenConfig(

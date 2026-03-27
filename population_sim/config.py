@@ -60,6 +60,18 @@ class ConflictConfig:
 
 
 @dataclass
+class PoliticsConfig:
+    """How settlements govern themselves as they grow (camp → village → town → city)."""
+
+    # auto: chiefdom at village, oligarchy vs democracy by civ index at town/city
+    # Other values force that style once the settlement is large enough (town+).
+    government_mode: str = "auto"  # auto | democracy | republic | oligarchy | chiefdom | monarchy | autocracy
+    election_interval_years: int = 12  # democracy / republic
+    elite_fraction: float = 0.12  # share of population with outsized influence
+    leader_power_bonus: float = 0.03  # annual institutional boost while in office (capped in sim)
+
+
+@dataclass
 class DemographicsConfig:
     initial_population: int = 500
     region_count: int = 3
@@ -85,5 +97,6 @@ class SimulationConfig:
     contact_network: ContactNetworkConfig = field(default_factory=ContactNetworkConfig)
     behavior: BehaviorConfig = field(default_factory=BehaviorConfig)
     conflict: ConflictConfig = field(default_factory=ConflictConfig)
+    politics: PoliticsConfig = field(default_factory=PoliticsConfig)
     pathogens: list[PathogenConfig] = field(default_factory=lambda: [PathogenConfig()])
 

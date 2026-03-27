@@ -61,6 +61,8 @@ class SimulationEngine:
         self.total_tools_crafted = 0
         self.total_books_written = 0
         self.next_person_id = 1
+        # region_id -> government state (leader, elites, elections)
+        self.politics_by_region: dict[int, dict[str, object]] = {}
         self._initialize_population()
 
     def _initialize_population(self) -> None:
@@ -97,6 +99,7 @@ class SimulationEngine:
                     personal_tools=0,
                     books_authored=0,
                     mutation_burden=0.0,
+                    political_power=self.rng.uniform(0.14, 0.28),
                 )
                 self.population.append(person)
                 self.next_person_id += 1
@@ -133,6 +136,7 @@ class SimulationEngine:
                     personal_tools=0,
                     books_authored=0,
                     mutation_burden=0.0,
+                    political_power=self.rng.uniform(0.12, 0.32),
                 )
                 self.population.append(person)
                 self.next_person_id += 1
@@ -301,6 +305,13 @@ class SimulationEngine:
             traits = inherit_traits(mother, father, self.rng)
             knowledge, tool_skill, spiritual, belief_group = inherit_social_profile(mother, father, self.rng)
             happiness, stress, aggression = inherit_emotions(mother, father, self.rng)
+            political_power = max(
+                0.0,
+                min(
+                    1.0,
+                    self.rng.gauss((mother.political_power + father.political_power) / 2.0, 0.06),
+                ),
+            )
             faction = mother.faction if self.rng.random() < 0.5 else father.faction
             language = mother.language if self.rng.random() < 0.65 else father.language
             if "digital_age" in self.unlocked_milestones and self.rng.random() < 0.08:
@@ -329,6 +340,7 @@ class SimulationEngine:
                 personal_tools=0,
                 books_authored=0,
                 mutation_burden=0.0,
+                political_power=political_power,
             )
             self.next_person_id += 1
 
@@ -910,6 +922,8 @@ class SimulationEngine:
                 )
             )
 
+        politics_stories = self._update_politics(year, alive)
+        stories.extend(politics_stories)
         self._refresh_settlement_identities(alive)
         return stories
 
@@ -927,6 +941,248 @@ class SimulationEngine:
             if structure["kind"] == "settlement" and structure["region_id"] == region_id:
                 return structure
         return None
+
+    def _effective_government(self, settlement_level: str, civ: float) -> str:
+        mode = self.config.politics.government_mode
+        if settlement_level == "camp":
+            return "informal"
+        if settlement_level == "village":
+            return "chiefdom"
+        if mode == "auto":
+            if settlement_level == "town":
+                return "democracy" if civ > 0.48 else "oligarchy"
+            if settlement_level == "city":
+                return "democracy" if civ > 0.55 else "oligarchy"
+            return "oligarchy"
+        if mode == "chiefdom":
+            return "oligarchy"
+        if mode in ("democracy", "republic"):
+            return "democracy"
+        if mode == "oligarchy":
+            return "oligarchy"
+        if mode == "monarchy":
+            return "monarchy"
+        if mode == "autocracy":
+            return "autocracy"
+        return "oligarchy"
+
+    def _leader_title_for_government(self, gov: str) -> str:
+        if gov == "democracy" and self.config.politics.government_mode == "republic":
+            return "Prime Minister"
+        return {
+            "informal": "",
+            "chiefdom": "Chief",
+            "oligarchy": "Council Chair",
+            "democracy": "President",
+            "republic": "President",
+            "monarchy": "Monarch",
+            "autocracy": "Ruler",
+        }.get(gov, "Leader")
+
+    def _recompute_political_power(self, person: Individual, settlement_level: str) -> None:
+        tier = {"camp": 1.0, "village": 1.06, "town": 1.14, "city": 1.24}.get(settlement_level, 1.0)
+        books = min(1.0, person.books_authored / 6.0)
+        tools = min(1.0, person.personal_tools / 10.0)
+        age_bonus = min(0.22, max(0.0, (person.age - 20) * 0.004))
+        base = (
+            0.27 * person.knowledge
+            + 0.24 * person.tool_skill
+            + 0.12 * person.spiritual_tendency
+            + 0.12 * books
+            + 0.1 * tools
+            + age_bonus
+        )
+        person.political_power = max(0.0, min(1.0, base * tier))
+
+    def _update_politics(self, year: int, alive: list[Individual]) -> list[str]:
+        stories: list[str] = []
+        cfg = self.config.politics
+        by_region: dict[int, list[Individual]] = defaultdict(list)
+        for p in alive:
+            by_region[p.region_id].append(p)
+
+        for structure in self.world_structures:
+            if structure.get("kind") != "settlement":
+                continue
+            region_id = int(structure.get("region_id", 0))
+            level = str(structure.get("level", "camp"))
+            residents = by_region.get(region_id, [])
+            if not residents:
+                continue
+
+            prev = self.politics_by_region.get(region_id, {})
+            prev_gov = str(prev.get("government", "informal"))
+            prev_leader = prev.get("leader_id")
+            prev_leader_int = int(prev_leader) if isinstance(prev_leader, int) else None
+
+            gov = self._effective_government(level, self.civilization_index)
+            elite_n = max(2, min(len(residents), int(len(residents) * cfg.elite_fraction) + 1))
+
+            for person in residents:
+                self._recompute_political_power(person, level)
+
+            sorted_r = sorted(residents, key=lambda x: x.political_power, reverse=True)
+            elite_ids = [p.person_id for p in sorted_r[:elite_n]]
+
+            leader_alive_id = prev_leader_int
+            if leader_alive_id is not None:
+                if not any(p.person_id == leader_alive_id for p in residents):
+                    leader_alive_id = None
+
+            if leader_alive_id is not None:
+                for p in residents:
+                    if p.person_id == leader_alive_id:
+                        p.political_power = min(1.0, p.political_power + cfg.leader_power_bonus)
+                        break
+
+            new_leader_id: int | None = leader_alive_id
+            next_election: int | None = prev.get("next_election_year")  # type: ignore[assignment]
+            monarch_faction = prev.get("monarch_faction")
+
+            if gov == "informal":
+                state: dict[str, object] = {
+                    "government": "informal",
+                    "leader_id": None,
+                    "leader_title": "",
+                    "elite_ids": [],
+                    "next_election_year": None,
+                    "monarch_faction": None,
+                }
+                if prev_gov != "informal":
+                    stories.append(
+                        self._register_timeline_transition(
+                            year,
+                            "Politics: informal gathering",
+                            "No formal ruler; leadership is situational.",
+                        )
+                    )
+                self.politics_by_region[region_id] = state
+                continue
+
+            election_due = False
+            if gov in ("democracy", "republic"):
+                ne = prev.get("next_election_year")
+                if ne is None or (isinstance(ne, int) and year >= ne):
+                    election_due = True
+                if leader_alive_id is None:
+                    election_due = True
+
+            if gov == "chiefdom":
+                adults = [p for p in residents if p.age >= 20]
+                pool = adults if adults else residents
+
+                def chief_score(p: Individual) -> float:
+                    return (
+                        p.spiritual_tendency * 0.5
+                        + min(1.0, p.age / 88.0) * 0.35
+                        + p.political_power * 0.32
+                    )
+
+                best = max(pool, key=chief_score)
+                if leader_alive_id is None:
+                    new_leader_id = best.person_id
+                else:
+                    current = next((p for p in pool if p.person_id == leader_alive_id), None)
+                    if current is None:
+                        new_leader_id = best.person_id
+                    elif chief_score(best) > chief_score(current) * 1.12:
+                        new_leader_id = best.person_id
+                    else:
+                        new_leader_id = leader_alive_id
+                next_election = None
+
+            elif gov == "oligarchy":
+                elite_people = [p for p in sorted_r if p.person_id in elite_ids]
+                pool = elite_people if elite_people else sorted_r
+                if leader_alive_id is None:
+                    new_leader_id = pool[0].person_id
+                else:
+                    cur = next((p for p in pool if p.person_id == leader_alive_id), None)
+                    if cur is None:
+                        new_leader_id = pool[0].person_id
+                    elif self.rng.random() < 0.04 and pool[0].person_id != leader_alive_id:
+                        new_leader_id = pool[0].person_id
+                    else:
+                        new_leader_id = leader_alive_id
+                next_election = None
+
+            elif gov == "democracy":
+                cand_n = max(3, min(len(sorted_r), int(len(residents) * 0.2) + 2))
+                candidates = sorted_r[:cand_n]
+                weights = [max(0.06, p.political_power * (0.35 + p.happiness)) for p in candidates]
+                if election_due or leader_alive_id is None:
+                    picked = self.rng.choices(candidates, weights=weights, k=1)[0]
+                    new_leader_id = picked.person_id
+                    next_election = year + max(3, cfg.election_interval_years)
+                else:
+                    new_leader_id = leader_alive_id
+                    next_election = ne if isinstance(ne, int) else year + cfg.election_interval_years
+
+            elif gov == "monarchy":
+                fac = monarch_faction if isinstance(monarch_faction, str) else None
+                if leader_alive_id is None:
+                    if fac:
+                        same = [p for p in sorted_r if p.faction == fac]
+                        pick_from = same if same else sorted_r
+                    else:
+                        pick_from = sorted_r
+                    new_leader_id = pick_from[0].person_id
+                else:
+                    new_leader_id = leader_alive_id
+                next_election = None
+                lp = next((p for p in residents if p.person_id == new_leader_id), None)
+                monarch_faction = lp.faction if lp else fac
+
+            else:  # autocracy
+                best = max(
+                    residents,
+                    key=lambda p: p.political_power * (0.55 + 0.45 * p.aggression),
+                )
+                if leader_alive_id is None:
+                    new_leader_id = best.person_id
+                else:
+                    cur = next((p for p in residents if p.person_id == leader_alive_id), None)
+                    if cur is None:
+                        new_leader_id = best.person_id
+                    elif (
+                        best.person_id != leader_alive_id
+                        and best.political_power * (0.55 + 0.45 * best.aggression)
+                        > cur.political_power * (0.55 + 0.45 * cur.aggression) * 1.2
+                    ):
+                        new_leader_id = best.person_id
+                    else:
+                        new_leader_id = leader_alive_id
+                next_election = None
+
+            title = self._leader_title_for_government(gov)
+            state = {
+                "government": gov,
+                "leader_id": new_leader_id,
+                "leader_title": title,
+                "elite_ids": elite_ids,
+                "next_election_year": next_election,
+                "monarch_faction": monarch_faction if gov == "monarchy" else None,
+            }
+            self.politics_by_region[region_id] = state
+
+            if prev_gov != gov:
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"Government: {gov.replace('_', ' ')}",
+                        f"The settlement organizes as {gov}; power stratifies with size and literacy.",
+                    )
+                )
+            if new_leader_id != prev_leader_int and new_leader_id is not None:
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"{title} #{new_leader_id}",
+                        f"Leadership passes in a {gov} system; elites hold ~{cfg.elite_fraction:.0%} of formal sway.",
+                    )
+                )
+
+        return stories
 
     def _generate_settlement_name(self, region_id: int) -> str:
         base = [
@@ -967,6 +1223,11 @@ class SimulationEngine:
             structure["culture"] = culture
             structure["faction"] = faction
             structure["language"] = language
+            pol = self.politics_by_region.get(region_id, {})
+            structure["government"] = str(pol.get("government", "informal"))
+            structure["leader_id"] = pol.get("leader_id")
+            lt = pol.get("leader_title", "")
+            structure["leader_title"] = str(lt) if lt is not None else ""
             if structure.get("level") == "city":
                 self.city_summaries.append(
                     {
@@ -976,6 +1237,9 @@ class SimulationEngine:
                         "faction": str(faction),
                         "language": str(language),
                         "population": pop,
+                        "government": str(pol.get("government", "informal")),
+                        "leader_title": str(lt) if lt is not None else "",
+                        "leader_id": pol.get("leader_id"),
                     }
                 )
 
