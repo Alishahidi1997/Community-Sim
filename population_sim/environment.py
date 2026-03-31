@@ -25,5 +25,16 @@ class Environment:
             )
 
     def available_food(self, population_size: int) -> float:
-        return population_size * self.config.base_food_per_capita * self.food_multiplier
+        if population_size <= 0:
+            return 0.0
+        # Sub-linear scaling creates a soft carrying-capacity effect so food does
+        # not grow linearly forever with population.
+        effective_population = population_size ** 0.9
+        congestion = 1.0 / (1.0 + (population_size / 1200.0) ** 0.65)
+        return (
+            effective_population
+            * self.config.base_food_per_capita
+            * self.food_multiplier
+            * (0.65 + 0.35 * congestion)
+        )
 

@@ -259,6 +259,8 @@ class SimulationEngine:
     def _generate_births(self, alive: list[Individual], era_birth_multiplier: float = 1.0) -> list[Individual]:
         cfg = self.config.demographics
         pathogen_names = [p.name for p in self.config.pathogens]
+        alive_count = len(alive)
+        crowding_penalty = 1.0 / (1.0 + max(0.0, (alive_count - 900.0) / 650.0))
         food_ratio_by_region = self._food_ratio_by_region(alive)
         infection_ratio_by_region = self._infection_ratio_by_region(alive)
         bcfg = self.config.behavior
@@ -300,6 +302,7 @@ class SimulationEngine:
             fertility_score *= era_birth_multiplier
             fertility_score *= 1.0 + ((mother.knowledge + father.knowledge) * 0.08)
             fertility_score *= max(0.4, 0.8 + (self._individual_productivity(mother) + self._individual_productivity(father)) * 0.15)
+            fertility_score *= crowding_penalty
             fertility_score = max(0.0, min(1.0, fertility_score))
             if self.rng.random() >= fertility_score:
                 continue
