@@ -63,6 +63,8 @@ class SimulationEngine:
         self.next_person_id = 1
         # region_id -> government state (leader, elites, elections)
         self.politics_by_region: dict[int, dict[str, object]] = {}
+        self._friend_degree_cache: dict[int, int] = {}
+        self._enemy_degree_cache: dict[int, int] = {}
         self._initialize_population()
 
     def _initialize_population(self) -> None:
@@ -158,7 +160,7 @@ class SimulationEngine:
                 enmities=len(self.enmities),
             )
 
-            if not any(p.alive for p in self.population):
+            if self.stats.history and self.stats.history[-1].population == 0:
                 break
         return self.stats
 
@@ -185,6 +187,7 @@ class SimulationEngine:
         self.contact_graph = self._rewire_contact_graph(alive, self.contact_graph)
         self._prune_social_edges(alive)
         self._simulate_social_dynamics(alive)
+        self._rebuild_social_degree_cache()
         self._apply_social_learning(alive)
         self._craft_tools_and_books(alive, year)
         alliance_stories, alliance_deaths = self._simulate_alliances_and_war(alive, year)
@@ -229,7 +232,8 @@ class SimulationEngine:
                 person.alive = False
                 deaths += 1
 
-        newborns = self._generate_births(era["birth_multiplier"] * (1.0 - self.temp_birth_penalty))
+        alive_for_births = [p for p in alive if p.alive]
+        newborns = self._generate_births(alive_for_births, era["birth_multiplier"] * (1.0 - self.temp_birth_penalty))
         births = len(newborns)
         self.population.extend(newborns)
 
@@ -252,25 +256,23 @@ class SimulationEngine:
         }
         return births, deaths, available_food
 
-    def _generate_births(self, era_birth_multiplier: float = 1.0) -> list[Individual]:
+    def _generate_births(self, alive: list[Individual], era_birth_multiplier: float = 1.0) -> list[Individual]:
         cfg = self.config.demographics
         pathogen_names = [p.name for p in self.config.pathogens]
-        food_ratio_by_region = self._food_ratio_by_region([p for p in self.population if p.alive])
-        infection_ratio_by_region = self._infection_ratio_by_region([p for p in self.population if p.alive])
+        food_ratio_by_region = self._food_ratio_by_region(alive)
+        infection_ratio_by_region = self._infection_ratio_by_region(alive)
         bcfg = self.config.behavior
         females = [
             p
-            for p in self.population
-            if p.alive
-            and p.gender == Gender.FEMALE
+            for p in alive
+            if p.gender == Gender.FEMALE
             and cfg.reproductive_age_min <= p.age <= cfg.reproductive_age_max
             and p.health > 0.35
         ]
         males = [
             p
-            for p in self.population
-            if p.alive
-            and p.gender == Gender.MALE
+            for p in alive
+            if p.gender == Gender.MALE
             and cfg.reproductive_age_min <= p.age <= cfg.reproductive_age_max
             and p.health > 0.35
         ]
@@ -422,7 +424,17 @@ class SimulationEngine:
 
     def _build_contact_graph(self, alive: list[Individual]) -> dict[int, list[int]]:
         graph: dict[int, set[int]] = defaultdict(set)
-        avg = max(1, self.config.contact_network.avg_contacts)
+        base_avg = max(1, self.config.contact_network.avg_contacts)
+        pop = len(alive)
+        # Adaptive contact throttling keeps very large populations tractable.
+        if pop > 3000:
+            avg = max(2, int(base_avg * 0.2))
+        elif pop > 1600:
+            avg = max(2, int(base_avg * 0.35))
+        elif pop > 900:
+            avg = max(3, int(base_avg * 0.55))
+        else:
+            avg = base_avg
         people = alive[:]
         self.rng.shuffle(people)
         bcfg = self.config.behavior
@@ -613,9 +625,19 @@ class SimulationEngine:
         self.friendships = {pair for pair in self.friendships if pair[0] in alive_ids and pair[1] in alive_ids}
         self.enmities = {pair for pair in self.enmities if pair[0] in alive_ids and pair[1] in alive_ids}
 
+    def _rebuild_social_degree_cache(self) -> None:
+        self._friend_degree_cache = {}
+        self._enemy_degree_cache = {}
+        for a, b in self.friendships:
+            self._friend_degree_cache[a] = self._friend_degree_cache.get(a, 0) + 1
+            self._friend_degree_cache[b] = self._friend_degree_cache.get(b, 0) + 1
+        for a, b in self.enmities:
+            self._enemy_degree_cache[a] = self._enemy_degree_cache.get(a, 0) + 1
+            self._enemy_degree_cache[b] = self._enemy_degree_cache.get(b, 0) + 1
+
     def _individual_productivity(self, person: Individual) -> float:
-        friend_count = sum(1 for a, b in self.friendships if a == person.person_id or b == person.person_id)
-        enemy_count = sum(1 for a, b in self.enmities if a == person.person_id or b == person.person_id)
+        friend_count = self._friend_degree_cache.get(person.person_id, 0)
+        enemy_count = self._enemy_degree_cache.get(person.person_id, 0)
         social_bonus = min(0.2, friend_count * 0.01) - min(0.18, enemy_count * 0.015)
         emotional = person.happiness * 0.45 - person.stress * 0.35 - person.aggression * 0.15
         skill = person.knowledge * 0.22 + person.tool_skill * 0.28

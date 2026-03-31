@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import os
 import random
 from collections import defaultdict
 
 from population_sim.config import PathogenConfig
 from population_sim.models import DiseaseState, Individual
+
+try:
+    import cupy as _cp  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    _cp = None
 
 
 class MultiDiseaseModel:
@@ -12,6 +18,7 @@ class MultiDiseaseModel:
         self.configs = configs
         self.rng = rng
         self.pathogen_index = {cfg.name: cfg for cfg in configs}
+        self.gpu_enabled = os.getenv("POP_SIM_USE_GPU", "0") == "1" and _cp is not None
 
     def seed_initial_infections(self, population: list[Individual]) -> None:
         for person in population:
@@ -27,38 +34,132 @@ class MultiDiseaseModel:
     ) -> None:
         alive_map = {p.person_id: p for p in population if p.alive}
         to_infect: dict[str, set[int]] = defaultdict(set)
+        gpu_candidates: dict[str, list[tuple[int, float]]] = defaultdict(list)
 
-        for person in alive_map.values():
-            for neighbor_id in contacts.get(person.person_id, []):
+        # Traverse each undirected edge once, then evaluate both directions.
+        for person_id, neighbor_ids in contacts.items():
+            person = alive_map.get(person_id)
+            if person is None:
+                continue
+            for neighbor_id in neighbor_ids:
+                if person_id >= neighbor_id:
+                    continue
                 neighbor = alive_map.get(neighbor_id)
                 if neighbor is None:
                     continue
-                weight = 1.0 if neighbor.region_id == person.region_id else cross_region_contact_rate
-                if weight <= 0:
-                    continue
 
-                for pathogen_name, cfg in self.pathogen_index.items():
-                    if neighbor.disease_states.get(pathogen_name) != DiseaseState.INFECTED:
-                        continue
-                    if person.disease_states.get(pathogen_name) != DiseaseState.SUSCEPTIBLE:
-                        continue
-                    immunity = person.immunity_levels.get(pathogen_name, 0.0)
-                    genetic_immunity = person.genetic_traits.get("immunity", 0.5)
-                    vaccination_factor = 1.0 - (0.45 if person.vaccinated else 0.0)
-                    risk = (
-                        cfg.infection_rate
-                        * person.disease_susceptibility
-                        * (1.05 - genetic_immunity)
-                        * (1.0 - immunity)
-                        * vaccination_factor
-                        * weight
-                    )
-                    if self.rng.random() < max(0.0, min(1.0, risk)):
-                        to_infect[pathogen_name].add(person.person_id)
+                weight_ab = 1.0 if neighbor.region_id == person.region_id else cross_region_contact_rate
+                if weight_ab > 0:
+                    if self.gpu_enabled:
+                        self._collect_pair_transmission_candidates(
+                            src=neighbor,
+                            dst=person,
+                            weight=weight_ab,
+                            candidates=gpu_candidates,
+                        )
+                        self._collect_pair_transmission_candidates(
+                            src=person,
+                            dst=neighbor,
+                            weight=weight_ab,
+                            candidates=gpu_candidates,
+                        )
+                    else:
+                        self._try_pair_transmission(src=neighbor, dst=person, weight=weight_ab, to_infect=to_infect)
+                        self._try_pair_transmission(src=person, dst=neighbor, weight=weight_ab, to_infect=to_infect)
+
+        if self.gpu_enabled:
+            self._resolve_gpu_transmission_candidates(gpu_candidates, to_infect)
 
         for pathogen_name, ids in to_infect.items():
             for pid in ids:
                 alive_map[pid].disease_states[pathogen_name] = DiseaseState.INFECTED
+
+    def _collect_pair_transmission_candidates(
+        self,
+        src: Individual,
+        dst: Individual,
+        weight: float,
+        candidates: dict[str, list[tuple[int, float]]],
+    ) -> None:
+        if weight <= 0:
+            return
+        vaccination_factor = 1.0 - (0.45 if dst.vaccinated else 0.0)
+        genetic_immunity = dst.genetic_traits.get("immunity", 0.5)
+        susceptibility = dst.disease_susceptibility
+        for pathogen_name, cfg in self.pathogen_index.items():
+            if src.disease_states.get(pathogen_name) != DiseaseState.INFECTED:
+                continue
+            if dst.disease_states.get(pathogen_name) != DiseaseState.SUSCEPTIBLE:
+                continue
+            immunity = dst.immunity_levels.get(pathogen_name, 0.0)
+            risk = (
+                cfg.infection_rate
+                * susceptibility
+                * (1.05 - genetic_immunity)
+                * (1.0 - immunity)
+                * vaccination_factor
+                * weight
+            )
+            risk = max(0.0, min(1.0, risk))
+            if risk > 0:
+                candidates[pathogen_name].append((dst.person_id, risk))
+
+    def _resolve_gpu_transmission_candidates(
+        self,
+        candidates: dict[str, list[tuple[int, float]]],
+        to_infect: dict[str, set[int]],
+    ) -> None:
+        if _cp is None:
+            return
+        for pathogen_name, rows in candidates.items():
+            if not rows:
+                continue
+            person_ids = [pid for pid, _ in rows]
+            risks = [risk for _, risk in rows]
+            try:
+                risk_arr = _cp.asarray(risks, dtype=_cp.float32)
+                rand_arr = _cp.random.random(risk_arr.shape[0]).astype(_cp.float32)
+                hits = _cp.asnumpy(rand_arr < risk_arr)
+            except Exception:
+                # Safe fallback to CPU RNG if GPU path fails at runtime.
+                for pid, risk in rows:
+                    if self.rng.random() < risk:
+                        to_infect[pathogen_name].add(pid)
+                continue
+
+            for idx, hit in enumerate(hits):
+                if bool(hit):
+                    to_infect[pathogen_name].add(person_ids[idx])
+
+    def _try_pair_transmission(
+        self,
+        src: Individual,
+        dst: Individual,
+        weight: float,
+        to_infect: dict[str, set[int]],
+    ) -> None:
+        if weight <= 0:
+            return
+        vaccination_factor = 1.0 - (0.45 if dst.vaccinated else 0.0)
+        genetic_immunity = dst.genetic_traits.get("immunity", 0.5)
+        susceptibility = dst.disease_susceptibility
+
+        for pathogen_name, cfg in self.pathogen_index.items():
+            if src.disease_states.get(pathogen_name) != DiseaseState.INFECTED:
+                continue
+            if dst.disease_states.get(pathogen_name) != DiseaseState.SUSCEPTIBLE:
+                continue
+            immunity = dst.immunity_levels.get(pathogen_name, 0.0)
+            risk = (
+                cfg.infection_rate
+                * susceptibility
+                * (1.05 - genetic_immunity)
+                * (1.0 - immunity)
+                * vaccination_factor
+                * weight
+            )
+            if self.rng.random() < max(0.0, min(1.0, risk)):
+                to_infect[pathogen_name].add(dst.person_id)
 
     def apply_progression_and_mutation(self, person: Individual) -> int:
         if not person.alive:
