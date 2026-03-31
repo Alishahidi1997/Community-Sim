@@ -826,6 +826,9 @@ class SimulationEngine:
         avg_tools = sum(p.tool_skill for p in alive) / pop
         belief_groups = len({p.belief_group for p in alive})
         avg_spiritual = sum(p.spiritual_tendency for p in alive) / pop
+        by_region: dict[int, list[Individual]] = defaultdict(list)
+        for person in alive:
+            by_region[person.region_id].append(person)
 
         if (not self.agriculture_unlocked) and (self.current_era != "hunter-gatherer" or avg_tools > 0.42):
             self.agriculture_unlocked = True
@@ -837,90 +840,131 @@ class SimulationEngine:
                 )
             )
 
-        # Settlement progression as concrete state transitions.
-        settlement = self._get_settlement_structure(0)
-        if settlement is not None:
-            level = settlement["level"]
+        # Settlement progression as concrete state transitions per region/community.
+        for region_id, residents in by_region.items():
+            settlement = self._get_settlement_structure(region_id)
+            if settlement is None:
+                settlement = {
+                    "id": f"settlement_{region_id}",
+                    "name": self._generate_settlement_name(region_id),
+                    "kind": "settlement",
+                    "level": "camp",
+                    "region_id": region_id,
+                    "slot": max(0.08, min(0.92, self.rng.uniform(0.18, 0.82))),
+                    "culture": "tribal",
+                    "religion": "ancestor",
+                }
+                self.world_structures.append(settlement)
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"New settlement founded: {settlement['name']}",
+                        "Migrants established a new community center.",
+                    )
+                )
+
+            rpop = len(residents)
+            ravg_knowledge = sum(p.knowledge for p in residents) / rpop
+            ravg_tools = sum(p.tool_skill for p in residents) / rpop
+            level = str(settlement["level"])
             next_level = None
-            if level == "camp" and pop >= 18 and self.agriculture_unlocked:
+            if level == "camp" and rpop >= 14 and self.agriculture_unlocked:
                 next_level = "village"
-            elif level == "village" and pop >= 70 and self.civilization_index > 0.32:
+            elif level == "village" and rpop >= 55 and (ravg_knowledge + ravg_tools) * 0.5 > 0.34:
                 next_level = "town"
-            elif level == "town" and pop >= 170 and self.civilization_index > 0.5:
+            elif level == "town" and rpop >= 130 and (ravg_knowledge + ravg_tools) * 0.5 > 0.5:
                 next_level = "city"
             if next_level:
                 settlement["level"] = next_level
-                if next_level == "city":
+                if next_level == "city" and not str(settlement.get("name", "")).endswith(" City"):
                     settlement["name"] = f"{settlement['name']} City"
                 stories.append(
                     self._register_timeline_transition(
                         year,
                         f"Settlement evolved: {settlement['name']} {level} -> {next_level}",
-                        f"Population and organization enabled a {next_level}.",
+                        f"Regional population and institutions enabled a {next_level}.",
                     )
                 )
 
         # Agriculture fields become visible structures after agriculture unlock.
         if self.agriculture_unlocked:
-            existing_fields = len([s for s in self.world_structures if s["kind"] == "field"])
-            target_fields = min(14, max(2, int(pop / 18)))
-            while existing_fields < target_fields:
-                slot = 0.12 + (existing_fields % 8) * 0.1
-                self.world_structures.append(
-                    {
-                        "id": f"field_{existing_fields}",
-                        "kind": "field",
-                        "level": 1,
-                        "region_id": 0,
-                        "slot": max(0.08, min(0.92, slot)),
-                    }
-                )
-                existing_fields += 1
-            if existing_fields == target_fields and target_fields >= 2:
-                # Register first-time field establishment only once.
+            existing_fields = [s for s in self.world_structures if s["kind"] == "field"]
+            existing_by_region: dict[int, int] = defaultdict(int)
+            for field in existing_fields:
+                existing_by_region[int(field.get("region_id", 0))] += 1
+            for region_id, residents in by_region.items():
+                target_fields = min(8, max(1, int(len(residents) / 26)))
+                while existing_by_region.get(region_id, 0) < target_fields:
+                    idx = len([s for s in self.world_structures if s.get("kind") == "field"])
+                    slot = 0.12 + (existing_by_region[region_id] % 8) * 0.1
+                    self.world_structures.append(
+                        {
+                            "id": f"field_{region_id}_{idx}",
+                            "kind": "field",
+                            "level": 1,
+                            "region_id": region_id,
+                            "slot": max(0.08, min(0.92, slot)),
+                        }
+                    )
+                    existing_by_region[region_id] += 1
+            # Register first-time field establishment only once.
+            if any(s.get("kind") == "field" for s in self.world_structures):
                 if not any(e["title"] == "Agricultural fields established" for e in self.timeline_events):
                     stories.append(
                         self._register_timeline_transition(
                             year,
                             "Agricultural fields established",
-                            "Farms appeared around the settlement.",
+                            "Farms appeared around the settlements.",
                         )
                     )
 
-        # Institutions based on social practice.
-        if avg_knowledge > 0.55 and pop >= 80 and not self._has_structure("school"):
-            self.world_structures.append(
-                {"id": "school_0", "kind": "school", "level": 1, "region_id": 0, "slot": 0.3}
-            )
-            stories.append(
-                self._register_timeline_transition(
-                    year,
-                    "School founded",
-                    "Knowledge density supports formal learning.",
+        # Institutions based on social practice per region.
+        for region_id, residents in by_region.items():
+            rpop = len(residents)
+            ravg_knowledge = sum(p.knowledge for p in residents) / rpop
+            ravg_tools = sum(p.tool_skill for p in residents) / rpop
+            ravg_spiritual = sum(p.spiritual_tendency for p in residents) / rpop
+            rbelief_groups = len({p.belief_group for p in residents})
+
+            if ravg_knowledge > 0.55 and rpop >= 45 and not self._has_structure_in_region("school", region_id):
+                self.world_structures.append(
+                    {"id": f"school_{region_id}", "kind": "school", "level": 1, "region_id": region_id, "slot": 0.3}
                 )
-            )
-        if avg_tools > 0.58 and pop >= 70 and not self._has_structure("workshop"):
-            self.world_structures.append(
-                {"id": "workshop_0", "kind": "workshop", "level": 1, "region_id": 0, "slot": 0.68}
-            )
-            stories.append(
-                self._register_timeline_transition(
-                    year,
-                    "Workshop district formed",
-                    "Craft specialization creates workshops.",
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"School founded in {self._region_name(region_id)}",
+                        "Knowledge density supports formal learning.",
+                    )
                 )
-            )
-        if (avg_spiritual > 0.55 or belief_groups >= 3) and pop >= 65 and not self._has_structure("temple"):
-            self.world_structures.append(
-                {"id": "temple_0", "kind": "temple", "level": 1, "region_id": 0, "slot": 0.5}
-            )
-            stories.append(
-                self._register_timeline_transition(
-                    year,
-                    "Temple built",
-                    "Shared ritual practices establish a temple.",
+            if ravg_tools > 0.58 and rpop >= 40 and not self._has_structure_in_region("workshop", region_id):
+                self.world_structures.append(
+                    {"id": f"workshop_{region_id}", "kind": "workshop", "level": 1, "region_id": region_id, "slot": 0.68}
                 )
-            )
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"Workshop district formed in {self._region_name(region_id)}",
+                        "Craft specialization creates workshops.",
+                    )
+                )
+            if (ravg_spiritual > 0.55 or rbelief_groups >= 2) and rpop >= 40 and not self._has_structure_in_region(
+                "temple",
+                region_id,
+            ):
+                self.world_structures.append(
+                    {"id": f"temple_{region_id}", "kind": "temple", "level": 1, "region_id": region_id, "slot": 0.5}
+                )
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"Temple built in {self._region_name(region_id)}",
+                        "Shared ritual practices establish a temple.",
+                    )
+                )
+
+        split_stories = self._simulate_city_separation_and_civil_war(year, alive, by_region)
+        stories.extend(split_stories)
 
         politics_stories = self._update_politics(year, alive)
         stories.extend(politics_stories)
@@ -936,11 +980,20 @@ class SimulationEngine:
     def _has_structure(self, kind: str) -> bool:
         return any(s["kind"] == kind for s in self.world_structures)
 
+    def _has_structure_in_region(self, kind: str, region_id: int) -> bool:
+        return any(s["kind"] == kind and int(s.get("region_id", -1)) == region_id for s in self.world_structures)
+
     def _get_settlement_structure(self, region_id: int) -> dict[str, int | str | float] | None:
         for structure in self.world_structures:
             if structure["kind"] == "settlement" and structure["region_id"] == region_id:
                 return structure
         return None
+
+    def _region_name(self, region_id: int) -> str:
+        settlement = self._get_settlement_structure(region_id)
+        if settlement is None:
+            return f"Region-{region_id}"
+        return str(settlement.get("name", f"Region-{region_id}"))
 
     def _effective_government(self, settlement_level: str, civ: float) -> str:
         mode = self.config.politics.government_mode
@@ -1228,6 +1281,10 @@ class SimulationEngine:
             structure["leader_id"] = pol.get("leader_id")
             lt = pol.get("leader_title", "")
             structure["leader_title"] = str(lt) if lt is not None else ""
+            power_style = self._power_style_label(residents, str(pol.get("government", "informal")))
+            community = self._community_model_label(residents, structure.get("level", "camp"))
+            structure["power_style"] = power_style
+            structure["community"] = community
             if structure.get("level") == "city":
                 self.city_summaries.append(
                     {
@@ -1240,6 +1297,8 @@ class SimulationEngine:
                         "government": str(pol.get("government", "informal")),
                         "leader_title": str(lt) if lt is not None else "",
                         "leader_id": pol.get("leader_id"),
+                        "power_style": str(power_style),
+                        "community": str(community),
                     }
                 )
 
@@ -1273,6 +1332,132 @@ class SimulationEngine:
         if not counts:
             return "mixed"
         return max(counts.items(), key=lambda x: x[1])[0]
+
+    def _power_style_label(self, residents: list[Individual], government: str) -> str:
+        if not residents:
+            return "informal"
+        powers = sorted((p.political_power for p in residents), reverse=True)
+        top_n = max(1, min(len(powers), int(len(powers) * 0.1)))
+        concentration = sum(powers[:top_n]) / max(1e-6, sum(powers))
+        avg_aggr = sum(p.aggression for p in residents) / len(residents)
+        if government in ("autocracy", "monarchy") and concentration > 0.36:
+            return "centralized-rule"
+        if government == "oligarchy" or concentration > 0.43:
+            return "elite-council"
+        if avg_aggr > 0.62:
+            return "military-command"
+        if government in ("democracy", "republic"):
+            return "civic-representation"
+        return "local-assembly"
+
+    def _community_model_label(self, residents: list[Individual], level: str | int) -> str:
+        if not residents:
+            return "mixed"
+        avg_knowledge = sum(p.knowledge for p in residents) / len(residents)
+        avg_tools = sum(p.tool_skill for p in residents) / len(residents)
+        avg_spiritual = sum(p.spiritual_tendency for p in residents) / len(residents)
+        avg_aggr = sum(p.aggression for p in residents) / len(residents)
+        if avg_aggr > 0.62:
+            return "militant"
+        if avg_spiritual > 0.7:
+            return "faith-centered"
+        if avg_knowledge > 0.7:
+            return "scholarly"
+        if avg_tools > 0.68:
+            return "craft-industrial"
+        if level == "camp":
+            return "tribal"
+        return "civic-mercantile"
+
+    def _simulate_city_separation_and_civil_war(
+        self,
+        year: int,
+        alive: list[Individual],
+        by_region: dict[int, list[Individual]],
+    ) -> list[str]:
+        stories: list[str] = []
+        if len(alive) < 80:
+            return stories
+        for region_id, residents in list(by_region.items()):
+            if len(residents) < 70:
+                continue
+            settlement = self._get_settlement_structure(region_id)
+            if settlement is None:
+                continue
+            level = str(settlement.get("level", "camp"))
+            if level not in ("town", "city"):
+                continue
+
+            avg_stress = sum(p.stress for p in residents) / len(residents)
+            avg_aggr = sum(p.aggression for p in residents) / len(residents)
+            factions = {p.faction for p in residents}
+            languages = {p.language for p in residents}
+            fragmentation = min(1.0, (len(factions) - 1) * 0.16 + (len(languages) - 1) * 0.11)
+            civil_war_prob = min(0.22, max(0.0, (avg_stress - 0.5) * 0.3 + (avg_aggr - 0.5) * 0.25 + fragmentation * 0.2))
+            secession_prob = min(0.16, max(0.0, (avg_stress - 0.45) * 0.24 + fragmentation * 0.18))
+
+            event: str | None = None
+            if self.rng.random() < civil_war_prob:
+                event = "civil_war"
+            elif self.rng.random() < secession_prob:
+                event = "secession"
+            if event is None:
+                continue
+
+            newcomer_region = len(self.environments)
+            self.environments.append(Environment(self.config.environment, self.rng))
+            self.config.demographics.region_count = len(self.environments)
+
+            split_by_faction: dict[str, list[Individual]] = defaultdict(list)
+            for p in residents:
+                split_by_faction[p.faction].append(p)
+            target_faction, target_group = max(split_by_faction.items(), key=lambda kv: len(kv[1]))
+            movers = target_group[:]
+            min_movers = max(18, int(len(residents) * 0.22))
+            if len(movers) < min_movers:
+                others = [p for p in residents if p.faction != target_faction]
+                self.rng.shuffle(others)
+                movers.extend(others[: max(0, min_movers - len(movers))])
+
+            self.rng.shuffle(movers)
+            movers = movers[: max(12, min(len(movers), int(len(residents) * 0.45)))]
+            for p in movers:
+                p.region_id = newcomer_region
+                p.stress = max(0.0, p.stress - 0.06)
+
+            new_name = self._generate_settlement_name(newcomer_region)
+            new_level = "village" if len(movers) < 80 else "town"
+            self.world_structures.append(
+                {
+                    "id": f"settlement_{newcomer_region}",
+                    "name": new_name,
+                    "kind": "settlement",
+                    "level": new_level,
+                    "region_id": newcomer_region,
+                    "slot": max(0.1, min(0.9, self.rng.uniform(0.2, 0.82))),
+                    "culture": "mixed",
+                    "religion": self._dominant_belief(movers),
+                }
+            )
+
+            if event == "civil_war":
+                casualties = self._apply_direct_deaths(movers, 0.07, 2)
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"Civil war in {self._region_name(region_id)}",
+                        f"{casualties} deaths; rebels founded {new_name}.",
+                    )
+                )
+            else:
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"Secession: {new_name} splits",
+                        f"A {target_faction} bloc left {self._region_name(region_id)} and formed a new polity.",
+                    )
+                )
+        return stories
 
     def _auto_adjust_parameters(self, alive: list[Individual], available_food: float) -> list[str]:
         """Autonomous parameter adaptation based on simulation state."""

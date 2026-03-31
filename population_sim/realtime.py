@@ -672,7 +672,7 @@ class RealtimeVisualizer:
         for idx, city in enumerate(rows, start=start + 1):
             line = (
                 f"{idx:>2}. {city['name']} | pop {city['population']} | "
-                f"{city['culture']} | {city['religion']} | "
+                f"{city.get('community', city['culture'])} | {city['religion']} | "
                 f"{city.get('faction','?')} | {city.get('language','?')}"
             )
             txt = small_font.render(line[:56], True, (202, 208, 223))
@@ -681,7 +681,8 @@ class RealtimeVisualizer:
             gov = city.get("government", "?")
             lt = city.get("leader_title", "") or "Leader"
             lid = city.get("leader_id")
-            sub = f"     {gov}" + (f" — {lt} #{lid}" if lid is not None else "")
+            power_style = city.get("power_style", "local-assembly")
+            sub = f"     {gov}/{power_style}" + (f" — {lt} #{lid}" if lid is not None else "")
             sub_t = small_font.render(sub[:56], True, (160, 176, 198))
             screen.blit(sub_t, (ledger_rect.left + 8, y))
             y += 22
