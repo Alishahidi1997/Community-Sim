@@ -21,12 +21,12 @@ def build_default_config() -> SimulationConfig:
         years=1000,
         random_seed=7,
         demographics=DemographicsConfig(
-            initial_population=2,
-            region_count=1,
+            initial_population=90,
+            region_count=6,
             max_age=110,
             reproductive_age_min=18,
             reproductive_age_max=46,
-            base_birth_rate=0.55,
+            base_birth_rate=0.42,
             partner_match_rate=0.95,
             child_mortality=0.002,
             natural_mortality_base=0.0015,
@@ -34,7 +34,7 @@ def build_default_config() -> SimulationConfig:
             fertility_trait_weight=0.45,
         ),
         environment=EnvironmentConfig(
-            base_food_per_capita=1.3,
+            base_food_per_capita=1.75,
             food_variability=0.05,
             environmental_stress=0.01,
             shock_probability=0.015,
@@ -137,8 +137,9 @@ def print_city_summary(engine: SimulationEngine) -> None:
     for city in engine.city_summaries[:10]:
         print(
             f"- {city['name']} | pop={city['population']} | "
-            f"culture={city['culture']} | religion={city['religion']} | "
-            f"faction={city['faction']} | language={city['language']}"
+            f"community={city.get('community', city['culture'])} | religion={city['religion']} | "
+            f"faction={city['faction']} | language={city['language']} | "
+            f"power={city.get('power_style', '?')} | resources={city.get('resource_score', '?')}"
         )
 
 

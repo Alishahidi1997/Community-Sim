@@ -37,6 +37,7 @@ class Individual:
     happiness: float
     stress: float
     aggression: float
+    ambition: float
     faction: str
     language: str
     personal_tools: int
@@ -66,11 +67,12 @@ def random_social_profile(rng: random.Random) -> tuple[float, float, float, str]
     )
 
 
-def random_emotional_profile(rng: random.Random) -> tuple[float, float, float]:
+def random_emotional_profile(rng: random.Random) -> tuple[float, float, float, float]:
     return (
         rng.uniform(0.45, 0.7),   # happiness
         rng.uniform(0.2, 0.5),    # stress
         rng.uniform(0.1, 0.4),    # aggression
+        rng.uniform(0.15, 0.75),  # ambition
     )
 
 
@@ -107,9 +109,10 @@ def inherit_emotions(
     mother: Individual,
     father: Individual,
     rng: random.Random,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, float]:
     happiness = max(0.0, min(1.0, rng.gauss((mother.happiness + father.happiness) / 2.0, 0.07)))
     stress = max(0.0, min(1.0, rng.gauss((mother.stress + father.stress) / 2.0, 0.07)))
     aggression = max(0.0, min(1.0, rng.gauss((mother.aggression + father.aggression) / 2.0, 0.07)))
-    return happiness, stress, aggression
+    ambition = max(0.0, min(1.0, rng.gauss((mother.ambition + father.ambition) / 2.0, 0.08)))
+    return happiness, stress, aggression, ambition
 

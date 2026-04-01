@@ -46,7 +46,7 @@ class UISlider:
 
 
 class RealtimeVisualizer:
-    def __init__(self, engine: SimulationEngine, width: int = 1820, height: int = 1020) -> None:
+    def __init__(self, engine: SimulationEngine, width: int = 2140, height: int = 1120) -> None:
         self.engine = engine
         self.width = width
         self.height = height
@@ -64,7 +64,16 @@ class RealtimeVisualizer:
         self.sliders: list[UISlider] = []
         self.dragging_slider: UISlider | None = None
 
-        self.region_colors = [(72, 96, 70), (76, 86, 108), (106, 82, 80)]
+        self.region_colors = [
+            (72, 96, 70),
+            (76, 86, 108),
+            (106, 82, 80),
+            (118, 96, 68),
+            (90, 112, 86),
+            (92, 88, 122),
+            (124, 88, 92),
+            (84, 118, 120),
+        ]
         self.bg_color = (140, 185, 235)
         self.grid_color = (90, 120, 90)
         self.ground_color = (62, 130, 72)
@@ -317,6 +326,7 @@ class RealtimeVisualizer:
             f"Cities: {len(self.engine.city_summaries)} {self._city_line_summary()}",
             f"Politics: {self._politics_summary()}",
             f"Factions: {self._faction_summary_line()}   Conflict preset: {self.engine.config.conflict.preset}",
+            f"Trade routes: {len(getattr(self.engine, 'region_trade_links', []))}   Regions: {self.engine.config.demographics.region_count}",
             f"Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}",
             "Controls: SPACE pause | mouse drag sliders | ,/. speed | L labels | ESC quit",
         ]
@@ -673,7 +683,7 @@ class RealtimeVisualizer:
             line = (
                 f"{idx:>2}. {city['name']} | pop {city['population']} | "
                 f"{city.get('community', city['culture'])} | {city['religion']} | "
-                f"{city.get('faction','?')} | {city.get('language','?')}"
+                f"{city.get('faction','?')} | r={city.get('resource_score','?')}"
             )
             txt = small_font.render(line[:56], True, (202, 208, 223))
             screen.blit(txt, (ledger_rect.left + 8, y))

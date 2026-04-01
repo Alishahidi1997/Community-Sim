@@ -10,6 +10,13 @@ class Environment:
         self.config = config
         self.rng = rng
         self.food_multiplier = 1.0
+        self.resource_richness = {
+            "water": rng.uniform(0.35, 1.0),
+            "fertile_land": rng.uniform(0.3, 1.0),
+            "timber": rng.uniform(0.2, 1.0),
+            "ore": rng.uniform(0.15, 1.0),
+        }
+        self.territory_size = rng.uniform(0.75, 1.45)
 
     def update(self) -> None:
         swing = self.rng.uniform(
@@ -31,10 +38,23 @@ class Environment:
         # not grow linearly forever with population.
         effective_population = population_size ** 0.9
         congestion = 1.0 / (1.0 + (population_size / 1200.0) ** 0.65)
+        fertile_factor = 0.6 + self.resource_richness["fertile_land"] * 0.4
+        water_factor = 0.75 + self.resource_richness["water"] * 0.25
         return (
             effective_population
             * self.config.base_food_per_capita
             * self.food_multiplier
+            * self.territory_size
+            * fertile_factor
+            * water_factor
             * (0.65 + 0.35 * congestion)
         )
+
+    def resource_score(self) -> float:
+        return (
+            self.resource_richness["water"] * 0.32
+            + self.resource_richness["fertile_land"] * 0.3
+            + self.resource_richness["timber"] * 0.2
+            + self.resource_richness["ore"] * 0.18
+        ) * self.territory_size
 

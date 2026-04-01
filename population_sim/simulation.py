@@ -65,6 +65,8 @@ class SimulationEngine:
         self.politics_by_region: dict[int, dict[str, object]] = {}
         self._friend_degree_cache: dict[int, int] = {}
         self._enemy_degree_cache: dict[int, int] = {}
+        self.region_trade_links: set[tuple[int, int]] = set()
+        self.region_food_adjustments: dict[int, float] = {}
         self._initialize_population()
 
     def _initialize_population(self) -> None:
@@ -74,7 +76,7 @@ class SimulationEngine:
             for gender in founders:
                 traits = random_traits(self.rng)
                 knowledge, tool_skill, spiritual, belief_group = random_social_profile(self.rng)
-                happiness, stress, aggression = random_emotional_profile(self.rng)
+                happiness, stress, aggression, ambition = random_emotional_profile(self.rng)
                 faction = self.rng.choice(self.faction_names[:2])
                 language = self.language_names[0]
                 person = Individual(
@@ -96,6 +98,7 @@ class SimulationEngine:
                     happiness=happiness,
                     stress=stress,
                     aggression=aggression,
+                    ambition=ambition,
                     faction=faction,
                     language=language,
                     personal_tools=0,
@@ -111,7 +114,7 @@ class SimulationEngine:
                 gender = Gender.FEMALE if self.rng.random() < 0.5 else Gender.MALE
                 traits = random_traits(self.rng)
                 knowledge, tool_skill, spiritual, belief_group = random_social_profile(self.rng)
-                happiness, stress, aggression = random_emotional_profile(self.rng)
+                happiness, stress, aggression, ambition = random_emotional_profile(self.rng)
                 faction = self.rng.choice(self.faction_names)
                 language = self.rng.choice(self.language_names[:3])
                 person = Individual(
@@ -133,6 +136,7 @@ class SimulationEngine:
                     happiness=happiness,
                     stress=stress,
                     aggression=aggression,
+                    ambition=ambition,
                     faction=faction,
                     language=language,
                     personal_tools=0,
@@ -178,6 +182,10 @@ class SimulationEngine:
         for env in self.environments:
             env.update()
         self._decay_temporal_effects()
+        self.region_food_adjustments = {}
+        diplomacy_stories, diplomacy_deaths = self._simulate_regional_diplomacy(alive, year)
+        stories.extend(diplomacy_stories)
+        deaths += diplomacy_deaths
         available_food = self._available_food_total(alive)
         available_food *= max(0.2, 1.0 + self.food_system_bonus - self.temp_food_penalty)
         food_ratio_by_region = self._food_ratio_by_region(alive)
@@ -309,7 +317,7 @@ class SimulationEngine:
 
             traits = inherit_traits(mother, father, self.rng)
             knowledge, tool_skill, spiritual, belief_group = inherit_social_profile(mother, father, self.rng)
-            happiness, stress, aggression = inherit_emotions(mother, father, self.rng)
+            happiness, stress, aggression, ambition = inherit_emotions(mother, father, self.rng)
             political_power = max(
                 0.0,
                 min(
@@ -340,6 +348,7 @@ class SimulationEngine:
                 happiness=happiness,
                 stress=stress,
                 aggression=aggression,
+                ambition=ambition,
                 faction=faction,
                 language=language,
                 personal_tools=0,
@@ -361,7 +370,9 @@ class SimulationEngine:
             by_region[person.region_id] += 1
         total = 0.0
         for region_id, count in by_region.items():
-            total += self.environments[region_id].available_food(count)
+            regional_food = self.environments[region_id].available_food(count)
+            regional_food *= max(0.75, 1.0 + self.region_food_adjustments.get(region_id, 0.0))
+            total += regional_food
         return total
 
     def _food_ratio_by_region(self, alive: list[Individual]) -> dict[int, float]:
@@ -371,9 +382,92 @@ class SimulationEngine:
         ratios: dict[int, float] = {}
         for region_id, count in by_region.items():
             available = self.environments[region_id].available_food(count)
+            available *= max(0.75, 1.0 + self.region_food_adjustments.get(region_id, 0.0))
             modifier = max(0.2, 1.0 + self.food_system_bonus - self.temp_food_penalty)
             ratios[region_id] = (available * modifier) / count if count else 0.0
         return ratios
+
+    def _adjacent_region_pairs(self) -> list[tuple[int, int]]:
+        n = self.config.demographics.region_count
+        return [(i, i + 1) for i in range(max(0, n - 1))]
+
+    def _simulate_regional_diplomacy(self, alive: list[Individual], year: int) -> tuple[list[str], int]:
+        stories: list[str] = []
+        deaths = 0
+        if len(alive) < 20 or self.config.demographics.region_count < 2:
+            return stories, deaths
+        by_region: dict[int, list[Individual]] = defaultdict(list)
+        for p in alive:
+            by_region[p.region_id].append(p)
+
+        for ra, rb in self._adjacent_region_pairs():
+            pa = by_region.get(ra, [])
+            pb = by_region.get(rb, [])
+            if not pa or not pb:
+                continue
+            pair = (ra, rb)
+            avg_ambition = (
+                (sum(p.ambition for p in pa) / len(pa))
+                + (sum(p.ambition for p in pb) / len(pb))
+            ) * 0.5
+            avg_aggr = ((sum(p.aggression for p in pa) / len(pa)) + (sum(p.aggression for p in pb) / len(pb))) * 0.5
+            food_a = self.environments[ra].available_food(len(pa)) / max(1, len(pa))
+            food_b = self.environments[rb].available_food(len(pb)) / max(1, len(pb))
+            scarcity = max(0.0, 1.0 - ((food_a + food_b) * 0.5))
+            same_faction = self._dominant_label(pa, "faction") == self._dominant_label(pb, "faction")
+            diplomacy_score = (
+                (0.35 if same_faction else 0.0)
+                + (1.0 - abs(food_a - food_b)) * 0.2
+                + (1.0 - avg_aggr) * 0.25
+                + (1.0 - avg_ambition) * 0.2
+            )
+
+            if pair not in self.region_trade_links and diplomacy_score > 0.72 and self.rng.random() < 0.06:
+                self.region_trade_links.add(pair)
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"Trade pact: {self._region_name(ra)} ↔ {self._region_name(rb)}",
+                        "Diplomacy opened trade routes and migration corridors.",
+                    )
+                )
+
+            if pair in self.region_trade_links:
+                transfer = max(0.0, abs(food_a - food_b) * 0.06)
+                if food_a > food_b:
+                    self.region_food_adjustments[ra] = self.region_food_adjustments.get(ra, 0.0) - transfer * 0.45
+                    self.region_food_adjustments[rb] = self.region_food_adjustments.get(rb, 0.0) + transfer
+                else:
+                    self.region_food_adjustments[rb] = self.region_food_adjustments.get(rb, 0.0) - transfer * 0.45
+                    self.region_food_adjustments[ra] = self.region_food_adjustments.get(ra, 0.0) + transfer
+
+            war_pressure = scarcity * 0.42 + avg_aggr * 0.32 + avg_ambition * 0.26
+            if pair in self.region_trade_links:
+                war_pressure *= 0.55
+            if war_pressure > 0.66 and self.rng.random() < min(0.12, (war_pressure - 0.58) * 0.16):
+                casualties = self._regional_war_casualties(pa, pb)
+                deaths += casualties
+                if pair in self.region_trade_links and self.rng.random() < 0.45:
+                    self.region_trade_links.discard(pair)
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"Border war: {self._region_name(ra)} vs {self._region_name(rb)}",
+                        f"Resource and territory conflict caused {casualties} deaths.",
+                    )
+                )
+        return stories, deaths
+
+    def _regional_war_casualties(self, pa: list[Individual], pb: list[Individual]) -> int:
+        casualties = 0
+        all_people = pa + pb
+        self.rng.shuffle(all_people)
+        kill_n = max(1, int(len(all_people) * self.rng.uniform(0.005, 0.018)))
+        for person in all_people[:kill_n]:
+            if person.alive:
+                person.alive = False
+                casualties += 1
+        return casualties
 
     def _apply_migration(self, alive: list[Individual]) -> None:
         mcfg = self.config.migration
@@ -391,7 +485,12 @@ class SimulationEngine:
                 for region_id in range(self.config.demographics.region_count):
                     food_score = food_ratio_by_region.get(region_id, 1.0)
                     inf_score = 1.0 - infection_by_region.get(region_id, 0.0)
-                    score = food_score * bcfg.migration_food_weight + inf_score * bcfg.migration_infection_weight
+                    resource_score = self.environments[region_id].resource_score()
+                    score = (
+                        food_score * bcfg.migration_food_weight
+                        + inf_score * bcfg.migration_infection_weight
+                        + resource_score * (0.18 + person.ambition * 0.16)
+                    )
                     if score > best_score:
                         best_score = score
                         target_region = region_id
@@ -399,9 +498,10 @@ class SimulationEngine:
                 current_score = (
                     food_ratio_by_region.get(person.region_id, 1.0) * bcfg.migration_food_weight
                     + (1.0 - infection_by_region.get(person.region_id, 0.0)) * bcfg.migration_infection_weight
+                    + self.environments[person.region_id].resource_score() * (0.18 + person.ambition * 0.16)
                 )
                 if target_region != person.region_id and best_score > current_score:
-                    migrate_prob = min(1.0, migrate_prob * 1.8)
+                    migrate_prob = min(1.0, migrate_prob * (1.45 + person.ambition * 0.9))
 
             if self.rng.random() < migrate_prob:
                 if bcfg.enabled and target_region != person.region_id:
@@ -598,6 +698,7 @@ class SimulationEngine:
                     + (1.0 - abs(person.aggression - other.aggression)) * 0.3
                 )
                 conflict_signal = (person.aggression + other.aggression) * 0.5 + abs(person.stress - other.stress) * 0.5
+                conflict_signal += (person.ambition + other.ambition) * 0.18
 
                 faction_tension = cfg["faction_tension"] if person.faction != other.faction else -0.02
                 language_tension = cfg["language_tension"] if person.language != other.language else -0.01
@@ -607,7 +708,10 @@ class SimulationEngine:
                     self.friendships.add(pair)
                     if pair in self.enmities:
                         self.enmities.discard(pair)
-                elif conflict_signal > cfg["enemy_conflict_threshold"] and self.rng.random() < cfg["enemy_prob"]:
+                elif conflict_signal > cfg["enemy_conflict_threshold"] and self.rng.random() < min(
+                    0.45,
+                    cfg["enemy_prob"] * (1.0 + (person.ambition + other.ambition) * 0.8),
+                ):
                     self.enmities.add(pair)
                     if pair in self.friendships:
                         self.friendships.discard(pair)
@@ -1068,6 +1172,7 @@ class SimulationEngine:
             + 0.12 * person.spiritual_tendency
             + 0.12 * books
             + 0.1 * tools
+            + 0.11 * person.ambition
             + age_bonus
         )
         person.political_power = max(0.0, min(1.0, base * tier))
@@ -1310,6 +1415,7 @@ class SimulationEngine:
             community = self._community_model_label(residents, structure.get("level", "camp"))
             structure["power_style"] = power_style
             structure["community"] = community
+            structure["resource_score"] = round(self.environments[region_id].resource_score(), 3)
             if structure.get("level") == "city":
                 self.city_summaries.append(
                     {
@@ -1324,6 +1430,7 @@ class SimulationEngine:
                         "leader_id": pol.get("leader_id"),
                         "power_style": str(power_style),
                         "community": str(community),
+                        "resource_score": round(self.environments[region_id].resource_score(), 3),
                     }
                 )
 
@@ -1662,8 +1769,8 @@ class SimulationEngine:
         return {
             "friend_trust_threshold": 0.65,
             "friend_prob": 0.08,
-            "enemy_conflict_threshold": 0.62,
-            "enemy_prob": 0.06,
+            "enemy_conflict_threshold": 0.56,
+            "enemy_prob": 0.11,
             "alliance_prob": 0.02,
             "alliance_damp": 0.06,
             "war_scale": 0.06,
