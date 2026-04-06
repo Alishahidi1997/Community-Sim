@@ -2,9 +2,7 @@
 
 This project simulates a human population from early hunter-gatherer origins toward organized civilization, with realtime strategy-style visualization and event-driven world changes.
 
-## Realtime View Screenshot
-
-![Realtime Strategy View](C:/Users/shahi/.cursor/projects/c-Users-shahi-Desktop-net-AI/assets/c__Users_shahi_AppData_Roaming_Cursor_User_workspaceStorage_6654ca197e68c959b355b5c500896697_images_image-800da252-2eb6-47a4-abf0-00cbebe4ccc8.png)
+The model emphasizes **emergent outcomes**: pressure, memory, and resource geography accumulate over time—so wars, alliances, and trade arise from **world state**, not only one-off random rolls.
 
 ## Demo
 
@@ -15,11 +13,8 @@ This project simulates a human population from early hunter-gatherer origins tow
 ### Population and Biology
 
 - Individuals with:
-  - age
-  - gender
-  - region
-  - health
-  - disease susceptibility
+  - age, gender, region
+  - health, disease susceptibility
   - inherited genetic traits (`resilience`, `fertility`, `immunity`)
 - Life cycle mechanics:
   - aging
@@ -27,86 +22,89 @@ This project simulates a human population from early hunter-gatherer origins tow
   - death (natural causes, disease, disaster, war)
 - Birth-based growth only (no random NPC spawning during runtime)
 
-### Social and Emotional Behavior
+### Social, Emotional, and Political Traits
 
-- Per-individual social/emotional state:
-  - `happiness`
-  - `stress`
-  - `aggression`
-  - `knowledge`
-  - `tool_skill`
-  - `spiritual_tendency`
-  - `belief_group`
-- Communication through contact networks
-- Relationship graph:
-  - friendships
-  - enmities
+- Per-individual state:
+  - `happiness`, `stress`, `aggression`
+  - **`ambition`** (drives rivalry, migration appetite, and political weight)
+  - `knowledge`, `tool_skill`, `spiritual_tendency`
+  - `belief_group`, `faction`, `language`
+  - **`political_power`** (compounds with skills, age, and office)
+- Communication through **contact networks**
+- Relationship graph: **friendships** and **enmities** (formation is gated by trust/conflict margins modulated by **global mood**, not only independent dice)
 - Emotions and relationships affect productivity, health trajectory, and fertility outcomes
+
+### World Dynamics (Latent “AI” Layer)
+
+`population_sim/world_dynamics.py` keeps **slow-moving state** that couples regions and years:
+
+- **Global instability**, **collective stress**, **food inequality** (spread of food per capita across regions)
+- **Per-border tension** and **trade goodwill** (inertia: pressure builds and releases)
+- **Internal war charge** for society-wide scarcity conflicts
+- **Belief-group alliance goodwill** (defensive pacts form after sustained calm between groups)
+
+Outcomes are **unpredictable but not meaningless**: the same snapshot rarely guarantees war or peace next year; sustained pressure or a sharp tension spike does.
+
+### Geography, Resources, and Migration
+
+- **Multiple regions** (configurable `region_count`) act as a larger map; migration prefers better food, lower infection, and **regional resource scores**
+- Each region’s `Environment` carries **natural resource richness** (water, fertile land, timber, ore) and **territory size**, feeding into food and attractiveness
+- **Carrying-capacity-style** food scaling avoids runaway population that would make the sim unusably slow in late years
+
+### Geopolitics: Trade, Diplomacy, and War
+
+- **Trade links** between adjacent regions; food can flow along trade routes (surplus toward deficit)
+- **Border wars** and **trade ruptures** emerge from latent border tension and scarcity—not a single yearly coin flip
+- **Belief-group alliances** and **resource wars** use accumulation/discharge mechanics where possible
+
+### Civilization and Settlements
+
+- Era progression: hunter-gatherer → agrarian → industrial → modern → information age
+- **Per-region settlement** evolution: `camp → village → town → city`
+- Agriculture fields and institutions (school, workshop, temple) can appear **per region**
+- **City labels** can include **community** and **power style** (e.g. civic-representation, elite-council) and **resource score**
+- Large settlements can **split** (secession / civil-war style events) with new regions and settlements
 
 ### Disease and Public Health
 
 - Multiple pathogens in parallel
-- Disease transmission through contact graph (not homogeneous mixing)
-- Recovery, mortality, immunity loss
-- Pathogen mutation (infection/recovery/mortality rates drift stochastically)
-- Vaccination policy layer with adaptive responses
+- Disease transmission through the contact graph (with optional GPU-assisted batch sampling; see below)
+- Recovery, mortality, immunity loss; pathogen mutation
+- Vaccination policy with adaptive responses
 
-### Environment and Resources
+### Environment and Disasters
 
-- Food supply with variability, stress, and random shocks
-- Natural disasters with real multi-year consequences:
-  - drought
-  - flood
-  - volcanic winter
-- Resource pressure feeds back into mortality, fertility, policy adaptation, and migration
-
-### Civilization and World Evolution
-
-- Era progression:
-  - hunter-gatherer
-  - agrarian
-  - industrial
-  - modern
-- Practice-driven world state transitions:
-  - settlement evolution: `camp -> village -> town -> city`
-  - agriculture fields appear when agriculture is adopted
-  - institutions appear from population behavior:
-    - school (knowledge-driven)
-    - workshop (tool-skill-driven)
-    - temple (belief/spiritual-driven)
-- NPCs prefer to move/work near structures that match their profile
+- Food supply with variability, stress, and shocks
+- Natural disasters with multi-year consequences (drought, flood, volcanic winter)
+- Policy adaptation feeds back into migration, mortality, and fertility
 
 ### Events and Timeline
 
-- Event system with real conditions and real effects
-- Historical summaries are generated from actual simulation transitions
-- Includes discoveries, governance shifts, conflict, and disasters
-- Realtime timeline panel keeps the latest major world events visible
+- Event system tied to real conditions and effects
+- Timeline and major-event feeds for discoveries, governance, conflict, and disasters
+- Realtime timeline panel shows recent major events
 
 ### Adaptive Governance (Auto-Adjusting Parameters)
 
-Core parameters can self-adjust each year based on state signals (population, health, infection, food, civilization index), including:
+Core parameters can self-adjust from state signals (population, health, infection, food, civilization index), including food policy, birth policy, vaccination, migration, and infection control.
 
-- food supply policy
-- birth policy
-- vaccination intensity
-- migration openness
-- infection control pressure
+## Performance
 
-These updates are visible live in the UI and event feed.
+- Contact graph and social metrics are optimized for large populations (adaptive contact counts, cached friendship/enemy degrees)
+- Optional **GPU path** for disease transmission random sampling: set environment variable `POP_SIM_USE_GPU=1` and install **CuPy** matching your CUDA stack (e.g. `cupy-cuda12x`). If CuPy is missing or fails, the sim falls back to CPU.
 
 ## Realtime Strategy View
-
-Run:
 
 ```bash
 python realtime_view.py
 ```
 
+The window opens **fitted to your primary monitor** (it will not be wider or taller than the usable desktop area). You can **resize** the window by dragging edges; the size stays **clamped** so it stays on-screen.
+
 ### Realtime UI Layout
 
-- **Left panel**: world timeline (recent major events)
-- **Center world**: terrain, structures, NPCs, social links
+- **Left panel**: world timeline, city ledger, recent events
+- **Center world**: regions, terrain, structures, NPCs, social links
 - **Right panel**: live sliders for policy/parameter tuning
 
 ### Realtime Controls
@@ -115,11 +113,11 @@ python realtime_view.py
 - Mouse drag sliders to tune live parameters
 - `,` / `.` slower/faster simulation stepping
 - `L` toggle labels
-- `ESC` quit
+- `PgUp` / `PgDn` scroll city ledger
+- `F11` toggle **fullscreen** (uses native desktop resolution; press again to return to windowed)
+- `ESC` **exit fullscreen** when fullscreen; otherwise **quit** the application
 
 ## Batch Simulation
-
-Run:
 
 ```bash
 python main.py
@@ -133,8 +131,6 @@ Output:
 - `outputs/population_trends.png`
 
 ## Sensitivity Sweep
-
-Run:
 
 ```bash
 python run_sweep.py
@@ -160,52 +156,41 @@ Dependencies:
 - `main.py`: batch simulation entrypoint + summary logging
 - `realtime_view.py`: realtime visualization entrypoint
 - `run_sweep.py`: parameter grid/sensitivity runner
-- `population_sim/config.py`: all configuration dataclasses
-- `population_sim/models.py`: individual model + inheritance/social helpers
-- `population_sim/environment.py`: resource and environmental dynamics
-- `population_sim/disease.py`: multi-disease transmission/progression/mutation
-- `population_sim/simulation.py`: core simulation engine and event/governance logic
-- `population_sim/stats.py`: metrics, snapshots, CSV export
+- `population_sim/config.py`: configuration dataclasses
+- `population_sim/models.py`: individual model + inheritance helpers
+- `population_sim/environment.py`: regional resources and food dynamics
+- `population_sim/world_dynamics.py`: latent global/border state (tension, trade goodwill, war charge)
+- `population_sim/disease.py`: multi-disease transmission (optional GPU batch sampling)
+- `population_sim/simulation.py`: core engine, geopolitics, social dynamics, settlements
+- `population_sim/stats.py`: metrics, CSV export
 - `population_sim/visualize.py`: batch chart rendering
-- `population_sim/sweep.py`: sweep automation utilities
-- `population_sim/realtime.py`: Pygame strategy-style renderer and UI
+- `population_sim/sweep.py`: sweep automation
+- `population_sim/realtime.py`: Pygame renderer and UI
 
 ## Key Metrics Tracked
 
 - population, births, deaths
 - age and health averages
-- susceptible / infected / recovered counts
-- vaccination counts
+- disease S/I/R counts, vaccination
 - genetic diversity
 - region distribution
 - civilization index
-- knowledge/tool skill averages
-- emotional averages
-- relationship counts (friendships/enmities)
+- knowledge / tool skill / emotional averages
+- friendships / enmities
 
 ## Notes
 
-- The simulation uses stochastic, rule-based agents with per-agent state (not deep neural policy brains).
-- Randomness affects outcomes, but key world transitions and timeline entries are condition-driven by actual state changes.
+- Agents are **rule-based with stateful world dynamics**, not a trained neural policy.
+- **Randomness** still appears where a continuous system needs a discrete outcome (e.g. some disease checks), but **large-scale conflict and diplomacy** lean on **accumulated pressure and thresholds** in `world_dynamics.py`.
 
 ## Suggested Next Extensions
 
-- Multi-settlement diplomacy and trade routes
-- Family lineages and dynastic inheritance
-- Occupation system (farmers, artisans, scholars, soldiers, priests)
-- Explicit economy (production, storage, demand)
-- Save/load simulation state and replay mode
+- Visual **border ownership** and explicit **map tiles**
+- **Goods-specific** trade (grain, timber, ore) with prices
+- **Dynasties** and named family lines
+- **Save/load** and replay
+- Richer **peace treaties** and sanctions after wars
 
 ## Disclaimer
 
-I built this project with AI assistance and my own engineering decisions.
-
-I used AI tools for rapid scaffolding and iteration, then fine-tuned the system through prompt engineering, code review, manual adjustments, and repeated simulation testing.
-
-What I personally focused on:
-
-- designing the architecture and module boundaries
-- refining behavior rules and event logic through iterative prompts
-- manually tuning parameters, balancing systems, and fixing edge cases
-- improving realtime UX and visualization flow
-- validating outputs with logs, charts, and scenario runs
+This project was built with AI assistance and manual engineering decisions: architecture, balancing, edge cases, and UX iteration.

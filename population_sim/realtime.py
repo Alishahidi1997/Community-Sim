@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+import sys
 from dataclasses import dataclass
 from typing import Callable
 
@@ -50,8 +51,11 @@ class RealtimeVisualizer:
         self.engine = engine
         self.width = width
         self.height = height
-        self.left_panel_width = 360
-        self.panel_width = 380
+        self._pending_resize: tuple[int, int] | None = None
+        self._pending_fullscreen_toggle = False
+        self._fullscreen = False
+        self._saved_windowed_size: tuple[int, int] = (width, height)
+        self._layout_panels()
         self.year = 0
         self.running = True
         self.paused = False
@@ -87,9 +91,82 @@ class RealtimeVisualizer:
         self.hills = self._build_hills()
         self._build_sliders()
 
+    def _desktop_pixel_size(self) -> tuple[int, int]:
+        """Primary monitor size in pixels (for clamping window and true fullscreen)."""
+        try:
+            pygame.display.init()
+            sizes = pygame.display.get_desktop_sizes()
+            if sizes:
+                return int(sizes[0][0]), int(sizes[0][1])
+        except (AttributeError, TypeError, IndexError, pygame.error):
+            pass
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                user32 = ctypes.windll.user32
+                return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
+            except Exception:
+                pass
+        return 1920, 1080
+
+    def _clamp_to_desktop(self, w: int, h: int) -> tuple[int, int]:
+        """Keep windowed mode inside the monitor (taskbar / frame margin)."""
+        dw, dh = self._desktop_pixel_size()
+        margin = 88
+        max_w = max(640, dw - margin)
+        max_h = max(480, dh - margin)
+        return min(max(640, w), max_w), min(max(480, h), max_h)
+
+    def _layout_panels(self) -> None:
+        """Side panel widths scale with window size; center world column keeps a minimum."""
+        w = max(400, self.width)
+        min_left, min_right = 168, 188
+        lw = max(min_left, min(int(w * 0.132), 400))
+        rw = max(min_right, min(int(w * 0.166), 440))
+        min_center = max(220, w // 5)
+        while lw + rw + min_center > w and lw > min_left + 20:
+            lw -= 12
+        while lw + rw + min_center > w and rw > min_right + 20:
+            rw -= 12
+        if lw + rw + min_center > w:
+            lw = max(min_left, w // 5)
+            rw = max(min_right, w // 5)
+        self.left_panel_width = lw
+        self.panel_width = rw
+
+    def _apply_window_size(self, w: int, h: int) -> None:
+        w = max(640, w)
+        h = max(480, h)
+        if not self._fullscreen:
+            w, h = self._clamp_to_desktop(w, h)
+            self._saved_windowed_size = (w, h)
+        self.width = w
+        self.height = h
+        self._layout_panels()
+        self.hills = self._build_hills()
+        self._build_sliders()
+        self._clamp_agents_to_regions()
+
+    def _clamp_agents_to_regions(self) -> None:
+        for person in self.engine.population:
+            if not person.alive:
+                continue
+            pid = person.person_id
+            if pid not in self.visual_state:
+                continue
+            rect = self._region_rect(person.region_id)
+            ag = self.visual_state[pid]
+            pad = 6.0
+            ag.x = max(float(rect.left + pad), min(float(rect.right - pad), ag.x))
+            ag.y = max(float(rect.top + pad), min(float(rect.bottom - pad), ag.y))
+
     def run(self) -> None:
         pygame.init()
-        screen = pygame.display.set_mode((self.width, self.height))
+        win_flags = pygame.RESIZABLE
+        # Default size was wider than many monitors; fit to screen on first open.
+        self._apply_window_size(self.width, self.height)
+        screen = pygame.display.set_mode((self.width, self.height), win_flags)
         pygame.display.set_caption("Population Dynamics - 2D Human Agents")
         clock = pygame.time.Clock()
         font = pygame.font.SysFont("consolas", 18)
@@ -98,6 +175,29 @@ class RealtimeVisualizer:
         while self.running:
             dt = clock.tick(60) / 1000.0
             self._handle_events()
+            if self._pending_fullscreen_toggle:
+                self._pending_fullscreen_toggle = False
+                if self._fullscreen:
+                    self._fullscreen = False
+                    w, h = self._saved_windowed_size
+                    self._apply_window_size(w, h)
+                    screen = pygame.display.set_mode((self.width, self.height), win_flags)
+                else:
+                    self._saved_windowed_size = (self.width, self.height)
+                    dw, dh = self._desktop_pixel_size()
+                    screen = pygame.display.set_mode((dw, dh), pygame.FULLSCREEN)
+                    self._fullscreen = True
+                    self.width = screen.get_width()
+                    self.height = screen.get_height()
+                    self._layout_panels()
+                    self.hills = self._build_hills()
+                    self._build_sliders()
+                    self._clamp_agents_to_regions()
+            if self._pending_resize is not None and not self._fullscreen:
+                nw, nh = self._pending_resize
+                self._pending_resize = None
+                self._apply_window_size(nw, nh)
+                screen = pygame.display.set_mode((self.width, self.height), win_flags)
             if not self.paused:
                 self._tick_simulation()
                 self._move_agents(dt)
@@ -112,7 +212,12 @@ class RealtimeVisualizer:
                 self.running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    self.running = False
+                    if self._fullscreen:
+                        self._pending_fullscreen_toggle = True
+                    else:
+                        self.running = False
+                elif event.key == pygame.K_F11:
+                    self._pending_fullscreen_toggle = True
                 elif event.key == pygame.K_SPACE:
                     self.paused = not self.paused
                 elif event.key == pygame.K_l:
@@ -140,6 +245,10 @@ class RealtimeVisualizer:
                 self.dragging_slider.set_from_x(event.pos[0])
             elif event.type == pygame.MOUSEWHEEL:
                 self._scroll_city_ledger(-event.y)
+            elif event.type == pygame.VIDEORESIZE and not self._fullscreen:
+                nw = max(1, int(getattr(event, "w", event.size[0])))
+                nh = max(1, int(getattr(event, "h", event.size[1])))
+                self._pending_resize = self._clamp_to_desktop(nw, nh)
 
     def _tick_simulation(self) -> None:
         self.frame_counter += 1
@@ -171,13 +280,19 @@ class RealtimeVisualizer:
         if self.year >= self.engine.config.years:
             self.paused = True
 
+    def _hud_top(self) -> int:
+        return max(64, min(88, self.height // 14))
+
     def _region_rect(self, region_id: int) -> pygame.Rect:
         regions = max(1, self.engine.config.demographics.region_count)
         world_left = self.left_panel_width
         world_width = self.width - self.panel_width - self.left_panel_width
+        world_width = max(80, world_width)
         region_width = world_width / regions
         x0 = int(world_left + region_id * region_width + 10)
-        return pygame.Rect(x0, 80, int(region_width - 20), self.height - 110)
+        top = self._hud_top()
+        bottom_margin = max(28, min(48, self.height // 22))
+        return pygame.Rect(x0, top, int(region_width - 20), max(60, self.height - top - bottom_margin))
 
     def _spawn_visual_agent(self, person_id: int, region_id: int) -> VisualAgent:
         del person_id
@@ -296,7 +411,13 @@ class RealtimeVisualizer:
         self._draw_sun_and_clouds(screen, world_rect)
         self._draw_hills(screen, world_rect)
         self._draw_river(screen, world_rect)
-        ground_rect = pygame.Rect(self.left_panel_width, 70, self.width - self.panel_width - self.left_panel_width, self.height - 70)
+        ground_top = max(56, self._hud_top() - 8)
+        ground_rect = pygame.Rect(
+            self.left_panel_width,
+            ground_top,
+            self.width - self.panel_width - self.left_panel_width,
+            max(40, self.height - ground_top),
+        )
         pygame.draw.rect(screen, self.ground_color, ground_rect)
 
         for region_id in range(self.engine.config.demographics.region_count):
@@ -325,24 +446,25 @@ class RealtimeVisualizer:
             f"Tools: {self.engine.total_tools_crafted}   Books: {self.engine.total_books_written}",
             f"Cities: {len(self.engine.city_summaries)} {self._city_line_summary()}",
             f"Politics: {self._politics_summary()}",
-            f"Factions: {self._faction_summary_line()}   Conflict preset: {self.engine.config.conflict.preset}",
+            f"Factions: {self._faction_summary_line()}   Preset: {self.engine.config.conflict.preset}   World aggression: {self.engine._world_aggression():.2f}",
             f"Trade routes: {len(getattr(self.engine, 'region_trade_links', []))}   Regions: {self.engine.config.demographics.region_count}",
             f"Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}",
-            "Controls: SPACE pause | mouse drag sliders | ,/. speed | L labels | ESC quit",
+            "Controls: SPACE pause | drag window edges to resize | sliders | ,/. speed | L | ESC",
         ]
         y = 8
+        line_h = max(16, min(22, self.height // 48))
         for line in lines:
             text = font.render(line, True, (20, 22, 30))
             screen.blit(text, (self.left_panel_width + 12, y))
-            y += 22
+            y += line_h
 
     def _draw_messages(self, screen: pygame.Surface, small_font: pygame.font.Font) -> None:
         self.recent_messages = [(m, ttl - 1) for m, ttl in self.recent_messages if ttl > 1]
-        y = 86
+        y = self._hud_top() - 6
         for msg, _ in self.recent_messages[-6:]:
             t = small_font.render(msg, True, (18, 20, 28))
             screen.blit(t, (self.left_panel_width + 12, y))
-            y += 18
+            y += max(14, min(20, self.height // 55))
 
     def _draw_human(self, screen: pygame.Surface, person, agent: VisualAgent) -> None:
         body_color = self._health_color(person)
@@ -392,11 +514,15 @@ class RealtimeVisualizer:
         return f"{gov} — {title} #{lid} (pref: {mode})"
 
     def _build_sliders(self) -> None:
-        left = self.width - self.panel_width + 24
-        top = 110
-        w = self.panel_width - 48
-        h = 14
-        gap = 56
+        margin_x = max(12, min(28, self.panel_width // 14))
+        left = self.width - self.panel_width + margin_x
+        top = max(96, min(120, int(self.height * 0.095)))
+        inner_w = max(120, self.panel_width - 2 * margin_x)
+        h = max(12, min(18, self.height // 70))
+        n_sliders = 8
+        footer = max(56, min(90, self.height // 12))
+        usable = max(h * n_sliders + 8, self.height - top - footer)
+        gap = max(40, min(60, usable // max(n_sliders, 1)))
 
         self.sliders = [
             UISlider(
@@ -405,7 +531,7 @@ class RealtimeVisualizer:
                 max_value=2.0,
                 getter=lambda: self.engine.config.environment.base_food_per_capita,
                 setter=lambda v: setattr(self.engine.config.environment, "base_food_per_capita", v),
-                rect=pygame.Rect(left, top + gap * 0, w, h),
+                rect=pygame.Rect(left, top + gap * 0, inner_w, h),
             ),
             UISlider(
                 label="Birth rate",
@@ -413,7 +539,7 @@ class RealtimeVisualizer:
                 max_value=0.9,
                 getter=lambda: self.engine.config.demographics.base_birth_rate,
                 setter=lambda v: setattr(self.engine.config.demographics, "base_birth_rate", v),
-                rect=pygame.Rect(left, top + gap * 1, w, h),
+                rect=pygame.Rect(left, top + gap * 1, inner_w, h),
             ),
             UISlider(
                 label="Infection rate",
@@ -421,7 +547,7 @@ class RealtimeVisualizer:
                 max_value=0.9,
                 getter=lambda: self.engine.config.pathogens[0].infection_rate if self.engine.config.pathogens else 0.01,
                 setter=lambda v: self._set_pathogen_value("infection_rate", v),
-                rect=pygame.Rect(left, top + gap * 2, w, h),
+                rect=pygame.Rect(left, top + gap * 2, inner_w, h),
             ),
             UISlider(
                 label="Disease mortality",
@@ -429,7 +555,7 @@ class RealtimeVisualizer:
                 max_value=0.3,
                 getter=lambda: self.engine.config.pathogens[0].mortality_rate if self.engine.config.pathogens else 0.001,
                 setter=lambda v: self._set_pathogen_value("mortality_rate", v),
-                rect=pygame.Rect(left, top + gap * 3, w, h),
+                rect=pygame.Rect(left, top + gap * 3, inner_w, h),
             ),
             UISlider(
                 label="Migration rate",
@@ -437,7 +563,15 @@ class RealtimeVisualizer:
                 max_value=0.2,
                 getter=lambda: self.engine.config.migration.migration_rate,
                 setter=lambda v: setattr(self.engine.config.migration, "migration_rate", v),
-                rect=pygame.Rect(left, top + gap * 4, w, h),
+                rect=pygame.Rect(left, top + gap * 4, inner_w, h),
+            ),
+            UISlider(
+                label="World aggression",
+                min_value=0.15,
+                max_value=2.5,
+                getter=lambda: float(getattr(self.engine.config.conflict, "world_aggression", 1.0)),
+                setter=lambda v: setattr(self.engine.config.conflict, "world_aggression", v),
+                rect=pygame.Rect(left, top + gap * 5, inner_w, h),
             ),
             UISlider(
                 label="Vaccination coverage",
@@ -445,7 +579,7 @@ class RealtimeVisualizer:
                 max_value=0.5,
                 getter=lambda: self.engine.config.vaccination.annual_coverage_fraction,
                 setter=lambda v: setattr(self.engine.config.vaccination, "annual_coverage_fraction", v),
-                rect=pygame.Rect(left, top + gap * 5, w, h),
+                rect=pygame.Rect(left, top + gap * 6, inner_w, h),
             ),
             UISlider(
                 label="Simulation speed",
@@ -453,7 +587,7 @@ class RealtimeVisualizer:
                 max_value=1800.0,
                 getter=lambda: float(self.step_every_frames),
                 setter=lambda v: setattr(self, "step_every_frames", max(1, min(1800, int(round(v))))),
-                rect=pygame.Rect(left, top + gap * 6, w, h),
+                rect=pygame.Rect(left, top + gap * 7, inner_w, h),
             ),
         ]
 
@@ -510,7 +644,7 @@ class RealtimeVisualizer:
         layers = []
         for layer_idx in range(3):
             points = []
-            base_y = 230 + layer_idx * 55
+            base_y = int(self.height * 0.19) + layer_idx * max(36, int(self.height * 0.048))
             for x in range(0, world_width + 40, 40):
                 y = base_y + self.terrain_seed.randint(-25, 25)
                 points.append((self.left_panel_width + x, y))
@@ -544,22 +678,28 @@ class RealtimeVisualizer:
                 int(top[1] + (bottom[1] - top[1]) * t),
                 int(top[2] + (bottom[2] - top[2]) * t),
             )
-            pygame.draw.line(screen, color, (rect.left, i), (rect.right, i))
+            y = rect.top + i
+            pygame.draw.line(screen, color, (rect.left, y), (rect.right, y), 1)
 
     def _draw_sun_and_clouds(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
         cycle = (self.year % 240) / 240.0
-        sun_x = int(rect.left + 80 + cycle * (rect.width - 160))
-        sun_y = int(120 - max(0.0, 1.0 - abs(cycle - 0.5) * 2.0) * 55)
+        pad = max(24, min(80, rect.width // 14))
+        sun_x = int(rect.left + pad + cycle * max(20, rect.width - 2 * pad))
+        sun_y = int(rect.top + 80 - max(0.0, 1.0 - abs(cycle - 0.5) * 2.0) * min(55, rect.height // 8))
         pygame.draw.circle(screen, (255, 232, 140), (sun_x, sun_y), 34)
         pygame.draw.circle(screen, (255, 244, 190), (sun_x - 8, sun_y - 8), 10)
         cloud_color = (245, 250, 255)
-        for cx, cy in [(160, 90), (320, 120), (520, 95)]:
+        rw = max(80, rect.width)
+        for ox, oy in [(0.14, 0.16), (0.32, 0.21), (0.52, 0.17)]:
+            cx = int(rect.left + ox * rw)
+            cy = int(rect.top + oy * max(120, rect.height * 0.35))
             pygame.draw.circle(screen, cloud_color, (cx, cy), 18)
             pygame.draw.circle(screen, cloud_color, (cx + 20, cy - 4), 16)
             pygame.draw.circle(screen, cloud_color, (cx + 38, cy), 14)
         if cycle < 0.16 or cycle > 0.84:
-            for sx in range(rect.left + 40, rect.right - 40, 90):
-                pygame.draw.circle(screen, (240, 240, 255), (sx, 42 + (sx % 20)), 1)
+            step = max(48, min(90, rect.width // 10))
+            for sx in range(rect.left + 40, rect.right - 40, step):
+                pygame.draw.circle(screen, (240, 240, 255), (sx, rect.top + 42 + (sx % 20)), 1)
 
     def _draw_hills(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
         del rect
@@ -639,9 +779,10 @@ class RealtimeVisualizer:
                 screen.blit(bullet, (16, y))
                 y += 22
 
-        # Dedicated scrollable city ledger area.
-        ledger_top = self.height - 310
-        ledger_rect = pygame.Rect(10, ledger_top, self.left_panel_width - 20, 292)
+        # Dedicated scrollable city ledger area (shrink on short windows).
+        ledger_h = min(300, max(100, int(self.height * 0.28)))
+        ledger_top = max(120, self.height - ledger_h - max(10, self.height // 80))
+        ledger_rect = pygame.Rect(10, ledger_top, max(40, self.left_panel_width - 20), ledger_h)
         pygame.draw.rect(screen, (24, 29, 36), ledger_rect, border_radius=6)
         pygame.draw.rect(screen, (54, 62, 76), ledger_rect, 1, border_radius=6)
         title = small_font.render("City Ledger (scroll: wheel / PgUp PgDn)", True, (220, 224, 236))

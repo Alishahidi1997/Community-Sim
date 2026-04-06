@@ -66,6 +66,7 @@ def build_default_config() -> SimulationConfig:
         ),
         conflict=ConflictConfig(
             preset="balanced",
+            world_aggression=1.0,
         ),
         politics=PoliticsConfig(
             government_mode="auto",
