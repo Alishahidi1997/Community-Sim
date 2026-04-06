@@ -36,6 +36,7 @@ class WorldDynamics:
         avg_stress: float,
         food_ratios: list[float],
         civilization_index: float,
+        world_aggression: float = 1.0,
     ) -> None:
         """Pull global mood from observable aggregates (smooth, no dice)."""
         self.collective_stress = 0.88 * self.collective_stress + 0.12 * _clamp(avg_stress, 0.0, 1.0)
@@ -47,12 +48,14 @@ class WorldDynamics:
             self.food_inequality *= 0.98
 
         # Instability rises with stress + inequality, falls with institutions/civ
+        wa = _clamp(world_aggression, 0.15, 3.0)
         target_instability = (
             0.42 * self.collective_stress
             + 0.38 * self.food_inequality
             - 0.22 * _clamp(civilization_index, 0.0, 1.0)
             + 0.08 * min(1.0, alive_count / 2500.0)
         )
+        target_instability *= 0.55 + 0.45 * wa
         self.global_instability = _clamp(0.82 * self.global_instability + 0.18 * target_instability, 0.0, 1.0)
 
         # Slow phase drift: quasi-periodic modulation (unpredictable shape, deterministic path)
@@ -60,13 +63,15 @@ class WorldDynamics:
         self._phase += 0.11 + 0.06 * self.food_inequality + 0.04 * pop_scale
         self._phase %= 6.283185307179586
 
-    def step_internal_war(self, war_pressure: float, year: int) -> bool:
+    def step_internal_war(self, war_pressure: float, year: int, world_aggression: float = 1.0) -> bool:
         """Accumulate cross-group tension; fire war when the system 'tips' (not a dice roll)."""
-        self.internal_war_charge += max(0.0, war_pressure) * 0.038
+        wa = _clamp(world_aggression, 0.15, 3.0)
+        self.internal_war_charge += max(0.0, war_pressure) * 0.038 * (0.55 + 0.45 * wa)
         self.internal_war_charge *= 0.988
         if year <= 70:
             return False
-        if self.internal_war_charge > 0.94:
+        threshold = _clamp(0.94 / (wa**0.4), 0.52, 1.02)
+        if self.internal_war_charge > threshold:
             self.internal_war_charge = 0.28
             return True
         return False
@@ -95,15 +100,16 @@ class WorldDynamics:
             return True
         return False
 
-    def social_modifiers(self) -> dict[str, float]:
+    def social_modifiers(self, world_aggression: float = 1.0) -> dict[str, float]:
         """Scale friendship/enmity dynamics from world mood (not independent RNG)."""
+        wa = _clamp(world_aggression, 0.15, 3.0)
         g = self.global_instability
         s = self.collective_stress
         # High instability: trust bar rises (harder to bond), conflict bar falls (easier to feud)
-        friend_trust_shift = 0.04 * g + 0.03 * s
-        enemy_threshold_shift = -0.05 * g - 0.04 * s
-        friend_prob_scale = max(0.35, 1.0 - 0.45 * g)
-        enemy_prob_scale = 1.0 + 0.75 * g + 0.35 * s
+        friend_trust_shift = (0.04 * g + 0.03 * s) * (0.75 + 0.25 * wa)
+        enemy_threshold_shift = (-0.05 * g - 0.04 * s) * (0.6 + 0.4 * wa)
+        friend_prob_scale = max(0.25, 1.0 - 0.45 * g - 0.12 * (wa - 1.0))
+        enemy_prob_scale = 1.0 + 0.75 * g + 0.35 * s + 0.45 * max(0.0, wa - 1.0)
         return {
             "friend_trust_shift": friend_trust_shift,
             "enemy_threshold_shift": enemy_threshold_shift,
@@ -127,6 +133,7 @@ class WorldDynamics:
         avg_ambition_pair: float,
         has_trade: bool,
         year: int,
+        world_aggression: float = 1.0,
     ) -> tuple[str | None, float]:
         """Update latent tension/goodwill; return event type and war intensity in [0,1].
 
@@ -142,6 +149,7 @@ class WorldDynamics:
         gap = abs(food_per_cap_a - food_per_cap_b)
         inequality_edge = _clamp(gap * 1.4, 0.0, 1.0)
 
+        wa = _clamp(world_aggression, 0.15, 3.0)
         pressure = (
             0.34 * scarcity
             + 0.28 * inequality_edge
@@ -150,6 +158,7 @@ class WorldDynamics:
             + (0.0 if same_dominant_faction else 0.12)
             + self.border_phase_jitter(ra, rb)
         )
+        pressure *= 0.45 + 0.55 * wa
         if has_trade:
             pressure *= 0.62
             pressure -= 0.06
@@ -184,7 +193,11 @@ class WorldDynamics:
         war_intensity = 0.0
 
         # War: release when tension is high OR sharp rise under scarcity (no p < roll)
-        war_ready = new_tension > 0.84 or (new_tension > 0.62 and d_tension > 0.085 and scarcity > 0.38)
+        hi = _clamp(0.84 - 0.07 * max(0.0, wa - 1.0), 0.62, 0.9)
+        lo = _clamp(0.62 - 0.06 * max(0.0, wa - 1.0), 0.48, 0.62)
+        spike = _clamp(0.085 - 0.02 * max(0.0, wa - 1.0), 0.045, 0.1)
+        sc_need = _clamp(0.38 - 0.06 * max(0.0, wa - 1.0), 0.22, 0.42)
+        war_ready = new_tension > hi or (new_tension > lo and d_tension > spike and scarcity > sc_need)
         if war_ready and years_since_war >= 5:
             event = "war"
             war_intensity = _clamp(0.35 + 0.55 * new_tension + 0.15 * scarcity, 0.0, 1.0)

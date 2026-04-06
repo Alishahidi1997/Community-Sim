@@ -191,7 +191,9 @@ class SimulationEngine:
         avg_t_w = sum(p.tool_skill for p in alive) / pop_n
         civ_w = avg_k_w * 0.55 + avg_t_w * 0.45
         food_ratios_list = list(self._food_ratio_by_region(alive).values())
-        self.world_dynamics.update_global(pop_n, avg_stress_w, food_ratios_list, civ_w)
+        self.world_dynamics.update_global(
+            pop_n, avg_stress_w, food_ratios_list, civ_w, self._world_aggression()
+        )
         diplomacy_stories, diplomacy_deaths = self._simulate_regional_diplomacy(alive, year)
         stories.extend(diplomacy_stories)
         deaths += diplomacy_deaths
@@ -273,6 +275,28 @@ class SimulationEngine:
         }
         return births, deaths, available_food
 
+    def _pick_father_for_birth(self, mother: Individual, males: list[Individual]) -> Individual:
+        """Prefer local, healthy, fertile partners with aligned skills and language (bounded rationality)."""
+        same_region = [m for m in males if m.region_id == mother.region_id]
+        local_bias = min(0.92, 0.38 + mother.knowledge * 0.32 + mother.tool_skill * 0.22)
+        pool = same_region if same_region and self.rng.random() < local_bias else males
+
+        def score(m: Individual) -> float:
+            fert = m.genetic_traits.get("fertility", 0.5)
+            sim = (
+                1.0
+                - abs(mother.knowledge - m.knowledge) * 0.3
+                - abs(mother.tool_skill - m.tool_skill) * 0.2
+            )
+            lang = 0.12 if m.language == mother.language else 0.0
+            reg = 0.1 if m.region_id == mother.region_id else 0.0
+            return max(0.05, m.health * (0.42 + fert * 0.58) * max(0.22, sim) + lang + reg)
+
+        k = max(3, min(14, len(pool)))
+        top = sorted(pool, key=score, reverse=True)[:k]
+        w = [score(m) for m in top]
+        return self.rng.choices(top, weights=w, k=1)[0]
+
     def _generate_births(self, alive: list[Individual], era_birth_multiplier: float = 1.0) -> list[Individual]:
         cfg = self.config.demographics
         pathogen_names = [p.name for p in self.config.pathogens]
@@ -304,7 +328,7 @@ class SimulationEngine:
             if self.rng.random() > cfg.partner_match_rate:
                 continue
 
-            father = self.rng.choice(males)
+            father = self._pick_father_for_birth(mother, males)
             fertility_score = (
                 cfg.base_birth_rate
                 * (0.6 + mother.genetic_traits.get("fertility", 0.5) * cfg.fertility_trait_weight)
@@ -384,6 +408,10 @@ class SimulationEngine:
             total += regional_food
         return total
 
+    def _world_aggression(self) -> float:
+        wa = float(getattr(self.config.conflict, "world_aggression", 1.0))
+        return max(0.15, min(3.0, wa))
+
     def _food_ratio_by_region(self, alive: list[Individual]) -> dict[int, float]:
         by_region = defaultdict(int)
         for person in alive:
@@ -437,6 +465,7 @@ class SimulationEngine:
                 avg_ambition,
                 has_trade,
                 year,
+                self._world_aggression(),
             )
 
             if event == "trade_open":
@@ -523,8 +552,14 @@ class SimulationEngine:
                     + (1.0 - infection_by_region.get(person.region_id, 0.0)) * bcfg.migration_infection_weight
                     + self.environments[person.region_id].resource_score() * (0.18 + person.ambition * 0.16)
                 )
-                if target_region != person.region_id and best_score > current_score:
+                advantage = best_score - current_score
+                iq = 0.5 * person.knowledge + 0.5 * person.tool_skill
+                min_edge = max(0.008, 0.11 * (1.02 - iq) / (1.0 + person.ambition * 0.35))
+                clear_gain = target_region != person.region_id and advantage > min_edge and best_score > current_score
+                if clear_gain:
                     migrate_prob = min(1.0, migrate_prob * (1.45 + person.ambition * 0.9))
+                elif target_region != person.region_id and best_score > current_score:
+                    migrate_prob *= 0.32 + 0.55 * iq
 
             if self.rng.random() < migrate_prob:
                 if bcfg.enabled and target_region != person.region_id:
@@ -670,6 +705,14 @@ class SimulationEngine:
             "mortality_multiplier": 0.64,
         }
 
+    def _mentor_suitability(self, pupil: Individual, mentor: Individual) -> float:
+        gain_k = max(0.0, mentor.knowledge - pupil.knowledge)
+        gain_t = max(0.0, mentor.tool_skill - pupil.tool_skill)
+        lang = 0.11 if mentor.language == pupil.language else 0.0
+        if any(state == DiseaseState.INFECTED for state in mentor.disease_states.values()):
+            return -0.2
+        return gain_k * 1.2 + gain_t + mentor.knowledge * 0.07 + mentor.tool_skill * 0.05 + lang
+
     def _apply_social_learning(self, alive: list[Individual]) -> None:
         if not alive:
             return
@@ -678,9 +721,18 @@ class SimulationEngine:
             neighbors = [id_map[n] for n in self.contact_graph.get(person.person_id, []) if n in id_map]
             if not neighbors:
                 continue
-            teacher = max(neighbors, key=lambda n: n.knowledge + n.tool_skill)
-            person.knowledge = min(1.0, person.knowledge + 0.012 * teacher.knowledge + self.knowledge_boost)
-            person.tool_skill = min(1.0, person.tool_skill + 0.01 * teacher.tool_skill)
+            best_mentor = max(neighbors, key=lambda n: self._mentor_suitability(person, n))
+            if self._mentor_suitability(person, best_mentor) < 0.02:
+                teacher = max(neighbors, key=lambda n: n.knowledge + n.tool_skill)
+            else:
+                teacher = best_mentor
+            head_k = max(0.07, 1.0 - person.knowledge)
+            head_t = max(0.07, 1.0 - person.tool_skill)
+            iq = 0.5 * person.knowledge + 0.5 * person.tool_skill
+            rate_k = 0.012 * (1.0 + 0.5 * iq) * min(1.2, head_k * 1.75)
+            rate_t = 0.01 * (1.0 + 0.45 * iq) * min(1.2, head_t * 1.75)
+            person.knowledge = min(1.0, person.knowledge + rate_k * teacher.knowledge + self.knowledge_boost)
+            person.tool_skill = min(1.0, person.tool_skill + rate_t * teacher.tool_skill)
 
             # Belief diffusion: high-spiritual groups can form stable cults/religions.
             if self.rng.random() < 0.03 * person.spiritual_tendency:
@@ -701,7 +753,7 @@ class SimulationEngine:
 
     def _simulate_social_dynamics(self, alive: list[Individual]) -> None:
         cfg = self._conflict_params()
-        mood = self.world_dynamics.social_modifiers()
+        mood = self.world_dynamics.social_modifiers(self._world_aggression())
         friend_bar = cfg["friend_trust_threshold"] + mood["friend_trust_shift"]
         enemy_bar = cfg["enemy_conflict_threshold"] + mood["enemy_threshold_shift"]
         if self.config.conflict.preset.lower().strip() == "high_conflict":
@@ -733,8 +785,15 @@ class SimulationEngine:
                 trust_margin = trust_signal - friend_bar
                 conflict_margin = conflict_signal - enemy_bar
                 instability = self.world_dynamics.global_instability
-                bond_forms = trust_margin > 0.06 + 0.05 * instability
-                feud_forms = conflict_margin > 0.04 + 0.06 * (1.0 - instability) and conflict_margin > trust_margin - 0.08
+                wa = self._world_aggression()
+                bond_forms = trust_margin > (
+                    0.06 + 0.05 * instability + 0.03 * max(0.0, wa - 1.0) - 0.05 * max(0.0, 1.0 - wa)
+                )
+                feud_forms = (
+                    conflict_margin
+                    > 0.04 + 0.06 * (1.0 - instability) - 0.03 * max(0.0, wa - 1.0) + 0.06 * max(0.0, 1.0 - wa)
+                    and conflict_margin > trust_margin - 0.08 - 0.04 * max(0.0, wa - 1.0)
+                )
 
                 if bond_forms and trust_margin * mood["friend_prob_scale"] > cfg["friend_prob"] * 0.35:
                     self.friendships.add(pair)
@@ -1766,7 +1825,7 @@ class SimulationEngine:
         alliance_factor = max(0.0, 1.0 - len(self.alliances) * cfg["alliance_damp"])
         war_pressure = max(0.0, (avg_stress - 0.45) + max(0.0, 1.0 - food_pc) + (len(groups) - 2) * 0.08)
         war_pressure = min(cfg["war_cap"], war_pressure * cfg["war_scale"] * alliance_factor)
-        if self.world_dynamics.step_internal_war(war_pressure, year):
+        if self.world_dynamics.step_internal_war(war_pressure, year, self._world_aggression()):
             casualty_fraction = min(0.12, 0.02 + war_pressure * 0.04)
             deaths = self._apply_direct_deaths(alive, casualty_fraction, 1)
             self.temp_birth_penalty += 0.08
@@ -1782,8 +1841,9 @@ class SimulationEngine:
 
     def _conflict_params(self) -> dict[str, float]:
         preset = self.config.conflict.preset.lower().strip()
+        wa = self._world_aggression()
         if preset == "high_conflict":
-            return {
+            d = {
                 "friend_trust_threshold": 0.78,
                 "friend_prob": 0.03,
                 "enemy_conflict_threshold": 0.48,
@@ -1795,16 +1855,22 @@ class SimulationEngine:
                 "faction_tension": 0.16,
                 "language_tension": 0.12,
             }
-        return {
-            "friend_trust_threshold": 0.65,
-            "friend_prob": 0.08,
-            "enemy_conflict_threshold": 0.56,
-            "enemy_prob": 0.11,
-            "alliance_prob": 0.02,
-            "alliance_damp": 0.06,
-            "war_scale": 0.06,
-            "war_cap": 0.18,
-            "faction_tension": 0.08,
-            "language_tension": 0.06,
-        }
+        else:
+            d = {
+                "friend_trust_threshold": 0.65,
+                "friend_prob": 0.08,
+                "enemy_conflict_threshold": 0.56,
+                "enemy_prob": 0.11,
+                "alliance_prob": 0.02,
+                "alliance_damp": 0.06,
+                "war_scale": 0.06,
+                "war_cap": 0.18,
+                "faction_tension": 0.08,
+                "language_tension": 0.06,
+            }
+        d["faction_tension"] = min(0.28, d["faction_tension"] * wa)
+        d["language_tension"] = min(0.22, d["language_tension"] * wa)
+        d["war_scale"] = min(0.22, d["war_scale"] * (0.65 + 0.35 * wa))
+        d["war_cap"] = min(0.42, d["war_cap"] * (0.7 + 0.3 * wa))
+        return d
 

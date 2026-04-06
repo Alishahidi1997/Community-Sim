@@ -57,6 +57,9 @@ class BehaviorConfig:
 @dataclass
 class ConflictConfig:
     preset: str = "balanced"  # balanced | high_conflict
+    # Global violence dial: scales border tension, internal wars, and social friction.
+    # 0.25 ≈ very peaceful, 1.0 default, 2.0+ very hostile world.
+    world_aggression: float = 1.0
 
 
 @dataclass
