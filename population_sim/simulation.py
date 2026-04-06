@@ -18,6 +18,7 @@ from population_sim.models import (
     random_traits,
 )
 from population_sim.stats import StatsTracker
+from population_sim.world_dynamics import WorldDynamics
 
 
 class SimulationEngine:
@@ -67,6 +68,7 @@ class SimulationEngine:
         self._enemy_degree_cache: dict[int, int] = {}
         self.region_trade_links: set[tuple[int, int]] = set()
         self.region_food_adjustments: dict[int, float] = {}
+        self.world_dynamics = WorldDynamics()
         self._initialize_population()
 
     def _initialize_population(self) -> None:
@@ -183,6 +185,13 @@ class SimulationEngine:
             env.update()
         self._decay_temporal_effects()
         self.region_food_adjustments = {}
+        pop_n = len(alive)
+        avg_stress_w = sum(p.stress for p in alive) / pop_n
+        avg_k_w = sum(p.knowledge for p in alive) / pop_n
+        avg_t_w = sum(p.tool_skill for p in alive) / pop_n
+        civ_w = avg_k_w * 0.55 + avg_t_w * 0.45
+        food_ratios_list = list(self._food_ratio_by_region(alive).values())
+        self.world_dynamics.update_global(pop_n, avg_stress_w, food_ratios_list, civ_w)
         diplomacy_stories, diplomacy_deaths = self._simulate_regional_diplomacy(alive, year)
         stories.extend(diplomacy_stories)
         deaths += diplomacy_deaths
@@ -400,35 +409,65 @@ class SimulationEngine:
         for p in alive:
             by_region[p.region_id].append(p)
 
+        food_ratio_by_region = self._food_ratio_by_region(alive)
+
         for ra, rb in self._adjacent_region_pairs():
             pa = by_region.get(ra, [])
             pb = by_region.get(rb, [])
             if not pa or not pb:
                 continue
-            pair = (ra, rb)
+            pair = (ra, rb) if ra < rb else (rb, ra)
+            has_trade = pair in self.region_trade_links
+
             avg_ambition = (
-                (sum(p.ambition for p in pa) / len(pa))
-                + (sum(p.ambition for p in pb) / len(pb))
+                (sum(p.ambition for p in pa) / len(pa)) + (sum(p.ambition for p in pb) / len(pb))
             ) * 0.5
             avg_aggr = ((sum(p.aggression for p in pa) / len(pa)) + (sum(p.aggression for p in pb) / len(pb))) * 0.5
-            food_a = self.environments[ra].available_food(len(pa)) / max(1, len(pa))
-            food_b = self.environments[rb].available_food(len(pb)) / max(1, len(pb))
-            scarcity = max(0.0, 1.0 - ((food_a + food_b) * 0.5))
+            food_a = food_ratio_by_region.get(ra, 1.0)
+            food_b = food_ratio_by_region.get(rb, 1.0)
             same_faction = self._dominant_label(pa, "faction") == self._dominant_label(pb, "faction")
-            diplomacy_score = (
-                (0.35 if same_faction else 0.0)
-                + (1.0 - abs(food_a - food_b)) * 0.2
-                + (1.0 - avg_aggr) * 0.25
-                + (1.0 - avg_ambition) * 0.2
+
+            event, war_intensity = self.world_dynamics.step_border(
+                ra,
+                rb,
+                food_a,
+                food_b,
+                same_faction,
+                avg_aggr,
+                avg_ambition,
+                has_trade,
+                year,
             )
 
-            if pair not in self.region_trade_links and diplomacy_score > 0.72 and self.rng.random() < 0.06:
+            if event == "trade_open":
                 self.region_trade_links.add(pair)
                 stories.append(
                     self._register_timeline_transition(
                         year,
                         f"Trade pact: {self._region_name(ra)} ↔ {self._region_name(rb)}",
                         "Diplomacy opened trade routes and migration corridors.",
+                    )
+                )
+            elif event == "war":
+                casualties = self._regional_war_casualties(pa, pb, war_intensity)
+                deaths += casualties
+                if has_trade and self.world_dynamics.global_instability > 0.52:
+                    self.region_trade_links.discard(pair)
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"Border war: {self._region_name(ra)} vs {self._region_name(rb)}",
+                        f"Resource and territory conflict caused {casualties} deaths.",
+                    )
+                )
+            elif event == "trade_break":
+                if pair in self.region_trade_links:
+                    self.region_trade_links.discard(pair)
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"Trade rupture: {self._region_name(ra)} — {self._region_name(rb)}",
+                        "Diplomatic tension collapsed a trade agreement.",
                     )
                 )
 
@@ -440,29 +479,13 @@ class SimulationEngine:
                 else:
                     self.region_food_adjustments[rb] = self.region_food_adjustments.get(rb, 0.0) - transfer * 0.45
                     self.region_food_adjustments[ra] = self.region_food_adjustments.get(ra, 0.0) + transfer
-
-            war_pressure = scarcity * 0.42 + avg_aggr * 0.32 + avg_ambition * 0.26
-            if pair in self.region_trade_links:
-                war_pressure *= 0.55
-            if war_pressure > 0.66 and self.rng.random() < min(0.12, (war_pressure - 0.58) * 0.16):
-                casualties = self._regional_war_casualties(pa, pb)
-                deaths += casualties
-                if pair in self.region_trade_links and self.rng.random() < 0.45:
-                    self.region_trade_links.discard(pair)
-                stories.append(
-                    self._register_timeline_transition(
-                        year,
-                        f"Border war: {self._region_name(ra)} vs {self._region_name(rb)}",
-                        f"Resource and territory conflict caused {casualties} deaths.",
-                    )
-                )
         return stories, deaths
 
-    def _regional_war_casualties(self, pa: list[Individual], pb: list[Individual]) -> int:
+    def _regional_war_casualties(self, pa: list[Individual], pb: list[Individual], intensity: float) -> int:
         casualties = 0
-        all_people = pa + pb
-        self.rng.shuffle(all_people)
-        kill_n = max(1, int(len(all_people) * self.rng.uniform(0.005, 0.018)))
+        all_people = sorted(pa + pb, key=lambda p: p.person_id)
+        frac = min(0.04, 0.003 + max(0.0, min(1.0, intensity)) * 0.032)
+        kill_n = max(1, int(len(all_people) * frac))
         for person in all_people[:kill_n]:
             if person.alive:
                 person.alive = False
@@ -678,6 +701,9 @@ class SimulationEngine:
 
     def _simulate_social_dynamics(self, alive: list[Individual]) -> None:
         cfg = self._conflict_params()
+        mood = self.world_dynamics.social_modifiers()
+        friend_bar = cfg["friend_trust_threshold"] + mood["friend_trust_shift"]
+        enemy_bar = cfg["enemy_conflict_threshold"] + mood["enemy_threshold_shift"]
         if self.config.conflict.preset.lower().strip() == "high_conflict":
             for p in alive:
                 p.aggression = min(1.0, p.aggression + 0.004)
@@ -704,14 +730,17 @@ class SimulationEngine:
                 language_tension = cfg["language_tension"] if person.language != other.language else -0.01
                 conflict_signal += faction_tension + language_tension
 
-                if trust_signal > cfg["friend_trust_threshold"] and self.rng.random() < cfg["friend_prob"]:
+                trust_margin = trust_signal - friend_bar
+                conflict_margin = conflict_signal - enemy_bar
+                instability = self.world_dynamics.global_instability
+                bond_forms = trust_margin > 0.06 + 0.05 * instability
+                feud_forms = conflict_margin > 0.04 + 0.06 * (1.0 - instability) and conflict_margin > trust_margin - 0.08
+
+                if bond_forms and trust_margin * mood["friend_prob_scale"] > cfg["friend_prob"] * 0.35:
                     self.friendships.add(pair)
                     if pair in self.enmities:
                         self.enmities.discard(pair)
-                elif conflict_signal > cfg["enemy_conflict_threshold"] and self.rng.random() < min(
-                    0.45,
-                    cfg["enemy_prob"] * (1.0 + (person.ambition + other.ambition) * 0.8),
-                ):
+                elif feud_forms and conflict_margin * mood["enemy_prob_scale"] > cfg["enemy_prob"] * 0.55:
                     self.enmities.add(pair)
                     if pair in self.friendships:
                         self.friendships.discard(pair)
@@ -1711,7 +1740,7 @@ class SimulationEngine:
         if len(groups) < 2:
             return stories, deaths
 
-        # Form alliances when groups share low aggression and similar stress.
+        # Defensive pacts build from sustained calm between belief blocs (latent goodwill).
         for i, g1 in enumerate(groups):
             for g2 in groups[i + 1 :]:
                 key = tuple(sorted((g1, g2)))
@@ -1721,7 +1750,7 @@ class SimulationEngine:
                 a2 = sum(p.aggression for p in by_belief[g2]) / len(by_belief[g2])
                 s1 = sum(p.stress for p in by_belief[g1]) / len(by_belief[g1])
                 s2 = sum(p.stress for p in by_belief[g2]) / len(by_belief[g2])
-                if (a1 + a2) < 0.72 and abs(s1 - s2) < 0.2 and self.rng.random() < cfg["alliance_prob"]:
+                if self.world_dynamics.step_belief_alliance(g1, g2, a1, a2, s1, s2):
                     self.alliances.add(key)
                     msg = self._register_timeline_transition(
                         year,
@@ -1730,14 +1759,14 @@ class SimulationEngine:
                     )
                     stories.append(msg)
 
-        # Need-based war: high stress + low food + group fragmentation, reduced by alliances.
+        # Internal resource war: pressure accumulates until the social system tips.
         pop = len(alive)
         avg_stress = sum(p.stress for p in alive) / pop
         food_pc = self._available_food_total(alive) / pop if pop else 1.0
         alliance_factor = max(0.0, 1.0 - len(self.alliances) * cfg["alliance_damp"])
         war_pressure = max(0.0, (avg_stress - 0.45) + max(0.0, 1.0 - food_pc) + (len(groups) - 2) * 0.08)
-        war_chance = min(cfg["war_cap"], war_pressure * cfg["war_scale"] * alliance_factor)
-        if year > 70 and self.rng.random() < war_chance:
+        war_pressure = min(cfg["war_cap"], war_pressure * cfg["war_scale"] * alliance_factor)
+        if self.world_dynamics.step_internal_war(war_pressure, year):
             casualty_fraction = min(0.12, 0.02 + war_pressure * 0.04)
             deaths = self._apply_direct_deaths(alive, casualty_fraction, 1)
             self.temp_birth_penalty += 0.08
