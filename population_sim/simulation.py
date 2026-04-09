@@ -3,6 +3,11 @@ from __future__ import annotations
 import random
 from collections import defaultdict
 
+from population_sim.agent_cognition import (
+    goal_migration_multipliers,
+    normalize_pair,
+    replan_primary_goal,
+)
 from population_sim.config import SimulationConfig
 from population_sim.disease import MultiDiseaseModel
 from population_sim.environment import Environment
@@ -69,6 +74,9 @@ class SimulationEngine:
         self.region_trade_links: set[tuple[int, int]] = set()
         self.region_food_adjustments: dict[int, float] = {}
         self.world_dynamics = WorldDynamics()
+        self._region_food_prev: dict[int, float] = {}
+        self._region_food_trend: dict[int, float] = {}
+        self._pair_trust: dict[tuple[int, int], float] = {}
         self._initialize_population()
 
     def _initialize_population(self) -> None:
@@ -81,13 +89,15 @@ class SimulationEngine:
                 happiness, stress, aggression, ambition = random_emotional_profile(self.rng)
                 faction = self.rng.choice(self.faction_names[:2])
                 language = self.language_names[0]
+                h0 = self.rng.uniform(0.8, 1.0)
+                age0 = self.rng.randint(18, 24)
                 person = Individual(
                     person_id=self.next_person_id,
-                    age=self.rng.randint(18, 24),
+                    age=age0,
                     gender=gender,
                     region_id=0,
                     alive=True,
-                    health=self.rng.uniform(0.8, 1.0),
+                    health=h0,
                     disease_susceptibility=self.rng.uniform(0.8, 1.2),
                     genetic_traits=traits,
                     vaccinated=False,
@@ -107,6 +117,9 @@ class SimulationEngine:
                     books_authored=0,
                     mutation_burden=0.0,
                     political_power=self.rng.uniform(0.14, 0.28),
+                    primary_goal=replan_primary_goal(h0, stress, ambition, age0),
+                    observed_food_ema=1.0,
+                    observed_food_trend=0.0,
                 )
                 self.population.append(person)
                 self.next_person_id += 1
@@ -119,13 +132,14 @@ class SimulationEngine:
                 happiness, stress, aggression, ambition = random_emotional_profile(self.rng)
                 faction = self.rng.choice(self.faction_names)
                 language = self.rng.choice(self.language_names[:3])
+                h0 = self.rng.uniform(0.6, 1.0)
                 person = Individual(
                     person_id=self.next_person_id,
                     age=age,
                     gender=gender,
                     region_id=self.rng.randint(0, self.config.demographics.region_count - 1),
                     alive=True,
-                    health=self.rng.uniform(0.6, 1.0),
+                    health=h0,
                     disease_susceptibility=self.rng.uniform(0.6, 1.4),
                     genetic_traits=traits,
                     vaccinated=False,
@@ -145,6 +159,9 @@ class SimulationEngine:
                     books_authored=0,
                     mutation_burden=0.0,
                     political_power=self.rng.uniform(0.12, 0.32),
+                    primary_goal=replan_primary_goal(h0, stress, ambition, age),
+                    observed_food_ema=1.0,
+                    observed_food_trend=0.0,
                 )
                 self.population.append(person)
                 self.next_person_id += 1
@@ -200,8 +217,11 @@ class SimulationEngine:
         available_food = self._available_food_total(alive)
         available_food *= max(0.2, 1.0 + self.food_system_bonus - self.temp_food_penalty)
         food_ratio_by_region = self._food_ratio_by_region(alive)
+        self._step_regional_food_trends(food_ratio_by_region)
+        self._replan_agent_goals(alive)
 
         self._apply_migration(alive)
+        self._update_personal_food_memory(alive)
         self._apply_vaccination_policy(alive, year)
         self.contact_graph = self._rewire_contact_graph(alive, self.contact_graph)
         self._prune_social_edges(alive)
@@ -290,7 +310,9 @@ class SimulationEngine:
             )
             lang = 0.12 if m.language == mother.language else 0.0
             reg = 0.1 if m.region_id == mother.region_id else 0.0
-            return max(0.05, m.health * (0.42 + fert * 0.58) * max(0.22, sim) + lang + reg)
+            pair = normalize_pair(mother.person_id, m.person_id)
+            trust_bonus = (self._pair_trust.get(pair, 0.5) - 0.5) * 0.34
+            return max(0.05, m.health * (0.42 + fert * 0.58) * max(0.22, sim) + lang + reg + trust_bonus)
 
         k = max(3, min(14, len(pool)))
         top = sorted(pool, key=score, reverse=True)[:k]
@@ -362,13 +384,14 @@ class SimulationEngine:
             language = mother.language if self.rng.random() < 0.65 else father.language
             if "digital_age" in self.unlocked_milestones and self.rng.random() < 0.08:
                 language = self.rng.choice(self.language_names)
+            ch = self.rng.uniform(0.7, 1.0)
             child = Individual(
                 person_id=self.next_person_id,
                 age=0,
                 gender=Gender.FEMALE if self.rng.random() < 0.5 else Gender.MALE,
                 region_id=mother.region_id,
                 alive=True,
-                health=self.rng.uniform(0.7, 1.0),
+                health=ch,
                 disease_susceptibility=max(0.2, min(1.8, self.rng.gauss(1.0, 0.2))),
                 genetic_traits=traits,
                 vaccinated=False,
@@ -388,6 +411,9 @@ class SimulationEngine:
                 books_authored=0,
                 mutation_burden=0.0,
                 political_power=political_power,
+                primary_goal=replan_primary_goal(ch, stress, ambition, 0),
+                observed_food_ema=1.0,
+                observed_food_trend=0.0,
             )
             self.next_person_id += 1
 
@@ -521,6 +547,28 @@ class SimulationEngine:
                 casualties += 1
         return casualties
 
+    def _step_regional_food_trends(self, food_ratio_by_region: dict[int, float]) -> None:
+        for region_id, fr in food_ratio_by_region.items():
+            prev = self._region_food_prev.get(region_id, fr)
+            tr = self._region_food_trend.get(region_id, 0.0)
+            self._region_food_trend[region_id] = 0.76 * tr + 0.24 * (fr - prev)
+            self._region_food_prev[region_id] = fr
+        for region_id in range(self.config.demographics.region_count):
+            if region_id not in food_ratio_by_region:
+                self._region_food_prev.setdefault(region_id, 1.0)
+
+    def _replan_agent_goals(self, alive: list[Individual]) -> None:
+        for p in alive:
+            p.primary_goal = replan_primary_goal(p.health, p.stress, p.ambition, p.age)
+
+    def _update_personal_food_memory(self, alive: list[Individual]) -> None:
+        food_ratio_by_region = self._food_ratio_by_region(alive)
+        for p in alive:
+            fr = food_ratio_by_region.get(p.region_id, 1.0)
+            delta = fr - p.observed_food_ema
+            p.observed_food_ema = 0.82 * p.observed_food_ema + 0.18 * fr
+            p.observed_food_trend = 0.76 * p.observed_food_trend + 0.24 * delta
+
     def _apply_migration(self, alive: list[Individual]) -> None:
         mcfg = self.config.migration
         if not mcfg.enabled or self.config.demographics.region_count <= 1:
@@ -533,33 +581,44 @@ class SimulationEngine:
             target_region = person.region_id
 
             if bcfg.enabled:
+                gf, gi, gr = goal_migration_multipliers(person.primary_goal)
+                iq = 0.5 * person.knowledge + 0.5 * person.tool_skill
+                trend_scale = 0.28 + 0.55 * iq
                 best_score = -10.0
                 for region_id in range(self.config.demographics.region_count):
                     food_score = food_ratio_by_region.get(region_id, 1.0)
+                    reg_trend = self._region_food_trend.get(region_id, 0.0)
+                    food_effective = max(0.12, min(1.45, food_score + trend_scale * reg_trend))
                     inf_score = 1.0 - infection_by_region.get(region_id, 0.0)
                     resource_score = self.environments[region_id].resource_score()
                     score = (
-                        food_score * bcfg.migration_food_weight
-                        + inf_score * bcfg.migration_infection_weight
-                        + resource_score * (0.18 + person.ambition * 0.16)
+                        food_effective * bcfg.migration_food_weight * gf
+                        + inf_score * bcfg.migration_infection_weight * gi
+                        + resource_score * (0.18 + person.ambition * 0.16) * gr
                     )
                     if score > best_score:
                         best_score = score
                         target_region = region_id
 
+                cur_food = food_ratio_by_region.get(person.region_id, 1.0)
+                cur_trend = self._region_food_trend.get(person.region_id, 0.0)
+                cur_food_eff = max(0.12, min(1.45, cur_food + trend_scale * cur_trend))
                 current_score = (
-                    food_ratio_by_region.get(person.region_id, 1.0) * bcfg.migration_food_weight
-                    + (1.0 - infection_by_region.get(person.region_id, 0.0)) * bcfg.migration_infection_weight
-                    + self.environments[person.region_id].resource_score() * (0.18 + person.ambition * 0.16)
+                    cur_food_eff * bcfg.migration_food_weight * gf
+                    + (1.0 - infection_by_region.get(person.region_id, 0.0)) * bcfg.migration_infection_weight * gi
+                    + self.environments[person.region_id].resource_score() * (0.18 + person.ambition * 0.16) * gr
                 )
                 advantage = best_score - current_score
-                iq = 0.5 * person.knowledge + 0.5 * person.tool_skill
                 min_edge = max(0.008, 0.11 * (1.02 - iq) / (1.0 + person.ambition * 0.35))
                 clear_gain = target_region != person.region_id and advantage > min_edge and best_score > current_score
                 if clear_gain:
                     migrate_prob = min(1.0, migrate_prob * (1.45 + person.ambition * 0.9))
                 elif target_region != person.region_id and best_score > current_score:
                     migrate_prob *= 0.32 + 0.55 * iq
+                if person.observed_food_trend < -0.035:
+                    migrate_prob *= 1.0 + min(
+                        0.32, (-person.observed_food_trend) * 1.85 * (0.42 + person.ambition * 0.28)
+                    )
 
             if self.rng.random() < migrate_prob:
                 if bcfg.enabled and target_region != person.region_id:
@@ -711,7 +770,9 @@ class SimulationEngine:
         lang = 0.11 if mentor.language == pupil.language else 0.0
         if any(state == DiseaseState.INFECTED for state in mentor.disease_states.values()):
             return -0.2
-        return gain_k * 1.2 + gain_t + mentor.knowledge * 0.07 + mentor.tool_skill * 0.05 + lang
+        pair = normalize_pair(pupil.person_id, mentor.person_id)
+        trust_adj = (self._pair_trust.get(pair, 0.5) - 0.5) * 0.16
+        return gain_k * 1.2 + gain_t + mentor.knowledge * 0.07 + mentor.tool_skill * 0.05 + lang + trust_adj
 
     def _apply_social_learning(self, alive: list[Individual]) -> None:
         if not alive:
@@ -768,7 +829,8 @@ class SimulationEngine:
                 other = id_map.get(nid)
                 if other is None:
                     continue
-                pair = (person.person_id, other.person_id)
+                pair = normalize_pair(person.person_id, other.person_id)
+                prev_trust = self._pair_trust.get(pair, 0.5)
                 similarity = 1.0 - abs(person.spiritual_tendency - other.spiritual_tendency)
                 trust_signal = (
                     similarity * 0.45
@@ -782,7 +844,7 @@ class SimulationEngine:
                 language_tension = cfg["language_tension"] if person.language != other.language else -0.01
                 conflict_signal += faction_tension + language_tension
 
-                trust_margin = trust_signal - friend_bar
+                trust_margin = trust_signal - friend_bar + (prev_trust - 0.5) * 0.24
                 conflict_margin = conflict_signal - enemy_bar
                 instability = self.world_dynamics.global_instability
                 wa = self._world_aggression()
@@ -795,14 +857,21 @@ class SimulationEngine:
                     and conflict_margin > trust_margin - 0.08 - 0.04 * max(0.0, wa - 1.0)
                 )
 
+                learned_trust = 0.91 * prev_trust + 0.09 * trust_signal
+                learned_trust = max(0.0, min(1.0, learned_trust))
+
                 if bond_forms and trust_margin * mood["friend_prob_scale"] > cfg["friend_prob"] * 0.35:
                     self.friendships.add(pair)
                     if pair in self.enmities:
                         self.enmities.discard(pair)
+                    self._pair_trust[pair] = min(1.0, learned_trust + 0.13)
                 elif feud_forms and conflict_margin * mood["enemy_prob_scale"] > cfg["enemy_prob"] * 0.55:
                     self.enmities.add(pair)
                     if pair in self.friendships:
                         self.friendships.discard(pair)
+                    self._pair_trust[pair] = max(0.0, learned_trust - 0.21)
+                else:
+                    self._pair_trust[pair] = learned_trust
 
                 if pair in self.friendships:
                     person.happiness = min(1.0, person.happiness + 0.01)
@@ -819,6 +888,9 @@ class SimulationEngine:
         alive_ids = {p.person_id for p in alive}
         self.friendships = {pair for pair in self.friendships if pair[0] in alive_ids and pair[1] in alive_ids}
         self.enmities = {pair for pair in self.enmities if pair[0] in alive_ids and pair[1] in alive_ids}
+        self._pair_trust = {
+            pair: v for pair, v in self._pair_trust.items() if pair[0] in alive_ids and pair[1] in alive_ids
+        }
 
     def _rebuild_social_degree_cache(self) -> None:
         self._friend_degree_cache = {}

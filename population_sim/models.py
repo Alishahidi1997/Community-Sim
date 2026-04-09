@@ -44,6 +44,10 @@ class Individual:
     books_authored: int
     mutation_burden: float
     political_power: float  # 0–1; wealth, skill, age, and office compound over time
+    # Yearly replanned; migration/social use these for trend-aware, goal-directed behavior
+    primary_goal: str
+    observed_food_ema: float
+    observed_food_trend: float
 
     def age_one_year(self) -> None:
         self.age += 1
