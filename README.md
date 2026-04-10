@@ -243,4 +243,4 @@ Dependencies:
 
 ## Disclaimer
 
-This project was built with AI assistance and manual engineering decisions: architecture, balancing, edge cases, and UX iteration.
+Developed end-to-end, including architecture, implementation, edge cases, and UX iteration. AI tools were used to accelerate development.
