@@ -73,6 +73,29 @@ class BehaviorConfig:
 
 
 @dataclass
+class SocialLifeConfig:
+    """Faith movements, romance, violence, and jail tied to enforcement."""
+
+    enabled: bool = True
+    love_pair_attempts_per_year: int = 160
+    love_base_probability: float = 0.012
+    assault_samples_per_year: int = 72
+    assault_base_probability: float = 0.009
+    jail_years_assault_caught: int = 2
+    jail_years_theft: int = 1
+    theft_jail_after_catches: int = 2
+    theft_jail_min_enforcement: float = 0.42
+    max_prophets_world: int = 6
+    prophet_min_population: int = 48
+    prophet_min_spiritual: float = 0.62
+    prophet_min_knowledge: float = 0.26
+    prophet_min_reputation: float = 0.36
+    prophet_emerge_probability: float = 0.052
+    worship_followers_for_shrine: int = 10
+    jail_wealth_multiplier: float = 0.26
+
+
+@dataclass
 class ConflictConfig:
     preset: str = "balanced"  # balanced | high_conflict
     # Global violence dial: scales border tension, internal wars, and social friction.
@@ -84,12 +107,21 @@ class ConflictConfig:
 class PoliticsConfig:
     """How settlements govern themselves as they grow (camp → village → town → city)."""
 
-    # auto: chiefdom at village, oligarchy vs democracy by civ index at town/city
+    # auto: chiefdom at village, oligarchy vs democracy by town/city; country/empire bias below
     # Other values force that style once the settlement is large enough (town+).
     government_mode: str = "auto"  # auto | democracy | republic | oligarchy | chiefdom | monarchy | autocracy
     election_interval_years: int = 12  # democracy / republic
     elite_fraction: float = 0.12  # share of population with outsized influence
     leader_power_bonus: float = 0.03  # annual institutional boost while in office (capped in sim)
+    # After level reaches city, polity can rise to a multi-community country then empire (same region).
+    polity_progression: bool = True
+    country_min_city_pop: int = 170
+    country_min_civ_region: float = 0.44
+    country_requires_state_milestone: bool = True
+    empire_min_country_pop: int = 235
+    empire_min_civ_region: float = 0.52
+    # Empire more likely when ambition is high or iron exists (expansionist / coercive capacity).
+    empire_ambition_threshold: float = 0.43
 
 
 @dataclass
@@ -109,6 +141,18 @@ class CognitionConfig:
     learned_goal_imitation_years: int = 22
     learned_goal_lr: float = 0.035
     learned_goal_lr_imitation: float = 0.07
+
+
+@dataclass
+class TechnologyConfig:
+    """Resource gates for inventions and tools; dynamic era labels from tech + civ."""
+
+    dynamic_eras: bool = True
+    # Require regional ore/timber (etc.) floors before a breakthrough can fire.
+    resource_gated_inventions: bool = True
+    resource_gated_tool_crafting: bool = True
+    # Multiplier on resource drain when inventions fire or tools are crafted.
+    resource_drain_scale: float = 1.0
 
 
 @dataclass
@@ -149,8 +193,10 @@ class SimulationConfig:
     contact_network: ContactNetworkConfig = field(default_factory=ContactNetworkConfig)
     behavior: BehaviorConfig = field(default_factory=BehaviorConfig)
     conflict: ConflictConfig = field(default_factory=ConflictConfig)
+    social_life: SocialLifeConfig = field(default_factory=SocialLifeConfig)
     politics: PoliticsConfig = field(default_factory=PoliticsConfig)
     cognition: CognitionConfig = field(default_factory=CognitionConfig)
+    technology: TechnologyConfig = field(default_factory=TechnologyConfig)
     economy: EconomyConfig = field(default_factory=EconomyConfig)
     pathogens: list[PathogenConfig] = field(default_factory=lambda: [PathogenConfig()])
 

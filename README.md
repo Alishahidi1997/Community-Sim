@@ -45,8 +45,9 @@ Most of the world still runs on **equations, thresholds, and config**:
 | Economy helpers | `economy.py` |
 | Year loop, macro cache for goals/migration, policies, city comms | `simulation.py` |
 | Border tension, trade goodwill, `world_iq` diplomacy tuning | `world_dynamics.py` |
+| Eras, invention/tool resource rules (pure helpers) | `tech_society.py` |
 | Person fields, inheritance | `models.py` |
-| Config (cognition, economy, …) | `config.py` |
+| Config (cognition, economy, technology, …) | `config.py` |
 
 ## Demo
 
@@ -135,6 +136,23 @@ Outcomes are **unpredictable but not meaningless**: the same snapshot rarely gua
 ### Adaptive Governance (Auto-Adjusting Parameters)
 
 Core parameters can self-adjust from state signals (population, health, infection, food, civilization index), including food policy, birth policy, vaccination, migration, and infection control.
+
+### Technology, Resources, and Diplomacy
+
+- **Dynamic eras** — Labels such as hunter-gatherer → agrarian → classical → industrial → modern → information age follow **civilization level**, **unlocked inventions** (husbandry, wheel, advanced tools, iron), and **milestones** (writing, country, etc.), with a light calendar bias. Set `TechnologyConfig.dynamic_eras = False` to restore the old **year-only** era table.
+- **Resource-gated inventions** — Breakthroughs require sufficient **timber / ore / fertile land** in the inventor’s region and **draw down** those stocks when they fire (`TechnologyConfig.resource_gated_inventions`, `resource_drain_scale`).
+- **Tool crafting** — New personal tools consume **ore and timber** when `resource_gated_tool_crafting` is enabled; depleted regions craft slowly until regrowth catches up (environments slowly **regenerate** richness each year).
+- **Border diplomacy** — `WorldDynamics.step_border` factors in **regional resource scores**, **military/economic power asymmetry** (population × health × tools × food × wealth), and **material + food pressure**, so trade goodwill and war tension respond to scarcity and predation-like gaps, not only food per capita.
+- **Country and empire** — Settlements that reach **city** can mature into a **country** (renamed *Republic* or *Kingdom* by local civ; democracy vs oligarchy bias) and then an **Empire** (monarchy/autocracy bias, leader title **Emperor**). Tuned via `PoliticsConfig` (`polity_progression`, population and civ thresholds, `country_requires_state_milestone`, `empire_ambition_threshold`).
+- **Faith, love, violence, jail** — Under `SocialLifeConfig`: a **prophet** can emerge (high spirituality, temples or spiritual age), founding a `way_of_<id>` movement; **conversions** and **shrine** structures appear as followings grow. **Love bonds** form between trusted same-region contacts; **assaults** harm victims and may **jail** aggressors when enforcement catches them; repeat **theft** with strong enforcement can also **jail**. Incarceration blocks migration and social learning and cuts yearly wealth gain until the sentence ticks down at year end.
+
+### Tests and Benchmark
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/
+python benchmark_sim.py --years 50 --pop 220
+```
 
 ## Performance
 

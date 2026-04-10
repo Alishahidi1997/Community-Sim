@@ -50,7 +50,24 @@ from population_sim.models import (
     random_social_profile,
     random_traits,
 )
+from population_sim.social_life import (
+    followers_by_region,
+    has_worship_shrine,
+    is_prophet_movement_belief,
+    prophet_movement_id,
+)
 from population_sim.stats import StatsTracker
+from population_sim.tech_society import (
+    apply_invention_resource_drain,
+    apply_tool_craft_drain,
+    compute_era_profile,
+    format_settlement_polity_name,
+    invention_roll_multiplier,
+    material_pressure,
+    region_can_craft_tools,
+    region_meets_invention_minimums,
+    settlement_name_stem,
+)
 from population_sim.world_dynamics import WorldDynamics
 
 
@@ -299,22 +316,23 @@ class SimulationEngine:
             return 0, 0, 0.0
 
         self._sync_season(year)
-        era = self._era_profile(year)
-        self.current_era = era["name"]
-        for env in self.environments:
-            env.update()
-        self._decay_temporal_effects()
-        self.region_food_adjustments = {}
         pop_n = len(alive)
         avg_stress_w = sum(p.stress for p in alive) / pop_n
         avg_k_w = sum(p.knowledge for p in alive) / pop_n
         avg_t_w = sum(p.tool_skill for p in alive) / pop_n
         civ_w = avg_k_w * 0.55 + avg_t_w * 0.45
+        era = self._era_profile(year, civ_w)
+        self.current_era = era["name"]
+        for env in self.environments:
+            env.update()
+        self._decay_temporal_effects()
+        self.region_food_adjustments = {}
         food_ratios_list = list(self._food_ratio_by_region(alive).values())
         self.world_dynamics.update_global(
             pop_n, avg_stress_w, food_ratios_list, civ_w, self._world_aggression()
         )
-        culture_stories = self._step_culture_inventions_and_riding(alive, year, civ_w)
+        food_ratio_for_culture = self._food_ratio_by_region(alive)
+        culture_stories = self._step_culture_inventions_and_riding(alive, year, civ_w, food_ratio_for_culture)
         stories.extend(culture_stories)
         diplomacy_stories, diplomacy_deaths = self._simulate_regional_diplomacy(alive, year)
         stories.extend(diplomacy_stories)
@@ -335,6 +353,7 @@ class SimulationEngine:
         stories.extend(self._step_economy(alive, year, civ_w))
         self._apply_social_learning(alive)
         self._step_belief_evolution(alive)
+        stories.extend(self._step_social_life(alive, year))
         self._craft_tools_and_books(alive, year)
         alliance_stories, alliance_deaths = self._simulate_alliances_and_war(alive, year)
         stories.extend(alliance_stories)
@@ -394,6 +413,7 @@ class SimulationEngine:
         event_deaths, event_stories = self._process_world_events(year, alive_now)
         deaths += event_deaths
         stories.extend(event_stories)
+        self._advance_jail_sentences(alive_now)
         new_infections_after = self._count_any_infected()
         self.last_step_events = {
             "births": births,
@@ -468,7 +488,11 @@ class SimulationEngine:
             if self.rng.random() > cfg.partner_match_rate:
                 continue
 
-            father = self._pick_father_for_birth(mother, males)
+            preferred = next((m for m in males if m.person_id == mother.love_partner_id), None)
+            if preferred is not None and self.rng.random() < 0.74:
+                father = preferred
+            else:
+                father = self._pick_father_for_birth(mother, males)
             fertility_score = (
                 cfg.base_birth_rate
                 * (0.6 + mother.genetic_traits.get("fertility", 0.5) * cfg.fertility_trait_weight)
@@ -708,9 +732,19 @@ class SimulationEngine:
         a = sum(p.aggression for p in people) / n
         t = sum(p.tool_skill for p in people) / n
         r = sum(p.riding_skill for p in people) / n
+        w = sum(min(2.5, p.wealth) for p in people) / n
+        pt = sum(min(24, p.personal_tools) for p in people) / n
         mount = 0.06 * r if "animal_husbandry" in self.world_inventions else 0.0
         wheel = 0.04 * r if "wheel" in self.world_inventions else 0.0
-        return n * h * (0.82 + 0.18 * a) * (1.0 + 0.14 * t + mount + wheel) * (0.88 + 0.24 * food_ratio)
+        iron = 0.05 if "iron_working" in self.world_inventions else 0.0
+        return (
+            n
+            * h
+            * (0.82 + 0.18 * a)
+            * (1.0 + 0.14 * t + 0.04 * pt + mount + wheel + iron)
+            * (0.88 + 0.24 * food_ratio)
+            * (1.0 + 0.06 * min(1.0, w))
+        )
 
     def _apply_border_conquest(self, winner_rid: int, loser_rid: int, intensity: float) -> str:
         env_w = self.environments[winner_rid]
@@ -731,10 +765,18 @@ class SimulationEngine:
             f"{self._region_name(loser_rid)}."
         )
 
-    def _step_culture_inventions_and_riding(self, alive: list[Individual], year: int, civ_w: float) -> list[str]:
+    def _step_culture_inventions_and_riding(
+        self,
+        alive: list[Individual],
+        year: int,
+        civ_w: float,
+        food_ratio_by_region: dict[int, float],
+    ) -> list[str]:
         stories: list[str] = []
         if len(alive) < 25:
             return stories
+        tcfg = self.config.technology
+        drain_s = max(0.0, tcfg.resource_drain_scale)
 
         invention_chain: list[tuple[str, float, str, str]] = [
             (
@@ -768,15 +810,36 @@ class SimulationEngine:
                 for p in alive
                 if p.age >= 17
                 and p.age < 72
-                and (p.knowledge * 0.48 + p.tool_skill * 0.52) > 0.26 + threshold * 0.22
+                and (p.knowledge * 0.48 + p.tool_skill * 0.52) > 0.24 + threshold * 0.2
             ]
+            if tcfg.resource_gated_inventions:
+                pool = [
+                    p
+                    for p in pool
+                    if region_meets_invention_minimums(self.environments[p.region_id], key)
+                ]
             if not pool:
                 continue
             headroom = min(1.6, (civ_w - threshold) * 3.2 + 0.08)
-            if self.rng.random() > min(0.5, 0.055 + headroom * 0.22):
-                continue
+            base_p = min(0.52, 0.055 + headroom * 0.22)
             inventor = self.rng.choice(pool)
+            fr = food_ratio_by_region.get(inventor.region_id, 1.0)
+            need_mul = invention_roll_multiplier(
+                inventor.cognitive_iq,
+                inventor.knowledge,
+                inventor.tool_skill,
+                inventor.stress,
+                invention_key=key,
+                regional_food_ratio=fr,
+            )
+            if self.rng.random() > min(0.55, base_p * need_mul):
+                continue
+            env_inv = self.environments[inventor.region_id]
+            if tcfg.resource_gated_inventions and not region_meets_invention_minimums(env_inv, key):
+                continue
             self.world_inventions.add(key)
+            if tcfg.resource_gated_inventions:
+                apply_invention_resource_drain(env_inv, key, scale=drain_s)
             inventor.inventions_made += 1
             inventor.knowledge = min(1.0, inventor.knowledge + 0.018 + self.rng.uniform(0, 0.012))
             inventor.tool_skill = min(1.0, inventor.tool_skill + 0.012)
@@ -828,6 +891,11 @@ class SimulationEngine:
             food_a = food_ratio_by_region.get(ra, 1.0)
             food_b = food_ratio_by_region.get(rb, 1.0)
             same_faction = self._dominant_label(pa, "faction") == self._dominant_label(pb, "faction")
+            pw_a = self._region_war_power(pa, food_a)
+            pw_b = self._region_war_power(pb, food_b)
+            rs_a = self.environments[ra].resource_score()
+            rs_b = self.environments[rb].resource_score()
+            pr = max(pw_a, pw_b) / max(1e-6, min(pw_a, pw_b))
 
             event, war_intensity = self.world_dynamics.step_border(
                 ra,
@@ -841,6 +909,11 @@ class SimulationEngine:
                 year,
                 self._world_aggression(),
                 self.config.cognition.world_iq,
+                resource_score_a=rs_a,
+                resource_score_b=rs_b,
+                relative_power_ratio=pr,
+                material_pressure_a=material_pressure(rs_a, food_a),
+                material_pressure_b=material_pressure(rs_b, food_b),
             )
 
             if event == "trade_open":
@@ -857,8 +930,6 @@ class SimulationEngine:
                 deaths += casualties
                 if has_trade and self.world_dynamics.global_instability > 0.52:
                     self.region_trade_links.discard(pair)
-                pw_a = self._region_war_power(pa, food_a)
-                pw_b = self._region_war_power(pb, food_b)
                 conquest_note = ""
                 if pw_a > pw_b * 1.06:
                     conquest_note = self._apply_border_conquest(ra, rb, war_intensity)
@@ -1090,7 +1161,15 @@ class SimulationEngine:
         if st is None:
             return 0
         lvl = str(st.get("level", "camp"))
-        return {"camp": 0, "village": 1, "town": 2, "city": 3}.get(lvl, 0)
+        base = {"camp": 0, "village": 1, "town": 2, "city": 3}.get(lvl, 0)
+        if lvl != "city":
+            return base
+        polity = str(st.get("polity", "city"))
+        if polity == "empire":
+            return 5
+        if polity == "country":
+            return 4
+        return 3
 
     def _refresh_region_policies(self) -> None:
         for rid in range(self.config.demographics.region_count):
@@ -1167,13 +1246,18 @@ class SimulationEngine:
             return out
         self._refresh_region_policies()
         food_rr = self._food_ratio_by_region(alive)
+        slc = self.config.social_life
+        jw = slc.jail_wealth_multiplier if slc.enabled else 1.0
         for p in alive:
             fr = food_rr.get(p.region_id, 1.0)
             prod = self._individual_productivity(p)
-            p.wealth += 0.017 * prod * (0.55 + 0.45 * fr)
+            wm = jw if slc.enabled and p.jail_years_remaining > 0 else 1.0
+            p.wealth += 0.017 * prod * (0.55 + 0.45 * fr) * wm
             p.wealth = min(40.0, max(0.0, p.wealth))
         id_map = {p.person_id: p for p in alive}
         for person in alive:
+            if person.jail_years_remaining > 0:
+                continue
             nbs = [id_map[n] for n in self.contact_graph.get(person.person_id, []) if n in id_map]
             if not nbs:
                 continue
@@ -1189,11 +1273,15 @@ class SimulationEngine:
         theft_seen = 0
         for _ in range(theft_rounds):
             thief = self.rng.choice(alive)
+            if thief.jail_years_remaining > 0:
+                continue
             nbs = [id_map[n] for n in self.contact_graph.get(thief.person_id, []) if n in id_map]
             if not nbs:
                 continue
             victim = self.rng.choice(nbs)
             if victim.person_id == thief.person_id:
+                continue
+            if victim.jail_years_remaining > 0:
                 continue
             enf = float(self.region_policies.get(thief.region_id, {}).get("theft_enforcement", 0.3))
             r = theft_attempt(
@@ -1207,6 +1295,14 @@ class SimulationEngine:
             )
             if r == "theft_caught":
                 theft_seen += 1
+                thief.crimes_caught_count += 1
+                sl = self.config.social_life
+                if (
+                    sl.enabled
+                    and thief.crimes_caught_count >= sl.theft_jail_after_catches
+                    and enf >= sl.theft_jail_min_enforcement
+                ):
+                    thief.jail_years_remaining = max(thief.jail_years_remaining, sl.jail_years_theft)
                 self.region_treasury[thief.region_id] = self.region_treasury.get(thief.region_id, 0.0) + min(
                     0.22,
                     max(0.0, thief.wealth) * 0.06,
@@ -1325,6 +1421,8 @@ class SimulationEngine:
             self._compute_macro_goal_cache(alive, food_ratio_by_region) if bcfg.enabled else {}
         )
         for person in alive:
+            if person.jail_years_remaining > 0:
+                continue
             migrate_prob = mcfg.migration_rate
             target_region = person.region_id
 
@@ -1498,41 +1596,15 @@ class SimulationEngine:
             if p.alive and any(state == DiseaseState.INFECTED for state in p.disease_states.values())
         )
 
-    def _era_profile(self, year: int) -> dict[str, float | str]:
-        if year < 120:
-            return {
-                "name": "hunter-gatherer",
-                "food_effect": 1.15,
-                "birth_multiplier": 1.2,
-                "mortality_multiplier": 1.1,
-            }
-        if year < 280:
-            return {
-                "name": "agrarian",
-                "food_effect": 1.0,
-                "birth_multiplier": 1.0,
-                "mortality_multiplier": 1.0,
-            }
-        if year < 480:
-            return {
-                "name": "industrial",
-                "food_effect": 0.9,
-                "birth_multiplier": 1.15,
-                "mortality_multiplier": 0.85,
-            }
-        if year < 760:
-            return {
-                "name": "modern",
-                "food_effect": 0.85,
-                "birth_multiplier": 0.92,
-                "mortality_multiplier": 0.72,
-            }
-        return {
-            "name": "information age",
-            "food_effect": 0.85,
-            "birth_multiplier": 0.84,
-            "mortality_multiplier": 0.64,
-        }
+    def _era_profile(self, year: int, civ_w: float) -> dict[str, float | str]:
+        return compute_era_profile(
+            year,
+            civ_w,
+            self.world_inventions,
+            self.unlocked_milestones,
+            self.agriculture_unlocked,
+            dynamic=self.config.technology.dynamic_eras,
+        )
 
     def _mentor_suitability(self, pupil: Individual, mentor: Individual) -> float:
         gain_k = max(0.0, mentor.knowledge - pupil.knowledge)
@@ -1549,6 +1621,8 @@ class SimulationEngine:
             return
         id_map = {p.person_id: p for p in alive}
         for person in alive:
+            if person.jail_years_remaining > 0:
+                continue
             neighbors = [id_map[n] for n in self.contact_graph.get(person.person_id, []) if n in id_map]
             if not neighbors:
                 continue
@@ -1587,12 +1661,16 @@ class SimulationEngine:
         for p in alive:
             if p.belief_group.startswith("cult_"):
                 continue
+            if is_prophet_movement_belief(p.belief_group):
+                continue
             by_region[p.region_id][p.belief_group] += 1
         majority: dict[int, str | None] = {}
         for rid, counts in by_region.items():
             majority[rid] = max(counts.items(), key=lambda kv: kv[1])[0] if counts else None
         for p in alive:
             if p.belief_group.startswith("cult_"):
+                continue
+            if is_prophet_movement_belief(p.belief_group):
                 continue
             dom = majority.get(p.region_id)
             if not dom or dom == p.belief_group:
@@ -1605,6 +1683,230 @@ class SimulationEngine:
                 continue
             if p.happiness > 0.6 and self.rng.random() < 0.0048:
                 p.belief_group = dom
+
+    def _advance_jail_sentences(self, alive: list[Individual]) -> None:
+        for p in alive:
+            if p.jail_years_remaining > 0:
+                p.jail_years_remaining -= 1
+
+    def _step_social_life(self, alive: list[Individual], year: int) -> list[str]:
+        sl = self.config.social_life
+        if not sl.enabled or len(alive) < 12:
+            return []
+        stories: list[str] = []
+        id_map = {p.person_id: p for p in alive}
+
+        for p in alive:
+            if p.jail_years_remaining > 0:
+                p.stress = min(1.0, p.stress + 0.022)
+                p.happiness = max(0.0, p.happiness - 0.035)
+                p.reputation = max(0.0, p.reputation - 0.006)
+
+        for p in alive:
+            lid = p.love_partner_id
+            if lid is None:
+                continue
+            o = id_map.get(lid)
+            if o is None or not o.alive:
+                p.love_partner_id = None
+                continue
+            if o.love_partner_id != p.person_id:
+                p.love_partner_id = None
+        for p in alive:
+            if p.love_partner_id is None:
+                continue
+            o = id_map.get(p.love_partner_id)
+            if o is None or o.love_partner_id != p.person_id:
+                p.love_partner_id = None
+
+        attempts = min(sl.love_pair_attempts_per_year, max(30, len(alive) * 4))
+        singles = [
+            p
+            for p in alive
+            if p.jail_years_remaining == 0 and p.love_partner_id is None and 18 <= p.age <= 52
+        ]
+        self.rng.shuffle(singles)
+        formed_love = 0
+        for p in singles[:attempts]:
+            if p.love_partner_id is not None:
+                continue
+            nbs = [id_map[n] for n in self.contact_graph.get(p.person_id, []) if n in id_map]
+            candidates = [
+                o
+                for o in nbs
+                if o.jail_years_remaining == 0
+                and o.love_partner_id is None
+                and 18 <= o.age <= 55
+                and o.region_id == p.region_id
+            ]
+            if not candidates:
+                continue
+            o = self.rng.choice(candidates)
+            pair = normalize_pair(p.person_id, o.person_id)
+            if pair in self.enmities:
+                continue
+            tr = self._pair_trust.get(pair, 0.5)
+            if tr < 0.5:
+                continue
+            if p.happiness < 0.32 or o.happiness < 0.32:
+                continue
+            p_ = sl.love_base_probability * (0.6 + tr) * (0.55 + 0.5 * min(p.happiness, o.happiness))
+            if self.rng.random() > min(0.14, p_):
+                continue
+            p.love_partner_id = o.person_id
+            o.love_partner_id = p.person_id
+            p.happiness = min(1.0, p.happiness + 0.04)
+            o.happiness = min(1.0, o.happiness + 0.04)
+            self._pair_trust[pair] = min(1.0, tr + 0.05)
+            formed_love += 1
+        if formed_love and self.rng.random() < 0.28:
+            stories.append(f"Y{year + 1}: {formed_love} new love bonds among neighbors")
+
+        n_as = min(sl.assault_samples_per_year, max(24, len(alive) // 2))
+        assaults = 0
+        jailed_assault = 0
+        for _ in range(n_as):
+            ag = self.rng.choice(alive)
+            if ag.jail_years_remaining > 0 or ag.aggression < 0.36:
+                continue
+            nbs = [id_map[n] for n in self.contact_graph.get(ag.person_id, []) if n in id_map]
+            if not nbs:
+                continue
+            vict = self.rng.choice(nbs)
+            if vict.jail_years_remaining > 0:
+                continue
+            pair = normalize_pair(ag.person_id, vict.person_id)
+            base = sl.assault_base_probability * (0.45 + ag.aggression) * (0.88 + ag.stress)
+            base *= 0.75 + 0.55 * (1.0 - self._pair_trust.get(pair, 0.5))
+            if pair in self.friendships:
+                base *= 0.22
+            if self.rng.random() > min(0.1, base):
+                continue
+            dmg = self.rng.uniform(0.045, 0.115)
+            vict.health = max(0.0, vict.health - dmg)
+            vict.stress = min(1.0, vict.stress + 0.11)
+            vict.happiness = max(0.0, vict.happiness - 0.08)
+            ag.stress = min(1.0, ag.stress + 0.04)
+            self.enmities.add(pair)
+            self.friendships.discard(pair)
+            self._pair_trust[pair] = max(0.08, self._pair_trust.get(pair, 0.5) - 0.22)
+            assaults += 1
+            enf = float(self.region_policies.get(ag.region_id, {}).get("theft_enforcement", 0.35))
+            catch = enf * (0.2 + 0.35 * vict.reputation) * (0.72 + 0.28 * self.rng.random())
+            if self.rng.random() < catch:
+                ag.crimes_caught_count += 1
+                ag.jail_years_remaining = max(ag.jail_years_remaining, sl.jail_years_assault_caught)
+                ag.reputation = max(0.0, ag.reputation - 0.12)
+                jailed_assault += 1
+        if assaults and self.rng.random() < 0.22:
+            stories.append(
+                f"Y{year + 1}: {assaults} violent assaults; {jailed_assault} aggressors jailed."
+            )
+
+        n_prophets = sum(1 for p in alive if p.is_prophet)
+        world_temple = any(s.get("kind") == "temple" for s in self.world_structures)
+        avg_sp = sum(p.spiritual_tendency for p in alive) / len(alive)
+        if (
+            len(alive) >= sl.prophet_min_population
+            and n_prophets < sl.max_prophets_world
+            and (world_temple or avg_sp > 0.46)
+        ):
+            candidates = [
+                p
+                for p in alive
+                if not p.is_prophet
+                and not p.belief_group.startswith("cult_")
+                and not is_prophet_movement_belief(p.belief_group)
+                and p.spiritual_tendency >= sl.prophet_min_spiritual
+                and p.knowledge >= sl.prophet_min_knowledge
+                and p.reputation >= sl.prophet_min_reputation
+                and 26 <= p.age <= 68
+            ]
+            self.rng.shuffle(candidates)
+            for p in candidates[:6]:
+                pr = sl.prophet_emerge_probability * (0.72 + 0.55 * p.spiritual_tendency)
+                if self.rng.random() > pr:
+                    continue
+                mov = prophet_movement_id(p.person_id)
+                p.is_prophet = True
+                p.belief_group = mov
+                p.reputation = min(1.0, p.reputation + 0.05)
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"Prophet arises (#{p.person_id})",
+                        f"A new teaching draws followers: {mov}.",
+                    )
+                )
+                break
+
+        prophets = [p for p in alive if p.is_prophet]
+        converts = 0
+        for pr in prophets:
+            mov = prophet_movement_id(pr.person_id)
+            if pr.belief_group != mov:
+                pr.belief_group = mov
+            nbs = [id_map[n] for n in self.contact_graph.get(pr.person_id, []) if n in id_map]
+            for o in nbs:
+                if o.region_id != pr.region_id:
+                    continue
+                if o.belief_group.startswith("cult_") or o.belief_group == mov:
+                    continue
+                conv = (
+                    0.028
+                    * (0.9 + pr.spiritual_tendency)
+                    * (1.0 + 0.55 * o.stress)
+                    * (0.75 + 0.45 * o.spiritual_tendency)
+                )
+                if pr.political_power > 0.45:
+                    conv *= 1.08
+                if self.rng.random() < min(0.14, conv):
+                    o.belief_group = mov
+                    o.spiritual_tendency = min(1.0, o.spiritual_tendency + 0.015)
+                    converts += 1
+        if converts and self.rng.random() < 0.2:
+            stories.append(f"Y{year + 1}: {converts} people joined prophet-led worship")
+
+        shrines = 0
+        for pr in prophets:
+            mov = prophet_movement_id(pr.person_id)
+            byr = followers_by_region(alive, mov)
+            for rid, c in byr.items():
+                if c < sl.worship_followers_for_shrine:
+                    continue
+                if has_worship_shrine(self.world_structures, rid, mov):
+                    continue
+                idx = len([s for s in self.world_structures if s.get("kind") == "shrine"])
+                self.world_structures.append(
+                    {
+                        "id": f"shrine_{rid}_{pr.person_id}_{idx}",
+                        "kind": "shrine",
+                        "movement": mov,
+                        "prophet_id": pr.person_id,
+                        "region_id": rid,
+                        "slot": max(0.08, min(0.92, self.rng.uniform(0.18, 0.82))),
+                        "slot_y": max(0.38, min(0.9, self.rng.uniform(0.44, 0.86))),
+                    }
+                )
+                shrines += 1
+                stories.append(
+                    self._register_timeline_transition(
+                        year,
+                        f"Worship hall: {self._region_name(rid)}",
+                        f"Followers of {mov} established a gathering place.",
+                    )
+                )
+
+        for p in alive:
+            lid = p.love_partner_id
+            if lid is None:
+                continue
+            o = id_map.get(lid)
+            if o and o.alive and p.region_id == o.region_id and self.rng.random() < 0.45:
+                p.happiness = min(1.0, p.happiness + 0.006)
+                o.happiness = min(1.0, o.happiness + 0.006)
+
+        return stories
 
     def _update_civilization_metrics(self, alive: list[Individual]) -> None:
         if not alive:
@@ -1628,11 +1930,15 @@ class SimulationEngine:
                 p.stress = min(1.0, p.stress + 0.002)
         id_map = {p.person_id: p for p in alive}
         for person in alive:
+            if person.jail_years_remaining > 0:
+                continue
             for nid in self.contact_graph.get(person.person_id, []):
                 if person.person_id >= nid:
                     continue
                 other = id_map.get(nid)
                 if other is None:
+                    continue
+                if other.jail_years_remaining > 0:
                     continue
                 pair = normalize_pair(person.person_id, other.person_id)
                 prev_trust = self._pair_trust.get(pair, 0.5)
@@ -1742,7 +2048,13 @@ class SimulationEngine:
             self.unlocked_milestones.add("tools")
             self.food_system_bonus += 0.05
             stories.append(self._register_event(year, "Advanced tools", "Tool use boosts food gathering efficiency."))
-        if "agriculture" not in self.unlocked_milestones and self.current_era in ("agrarian", "industrial", "modern"):
+        if "agriculture" not in self.unlocked_milestones and self.current_era in (
+            "agrarian",
+            "classical",
+            "industrial",
+            "modern",
+            "information age",
+        ):
             self.unlocked_milestones.add("agriculture")
             self.food_system_bonus += 0.09
             self.agriculture_unlocked = True
@@ -1977,8 +2289,11 @@ class SimulationEngine:
                 next_level = "city"
             if next_level:
                 settlement["level"] = next_level
-                if next_level == "city" and not str(settlement.get("name", "")).endswith(" City"):
-                    settlement["name"] = f"{settlement['name']} City"
+                if next_level == "city":
+                    settlement.setdefault("polity", "city")
+                    if not str(settlement.get("name", "")).endswith(" City"):
+                        stem = settlement_name_stem(str(settlement.get("name", "")))
+                        settlement["name"] = format_settlement_polity_name(stem, "city", (ravg_knowledge + ravg_tools) * 0.5)
                 stories.append(
                     self._register_timeline_transition(
                         year,
@@ -1986,6 +2301,47 @@ class SimulationEngine:
                         f"Regional population and institutions enabled a {next_level}.",
                     )
                 )
+
+            # City-scale polity: unified country, then empire (same region; names + government bias).
+            if str(settlement.get("level", "")) == "city":
+                pol = str(settlement.get("polity", "city"))
+                civ_r = (ravg_knowledge + ravg_tools) * 0.5
+                pcfg = self.config.politics
+                if pcfg.polity_progression and pol == "city":
+                    state_ok = ("state" in self.unlocked_milestones) or (rpop >= max(pcfg.country_min_city_pop + 40, 205))
+                    if (
+                        rpop >= pcfg.country_min_city_pop
+                        and civ_r >= pcfg.country_min_civ_region
+                        and (not pcfg.country_requires_state_milestone or state_ok)
+                    ):
+                        settlement["polity"] = "country"
+                        stem = settlement_name_stem(str(settlement.get("name", "")))
+                        settlement["name"] = format_settlement_polity_name(stem, "country", civ_r)
+                        stories.append(
+                            self._register_timeline_transition(
+                                year,
+                                f"Country formed: {settlement['name']}",
+                                "A city-scale polity unifies law, borders, and identity as a country.",
+                            )
+                        )
+                elif pcfg.polity_progression and pol == "country":
+                    avg_amb = sum(p.ambition for p in residents) / rpop
+                    expansion = avg_amb > pcfg.empire_ambition_threshold or "iron_working" in self.world_inventions
+                    if (
+                        rpop >= pcfg.empire_min_country_pop
+                        and civ_r >= pcfg.empire_min_civ_region
+                        and expansion
+                    ):
+                        settlement["polity"] = "empire"
+                        stem = settlement_name_stem(str(settlement.get("name", "")))
+                        settlement["name"] = format_settlement_polity_name(stem, "empire", civ_r)
+                        stories.append(
+                            self._register_timeline_transition(
+                                year,
+                                f"Empire proclaimed: {settlement['name']}",
+                                "Central power expands; the realm is recognized as an empire.",
+                            )
+                        )
 
         # Agriculture fields become visible structures after agriculture unlock.
         if self.agriculture_unlocked:
@@ -2117,7 +2473,7 @@ class SimulationEngine:
             return f"Region-{region_id}"
         return str(settlement.get("name", f"Region-{region_id}"))
 
-    def _effective_government(self, settlement_level: str, civ: float) -> str:
+    def _effective_government(self, settlement_level: str, civ: float, polity: str = "city") -> str:
         mode = self.config.politics.government_mode
         if settlement_level == "camp":
             return "informal"
@@ -2127,6 +2483,10 @@ class SimulationEngine:
             if settlement_level == "town":
                 return "democracy" if civ > 0.48 else "oligarchy"
             if settlement_level == "city":
+                if polity == "empire":
+                    return "monarchy" if civ > 0.5 else "autocracy"
+                if polity == "country":
+                    return "democracy" if civ > 0.53 else "oligarchy"
                 return "democracy" if civ > 0.55 else "oligarchy"
             return "oligarchy"
         if mode == "chiefdom":
@@ -2141,7 +2501,9 @@ class SimulationEngine:
             return "autocracy"
         return "oligarchy"
 
-    def _leader_title_for_government(self, gov: str) -> str:
+    def _leader_title_for_government(self, gov: str, polity: str = "city") -> str:
+        if polity == "empire" and gov in ("monarchy", "autocracy"):
+            return "Emperor"
         if gov == "democracy" and self.config.politics.government_mode == "republic":
             return "Prime Minister"
         return {
@@ -2154,8 +2516,13 @@ class SimulationEngine:
             "autocracy": "Ruler",
         }.get(gov, "Leader")
 
-    def _recompute_political_power(self, person: Individual, settlement_level: str) -> None:
+    def _recompute_political_power(self, person: Individual, settlement_level: str, polity: str = "city") -> None:
         tier = {"camp": 1.0, "village": 1.06, "town": 1.14, "city": 1.24}.get(settlement_level, 1.0)
+        if settlement_level == "city":
+            if polity == "country":
+                tier *= 1.07
+            elif polity == "empire":
+                tier *= 1.14
         books = min(1.0, person.books_authored / 6.0)
         tools = min(1.0, person.personal_tools / 10.0)
         age_bonus = min(0.22, max(0.0, (person.age - 20) * 0.004))
@@ -2182,6 +2549,7 @@ class SimulationEngine:
                 continue
             region_id = int(structure.get("region_id", 0))
             level = str(structure.get("level", "camp"))
+            polity = str(structure.get("polity", "city")) if level == "city" else "city"
             residents = by_region.get(region_id, [])
             if not residents:
                 continue
@@ -2191,11 +2559,11 @@ class SimulationEngine:
             prev_leader = prev.get("leader_id")
             prev_leader_int = int(prev_leader) if isinstance(prev_leader, int) else None
 
-            gov = self._effective_government(level, self.civilization_index)
+            gov = self._effective_government(level, self.civilization_index, polity)
             elite_n = max(2, min(len(residents), int(len(residents) * cfg.elite_fraction) + 1))
 
             for person in residents:
-                self._recompute_political_power(person, level)
+                self._recompute_political_power(person, level, polity)
 
             sorted_r = sorted(residents, key=lambda x: x.political_power, reverse=True)
             elite_ids = [p.person_id for p in sorted_r[:elite_n]]
@@ -2330,7 +2698,7 @@ class SimulationEngine:
                         new_leader_id = leader_alive_id
                 next_election = None
 
-            title = self._leader_title_for_government(gov)
+            title = self._leader_title_for_government(gov, polity)
             state = {
                 "government": gov,
                 "leader_id": new_leader_id,
@@ -2413,6 +2781,7 @@ class SimulationEngine:
                 self.city_summaries.append(
                     {
                         "name": str(structure.get("name", "Unknown")),
+                        "polity": str(structure.get("polity", "city")),
                         "culture": str(culture),
                         "religion": str(religion),
                         "faction": str(faction),
@@ -2672,11 +3041,24 @@ class SimulationEngine:
             )
 
     def _craft_tools_and_books(self, alive: list[Individual], year: int) -> None:
+        tcfg = self.config.technology
         craft_rate = 1.0 + 0.34 * int("advanced_tools" in self.world_inventions)
+        drain_s = max(0.0, tcfg.resource_drain_scale)
         for person in alive:
-            if person.tool_skill > 0.45 and self.rng.random() < (0.01 + person.tool_skill * 0.02) * craft_rate:
+            env = self.environments[person.region_id]
+            if tcfg.resource_gated_tool_crafting and not region_can_craft_tools(env):
+                craft_chance_scale = 0.22
+            else:
+                craft_chance_scale = 1.0
+            if person.tool_skill > 0.45 and self.rng.random() < (
+                (0.01 + person.tool_skill * 0.02) * craft_rate * craft_chance_scale
+            ):
+                if tcfg.resource_gated_tool_crafting and not region_can_craft_tools(env):
+                    continue
                 person.personal_tools += 1
                 self.total_tools_crafted += 1
+                if tcfg.resource_gated_tool_crafting:
+                    apply_tool_craft_drain(env, scale=drain_s)
 
             writing_unlocked = "writing" in self.unlocked_milestones
             if writing_unlocked and person.knowledge > 0.6 and self.rng.random() < (0.004 + person.knowledge * 0.01):

@@ -31,6 +31,13 @@ class Environment:
                 self.food_multiplier * (1.0 - self.config.shock_severity),
             )
 
+        # Gradual recovery of timber/ore/fertility after extraction (regrowth, shallow deposits).
+        regen = 0.0024 + self.rng.uniform(0, 0.0018)
+        for k in self.resource_richness:
+            cur = self.resource_richness[k]
+            headroom = max(0.0, 1.0 - cur)
+            self.resource_richness[k] = min(1.0, max(0.08, cur + regen * (0.35 + 0.65 * headroom)))
+
     def available_food(self, population_size: int) -> float:
         if population_size <= 0:
             return 0.0

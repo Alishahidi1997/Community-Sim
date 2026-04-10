@@ -56,6 +56,14 @@ class Individual:
     primary_goal: str
     observed_food_ema: float
     observed_food_trend: float
+    # Incarceration: years left after end-of-year tick; blocks migration and cuts income.
+    jail_years_remaining: int = 0
+    # Mutual romantic bond (contact graph); cleared if partner dies or bond breaks.
+    love_partner_id: int | None = None
+    # Founded a revelatory movement (belief_group becomes way_of_<id>).
+    is_prophet: bool = False
+    # Caught theft / violent crime; repeated theft can trigger jail.
+    crimes_caught_count: int = 0
 
     def age_one_year(self) -> None:
         self.age += 1

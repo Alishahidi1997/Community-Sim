@@ -135,6 +135,12 @@ class WorldDynamics:
         year: int,
         world_aggression: float = 1.0,
         world_iq: float = 0.65,
+        *,
+        resource_score_a: float = 0.5,
+        resource_score_b: float = 0.5,
+        relative_power_ratio: float = 1.0,
+        material_pressure_a: float = 0.0,
+        material_pressure_b: float = 0.0,
     ) -> tuple[str | None, float]:
         """Update latent tension/goodwill; return event type and war intensity in [0,1].
 
@@ -151,6 +157,17 @@ class WorldDynamics:
         gap = abs(food_per_cap_a - food_per_cap_b)
         inequality_edge = _clamp(gap * 1.4, 0.0, 1.0)
 
+        r_a = _clamp(resource_score_a, 0.0, 1.2)
+        r_b = _clamp(resource_score_b, 0.0, 1.2)
+        r_mean = (r_a + r_b) * 0.5
+        resource_scarcity = _clamp(1.0 - r_mean / 1.05, 0.0, 1.0)
+        resource_gap = abs(r_a - r_b)
+        resource_inequality = _clamp(resource_gap * 1.12, 0.0, 1.0)
+        pr = _clamp(relative_power_ratio, 1.0, 8.0)
+        power_asym = _clamp((pr - 1.0) / 3.5, 0.0, 1.0)
+        predation_pull = resource_inequality * (0.14 + 0.28 * power_asym)
+        mat_pair = _clamp((material_pressure_a + material_pressure_b) * 0.5, 0.0, 1.0)
+
         wa = _clamp(world_aggression, 0.15, 3.0)
         pressure = (
             0.34 * scarcity
@@ -159,6 +176,9 @@ class WorldDynamics:
             + 0.14 * avg_ambition_pair
             + (0.0 if same_dominant_faction else 0.12)
             + self.border_phase_jitter(ra, rb)
+            + 0.11 * resource_scarcity
+            + predation_pull
+            + 0.1 * mat_pair
         )
         pressure *= 0.45 + 0.55 * wa
         pressure *= 1.05 - 0.38 * iq_c
@@ -179,11 +199,13 @@ class WorldDynamics:
         d_tension = new_tension - prev
 
         # Trade goodwill accumulates when conditions favor cooperation
+        resource_complement = _clamp(resource_gap * (0.5 + 0.5 * (1.0 - scarcity)), 0.0, 1.0)
         dip = (
             (0.38 if same_dominant_faction else 0.0)
             + (1.0 - inequality_edge) * 0.22
             + (1.0 - avg_aggression_pair) * 0.22
             + (1.0 - scarcity) * 0.18
+            + resource_complement * 0.08
         )
         gw = self.border_trade_goodwill.get(key, 0.0)
         coop = 0.78 + 0.28 * iq_c

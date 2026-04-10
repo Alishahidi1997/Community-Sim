@@ -1184,8 +1184,18 @@ class RealtimeVisualizer:
         bg = person.belief_group
         if bg.startswith("cult_"):
             lines.append(f"Belief: cult — {bg}")
+        elif bg.startswith("way_of_"):
+            lines.append(f"Belief: prophet movement — {bg}")
         else:
             lines.append(f"Belief: {bg}")
+        if getattr(person, "is_prophet", False):
+            lines.append("Role: prophet (founded a movement)")
+        lp = getattr(person, "love_partner_id", None)
+        if lp is not None:
+            lines.append(f"Love bond: partner #{lp}")
+        jy = int(getattr(person, "jail_years_remaining", 0) or 0)
+        if jy > 0:
+            lines.append(f"Jail: {jy} year(s) remaining")
         lines.append(f"Faction: {person.faction} · Language: {person.language}")
         lines.append(f"Health {person.health:.2f} · Happy {person.happiness:.2f} · Stress {person.stress:.2f}")
         inf = [k for k, st in person.disease_states.items() if st == DiseaseState.INFECTED]
@@ -1231,6 +1241,8 @@ class RealtimeVisualizer:
             lines.append(f"Name: {s['name']}")
         if "level" in s:
             lines.append(f"Level: {s['level']}")
+        if s.get("polity"):
+            lines.append(f"Polity: {s['polity']}")
         lines.append(f"Id: {s.get('id', '?')}")
         if kind == "settlement":
             tr = float(self.engine.region_treasury.get(rid, 0.0))
@@ -2057,7 +2069,8 @@ class RealtimeVisualizer:
         screen.blit(city_header, (18, 68))
         y_city = 88
         for city in self.engine.city_summaries[:3]:
-            line = f"{city['name']} ({city['culture']}/{city['religion']})"
+            pol = city.get("polity", "city")
+            line = f"{city['name']} [{pol}] ({city['culture']}/{city['religion']})"
             txt = small_font.render(line[:42], True, (172, 184, 208))
             screen.blit(txt, (20, y_city))
             y_city += 18
@@ -2114,7 +2127,7 @@ class RealtimeVisualizer:
         y = ledger_rect.top + 34
         for idx, city in enumerate(rows, start=start + 1):
             line = (
-                f"{idx:>2}. {city['name']} | pop {city['population']} | "
+                f"{idx:>2}. {city['name']} | {city.get('polity', 'city')} | pop {city['population']} | "
                 f"{city.get('community', city['culture'])} | {city['religion']} | "
                 f"{city.get('faction','?')} | r={city.get('resource_score','?')}"
             )
