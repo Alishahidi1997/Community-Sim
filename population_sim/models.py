@@ -64,6 +64,13 @@ class Individual:
     is_prophet: bool = False
     # Caught theft / violent crime; repeated theft can trigger jail.
     crimes_caught_count: int = 0
+    # Formal bond with love_partner_id (mutual); cleared on breakup or death of partner.
+    is_married: bool = False
+    # Where this person lives within their region: hinterland vs denser tiers (coexists across the world).
+    # Allowed values: rural, village, town, city (city-tier only when regional settlement is a city).
+    living_context: str = "rural"
+    # Smoothed diet adequacy (tracks regional food ratio over years); drives chronic stress / health.
+    nutrition_ema: float = 1.0
 
     def age_one_year(self) -> None:
         self.age += 1

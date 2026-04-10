@@ -73,6 +73,79 @@ class BehaviorConfig:
 
 
 @dataclass
+class WorldRealismConfig:
+    """Marriage, birth risk, schools, corruption, unrest, sanitation, elder support."""
+
+    enabled: bool = True
+    marriage_probability_if_eligible: float = 0.11
+    marriage_min_trust: float = 0.56
+    marriage_min_age: int = 20
+    breakup_long_distance_probability: float = 0.11
+    breakup_high_stress_threshold: float = 0.9
+    breakup_low_trust: float = 0.38
+    breakup_low_trust_probability: float = 0.08
+    married_birth_fertility_bonus: float = 0.065
+    maternal_mortality_enabled: bool = True
+    maternal_mortality_base: float = 0.0036
+    maternal_mortality_health_scale: float = 1.05
+    school_learning_bonus: float = 0.005
+    school_max_age: int = 38
+    treasury_corruption_enabled: bool = True
+    treasury_corruption_enforcement_lt: float = 0.38
+    treasury_corruption_max_fraction: float = 0.014
+    unrest_food_ratio_below: float = 0.82
+    unrest_region_mean_stress_above: float = 0.58
+    unrest_event_probability: float = 0.15
+    unrest_instability_bump: float = 0.042
+    sanitation_requires_writing: bool = True
+    sanitation_min_mean_settlement_tier: float = 1.12
+    sanitation_transmission_reduction: float = 0.11
+    elder_support_age_min: int = 58
+    elder_partner_health_bonus: float = 0.0075
+    # Regional harvest quality (weather / pests / soil luck), persistent year to year.
+    harvest_weather_enabled: bool = True
+    harvest_volatility: float = 0.085
+    harvest_persistence: float = 0.62
+    harvest_min_factor: float = 0.58
+    harvest_max_factor: float = 1.28
+    # Slow-moving nutrition vs food ratio: chronic stress and health when diets stay poor.
+    nutrition_tracking_enabled: bool = True
+    nutrition_ema_alpha: float = 0.17
+    nutrition_stress_threshold: float = 0.56
+    nutrition_chronic_stress_per_year: float = 0.009
+    nutrition_chronic_health_penalty: float = 0.0055
+    nutrition_recovery_health_bonus: float = 0.0028
+    # More transmission when many people live in town/city bands (crowding).
+    urban_crowding_disease_boost: float = 0.072
+    # Town/city households pay more when local food is tight (rent / imports).
+    dense_housing_rent_drag: float = 0.0038
+    # Non-jailed partner absorbs stress while spouse is incarcerated.
+    partner_jail_stress: float = 0.013
+    # Rare multi-year shocks (drought, flood, crop blight) on top of harvest noise.
+    regional_disaster_enabled: bool = True
+    regional_disaster_probability: float = 0.042
+    regional_disaster_min_years: int = 1
+    regional_disaster_max_years: int = 3
+    regional_disaster_food_mult_low: float = 0.66
+    regional_disaster_food_mult_high: float = 0.91
+    # Contacts grieve when someone they know dies in the yearly mortality pass.
+    bereavement_enabled: bool = True
+    bereavement_stress: float = 0.035
+    bereavement_happiness_hit: float = 0.021
+    bereavement_max_contacts: int = 12
+    # Neighbors lean on each other when food is tight (trust + mood).
+    mutual_aid_enabled: bool = True
+    mutual_aid_food_below: float = 0.86
+    mutual_aid_attempt_probability: float = 0.13
+    mutual_aid_happiness: float = 0.012
+    mutual_aid_trust: float = 0.015
+    mutual_aid_min_trust: float = 0.51
+    # Sustained ambition / striving adds baseline stress (overwork proxy).
+    work_fatigue_enabled: bool = True
+    work_fatigue_stress: float = 0.0055
+
+
+@dataclass
 class SocialLifeConfig:
     """Faith movements, romance, violence, and jail tied to enforcement."""
 
@@ -194,6 +267,7 @@ class SimulationConfig:
     behavior: BehaviorConfig = field(default_factory=BehaviorConfig)
     conflict: ConflictConfig = field(default_factory=ConflictConfig)
     social_life: SocialLifeConfig = field(default_factory=SocialLifeConfig)
+    world_realism: WorldRealismConfig = field(default_factory=WorldRealismConfig)
     politics: PoliticsConfig = field(default_factory=PoliticsConfig)
     cognition: CognitionConfig = field(default_factory=CognitionConfig)
     technology: TechnologyConfig = field(default_factory=TechnologyConfig)

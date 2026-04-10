@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import colorsys
 import math
 import random
 import sys
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Callable
 
@@ -78,6 +80,7 @@ class RealtimeVisualizer:
         self.running = True
         self.paused = False
         self.show_labels = False
+        self.show_region_overlay = False
         # At ~60 FPS, 600 frames is about 10 seconds per simulation year.
         self.step_every_frames = 600
         self.frame_counter = 0
@@ -152,6 +155,78 @@ class RealtimeVisualizer:
             max(0, min(255, int(rgb[1] * factor))),
             max(0, min(255, int(rgb[2] * factor))),
         )
+
+    def _region_distinct_color(self, region_id: int) -> tuple[int, int, int]:
+        h = (region_id * 0.618033988749895) % 1.0
+        r, g, b = colorsys.hsv_to_rgb(h, 0.58, 0.78)
+        return int(r * 255), int(g * 255), int(b * 255)
+
+    def _region_overlay_button_rect(self) -> pygame.Rect:
+        w = min(236, max(140, self.panel_width - 36))
+        return pygame.Rect(self.width - self.panel_width + 18, self.height - 108, w, 34)
+
+    def _region_overlay_legend_entries(self) -> list[tuple[str, str, tuple[int, int, int]]]:
+        alive = [p for p in self.engine.population if p.alive]
+        by_reg: defaultdict[int, list] = defaultdict(list)
+        for p in alive:
+            by_reg[p.region_id].append(p)
+        food_by = self.engine._food_ratio_by_region(alive)
+        n_reg = self.engine.config.demographics.region_count
+        out: list[tuple[str, str, tuple[int, int, int]]] = []
+        for rid in range(n_reg):
+            col = self._region_distinct_color(rid)
+            st = self.engine._get_settlement_structure(rid)
+            name = self.engine._region_name(rid)
+            if st:
+                level = str(st.get("level", "?"))
+                polity = str(st.get("polity", "—")) if level == "city" else "—"
+            else:
+                level, polity = "—", "—"
+            pop_n = len(by_reg[rid])
+            lc_counts = Counter(getattr(p, "living_context", "rural") for p in by_reg[rid])
+            mix_s = " · ".join(f"{k}×{v}" for k, v in sorted(lc_counts.items(), key=lambda kv: (-kv[1], kv[0])))
+            fr = food_by.get(rid, 1.0)
+            treas = float(self.engine.region_treasury.get(rid, 0.0))
+            pol = self.engine.politics_by_region.get(rid, {})
+            gov = str(pol.get("government", "—"))
+            line_a = f"R{rid}  {name}"
+            line_b = f"{level} · {polity} · gov {gov} · pop {pop_n} · {mix_s} · food {fr:.2f} · treas {treas:.0f}"
+            out.append((line_a, line_b, col))
+        return out
+
+    def _draw_region_overlay_legend(self, screen: pygame.Surface, small_font: pygame.font.Font) -> None:
+        wr = self._world_rect()
+        entries = self._region_overlay_legend_entries()
+        line_h = small_font.get_height() + 3
+        pad = 10
+        title_h = small_font.get_height() + 6
+        max_h = min(int(wr.height * 0.42), title_h + len(entries) * line_h * 2 + pad * 2)
+        card_w = min(wr.width - 20, 480)
+        x0 = wr.left + 10
+        y0 = wr.bottom - max_h - 10
+        card = pygame.Rect(x0, y0, card_w, max_h)
+        plate = pygame.Surface((card.w, card.h), pygame.SRCALPHA)
+        plate.fill((12, 14, 20, 214))
+        screen.blit(plate, card.topleft)
+        pygame.draw.rect(screen, (72, 120, 168), card, 1, border_radius=6)
+
+        ty = card.top + pad
+        hdr = small_font.render("Regions (settlement · where people live · stats)", True, (210, 216, 228))
+        screen.blit(hdr, (card.left + pad, ty))
+        ty += title_h
+        sw = 12
+        for line_a, line_b, col in entries:
+            if ty + line_h * 2 > card.bottom - pad:
+                more = small_font.render("…", True, (160, 164, 176))
+                screen.blit(more, (card.left + pad, ty))
+                break
+            pygame.draw.rect(screen, col, pygame.Rect(card.left + pad, ty + 2, sw, sw - 2))
+            pygame.draw.rect(screen, self._lerp_rgb(col, (20, 22, 28), 0.35), pygame.Rect(card.left + pad, ty + 2, sw, sw - 2), 1)
+            t1 = small_font.render(line_a, True, (236, 238, 244))
+            t2 = small_font.render(line_b, True, (168, 174, 188))
+            screen.blit(t1, (card.left + pad + sw + 8, ty))
+            screen.blit(t2, (card.left + pad + sw + 8, ty + line_h - 2))
+            ty += line_h * 2
 
     def _world_rect(self) -> pygame.Rect:
         """Viewport (screen) rectangle where the map is drawn — fixed to window."""
@@ -484,6 +559,8 @@ class RealtimeVisualizer:
                     self.paused = not self.paused
                 elif event.key == pygame.K_l:
                     self.show_labels = not self.show_labels
+                elif event.key == pygame.K_r:
+                    self.show_region_overlay = not self.show_region_overlay
                 elif event.key == pygame.K_PERIOD:
                     self.step_every_frames = max(1, self.step_every_frames - 60)
                 elif event.key == pygame.K_COMMA:
@@ -501,6 +578,9 @@ class RealtimeVisualizer:
                     self._reset_camera_centered()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
+                if self._region_overlay_button_rect().collidepoint(mx, my):
+                    self.show_region_overlay = not self.show_region_overlay
+                    continue
                 hit_slider = False
                 for slider in self.sliders:
                     if slider.rect.collidepoint(event.pos):
@@ -749,6 +829,13 @@ class RealtimeVisualizer:
                 text = small_font.render(label, True, (16, 18, 22))
                 lx, ly = self._w2s(agent.x, agent.y)
                 screen.blit(text, (lx + 8, ly - 26))
+
+        if self.show_region_overlay:
+            wr = self._world_rect()
+            clip_leg = screen.get_clip()
+            screen.set_clip(wr)
+            self._draw_region_overlay_legend(screen, small_font)
+            screen.set_clip(clip_leg)
 
         self._draw_hud(screen, font, alive_people)
         self._draw_control_panel(screen, font, small_font)
@@ -1092,9 +1179,23 @@ class RealtimeVisualizer:
             pygame.draw.rect(screen, hcol, handle, border_radius=5)
             pygame.draw.rect(screen, (100, 108, 124), handle, 1, border_radius=5)
 
+        btn = self._region_overlay_button_rect()
+        on = self.show_region_overlay
+        pygame.draw.rect(screen, (14, 16, 22), btn, border_radius=8)
+        pygame.draw.rect(
+            screen,
+            self._lerp_rgb(self.ui_accent, (120, 200, 120), 0.55) if on else (48, 52, 62),
+            btn,
+            2,
+            border_radius=8,
+        )
+        lbl = "Region colors: ON" if on else "Region colors: OFF"
+        bt = small_font.render(lbl, True, (232, 234, 240))
+        screen.blit(bt, (btn.left + 12, btn.top + (btn.height - bt.get_height()) // 2))
+
         tips = [
             "Zoom: Ctrl+wheel or +/- keys · 0 resets view",
-            "Pan: WASD · wheel · middle-drag · hover / click people",
+            "Pan: WASD · wheel · middle-drag · R: region map",
         ]
         y = self.height - 52
         for tip in tips:
@@ -1176,10 +1277,13 @@ class RealtimeVisualizer:
         loc = f"{settlement}"
         if city:
             loc = f"{city} ({settlement})"
+        home_band = getattr(person, "living_context", "rural")
         lines = [
             f"Person #{person.person_id}",
             f"Age {person.age} · {person.gender.value}",
             f"Place: {loc}",
+            f"Living: {home_band}",
+            f"Diet (long-run): {getattr(person, 'nutrition_ema', 1.0):.2f}",
         ]
         bg = person.belief_group
         if bg.startswith("cult_"):
@@ -1190,6 +1294,8 @@ class RealtimeVisualizer:
             lines.append(f"Belief: {bg}")
         if getattr(person, "is_prophet", False):
             lines.append("Role: prophet (founded a movement)")
+        if getattr(person, "is_married", False) and getattr(person, "love_partner_id", None):
+            lines.append("Married to partner #{}".format(person.love_partner_id))
         lp = getattr(person, "love_partner_id", None)
         if lp is not None:
             lines.append(f"Love bond: partner #{lp}")
@@ -1457,17 +1563,24 @@ class RealtimeVisualizer:
         z = max(0.001, self.zoom)
         for region_id in range(self.engine.config.demographics.region_count):
             rect = self._region_rect(region_id)
-            base = self.region_colors[region_id % len(self.region_colors)]
+            if self.show_region_overlay:
+                base = self._region_distinct_color(region_id)
+                alpha = 108
+            else:
+                base = self.region_colors[region_id % len(self.region_colors)]
+                alpha = 18
             tint = pygame.Surface((max(1, rect.width), max(1, rect.height)), pygame.SRCALPHA)
             tr, tg, tb = base
-            tint.fill((tr, tg, tb, 18))
+            tint.fill((tr, tg, tb, alpha))
             zw = max(1, int(rect.width * z))
             zh = max(1, int(rect.height * z))
             tint_draw = pygame.transform.smoothscale(tint, (zw, zh)) if (zw, zh) != tint.get_size() else tint
             sl, st = self._w2s(rect.left, rect.top)
             screen.blit(tint_draw, (sl, st))
-            edge = self._lerp_rgb(base, (52, 58, 54), 0.42)
-            pygame.draw.rect(screen, edge, pygame.Rect(sl, st, zw, zh), max(1, self._zi(1)))
+            edge_mix = (28, 32, 38) if self.show_region_overlay else (52, 58, 54)
+            edge_w = max(2, self._zi(2)) if self.show_region_overlay else max(1, self._zi(1))
+            edge = self._lerp_rgb(base, edge_mix, 0.38 if self.show_region_overlay else 0.42)
+            pygame.draw.rect(screen, edge, pygame.Rect(sl, st, zw, zh), edge_w)
 
     def _draw_ocean_and_seas(self, screen: pygame.Surface, world_rect: pygame.Rect) -> None:
         oh = self._ocean_band_height(world_rect)

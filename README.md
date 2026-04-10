@@ -46,6 +46,7 @@ Most of the world still runs on **equations, thresholds, and config**:
 | Year loop, macro cache for goals/migration, policies, city comms | `simulation.py` |
 | Border tension, trade goodwill, `world_iq` diplomacy tuning | `world_dynamics.py` |
 | Eras, invention/tool resource rules (pure helpers) | `tech_society.py` |
+| Sanitation transmission helper | `world_realism.py` |
 | Person fields, inheritance | `models.py` |
 | Config (cognition, economy, technology, …) | `config.py` |
 
@@ -145,6 +146,7 @@ Core parameters can self-adjust from state signals (population, health, infectio
 - **Border diplomacy** — `WorldDynamics.step_border` factors in **regional resource scores**, **military/economic power asymmetry** (population × health × tools × food × wealth), and **material + food pressure**, so trade goodwill and war tension respond to scarcity and predation-like gaps, not only food per capita.
 - **Country and empire** — Settlements that reach **city** can mature into a **country** (renamed *Republic* or *Kingdom* by local civ; democracy vs oligarchy bias) and then an **Empire** (monarchy/autocracy bias, leader title **Emperor**). Tuned via `PoliticsConfig` (`polity_progression`, population and civ thresholds, `country_requires_state_milestone`, `empire_ambition_threshold`).
 - **Faith, love, violence, jail** — Under `SocialLifeConfig`: a **prophet** can emerge (high spirituality, temples or spiritual age), founding a `way_of_<id>` movement; **conversions** and **shrine** structures appear as followings grow. **Love bonds** form between trusted same-region contacts; **assaults** harm victims and may **jail** aggressors when enforcement catches them; repeat **theft** with strong enforcement can also **jail**. Incarceration blocks migration and social learning and cuts yearly wealth gain until the sentence ticks down at year end.
+- **World realism layer** — `WorldRealismConfig`: **marriage** after stable love + trust (with **breakups** from distance, stress, feuds); **married** couples get a small **fertility** boost. **Maternal mortality** can follow birth (higher in early eras, lower after **country** milestone). **Schools** add extra **knowledge** gain for younger people. **Weak enforcement** lets **treasury corruption** skim regional treasuries. **Civic unrest** when a region is hungry and stressed raises **global instability** and local mood shocks. **Sanitation** (after **writing** + more urban settlement mix) slightly **lowers contagious transmission** alongside seasons. **Elder support**: cohabiting partners in the same region slow **health decline** for older adults.
 
 ### Tests and Benchmark
 
@@ -261,4 +263,4 @@ Dependencies:
 
 ## Disclaimer
 
-Developed end-to-end, including architecture, implementation, edge cases, and UX iteration. AI tools were used to accelerate development.
+This project was built with AI assistance and manual engineering decisions: architecture, balancing, edge cases, and UX iteration.

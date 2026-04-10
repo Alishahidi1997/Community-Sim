@@ -50,6 +50,7 @@ from population_sim.models import (
     random_social_profile,
     random_traits,
 )
+from population_sim.world_realism import sanitation_transmission_multiplier
 from population_sim.social_life import (
     followers_by_region,
     has_worship_shrine,
@@ -72,6 +73,9 @@ from population_sim.world_dynamics import WorldDynamics
 
 
 class SimulationEngine:
+    # Within-region place type: rural hinterland vs village / town / urban core (mixed populations).
+    _LIVING_BANDS = ("rural", "village", "town", "city")
+
     def __init__(self, config: SimulationConfig) -> None:
         self.config = config
         self.rng = random.Random(config.random_seed)
@@ -130,6 +134,9 @@ class SimulationEngine:
         self._season_wildlife_mult: float = 1.0
         rc = config.demographics.region_count
         self.region_treasury: dict[int, float] = {i: 0.0 for i in range(rc)}
+        self.region_harvest_factor: dict[int, float] = {i: 1.0 for i in range(rc)}
+        self.region_disaster_years_left: dict[int, int] = {}
+        self.region_disaster_food_mult: dict[int, float] = {}
         self.region_policies: dict[int, dict[str, float]] = {
             i: default_region_policy(0) for i in range(rc)
         }
@@ -288,6 +295,7 @@ class SimulationEngine:
         self.disease_model.seed_initial_infections(self.population)
         self.contact_graph = self._build_contact_graph([p for p in self.population if p.alive])
         self._initialize_world_structures()
+        self._bootstrap_living_contexts([p for p in self.population if p.alive])
 
     def run(self) -> StatsTracker:
         for year in range(self.config.years):
@@ -316,6 +324,8 @@ class SimulationEngine:
             return 0, 0, 0.0
 
         self._sync_season(year)
+        self._tick_regional_harvest_weather()
+        stories.extend(self._roll_new_regional_disasters(year))
         pop_n = len(alive)
         avg_stress_w = sum(p.stress for p in alive) / pop_n
         avg_k_w = sum(p.knowledge for p in alive) / pop_n
@@ -342,12 +352,15 @@ class SimulationEngine:
         food_ratio_by_region = self._food_ratio_by_region(alive)
         self._step_regional_food_trends(food_ratio_by_region)
         self._replan_agent_goals(alive, civ_w, food_ratio_by_region, year)
+        stories.extend(self._step_civic_unrest(alive, year, food_ratio_by_region))
 
         self._apply_migration(alive)
         self._update_personal_food_memory(alive)
         self._apply_vaccination_policy(alive, year)
         self.contact_graph = self._rewire_contact_graph(alive, self.contact_graph)
         self._prune_social_edges(alive)
+        food_rr_aid = self._food_ratio_by_region(alive)
+        self._step_mutual_aid_scarcity(alive, food_rr_aid)
         self._simulate_social_dynamics(alive)
         self._rebuild_social_degree_cache()
         stories.extend(self._step_economy(alive, year, civ_w))
@@ -358,13 +371,17 @@ class SimulationEngine:
         alliance_stories, alliance_deaths = self._simulate_alliances_and_war(alive, year)
         stories.extend(alliance_stories)
         deaths += alliance_deaths
+        san_scale = self._sanitation_transmission_scale(alive)
+        crowd_scale = self._urban_crowding_disease_mult(alive)
         self.disease_model.apply_transmission_from_contacts(
             alive,
             self.contact_graph,
             self.config.migration.cross_region_contact_rate,
-            transmission_scale=self._season_disease_mult,
+            transmission_scale=self._season_disease_mult * san_scale * crowd_scale,
         )
 
+        id_health = {p.person_id: p for p in alive}
+        wrx = self.config.world_realism
         for person in alive:
             person.age_one_year()
 
@@ -373,6 +390,28 @@ class SimulationEngine:
             productivity = self._individual_productivity(person)
             tech_bonus = 1.0 + (person.tool_skill * 0.25) + productivity * 0.2
             person.health = max(0.0, min(1.0, person.health + nutrition_delta * (0.8 + resilience) * tech_bonus))
+            if (
+                wrx.enabled
+                and person.age >= wrx.elder_support_age_min
+                and person.love_partner_id is not None
+            ):
+                partner = id_health.get(person.love_partner_id)
+                if (
+                    partner is not None
+                    and partner.alive
+                    and partner.region_id == person.region_id
+                ):
+                    person.health = min(1.0, person.health + wrx.elder_partner_health_bonus)
+            if (
+                wrx.enabled
+                and wrx.work_fatigue_enabled
+                and 16 <= person.age < 64
+                and person.ambition > 0.52
+            ):
+                person.stress = min(
+                    1.0,
+                    person.stress + wrx.work_fatigue_stress * (person.ambition - 0.5) * 1.85,
+                )
             self._apply_biological_mutation(person, year)
 
             disease_deaths = self.disease_model.apply_progression_and_mutation(person)
@@ -398,9 +437,14 @@ class SimulationEngine:
                 person.alive = False
                 deaths += 1
 
+        self._apply_contact_bereavement(alive)
+
         alive_for_births = [p for p in alive if p.alive]
-        newborns = self._generate_births(alive_for_births, era["birth_multiplier"] * (1.0 - self.temp_birth_penalty))
+        newborns, maternal_deaths = self._generate_births(
+            alive_for_births, era["birth_multiplier"] * (1.0 - self.temp_birth_penalty)
+        )
         births = len(newborns)
+        deaths += maternal_deaths
         self.population.extend(newborns)
 
         alive_now = [p for p in self.population if p.alive]
@@ -408,6 +452,10 @@ class SimulationEngine:
         self._update_civilization_metrics(alive_now)
         transition_stories = self._update_world_structures(year, alive_now)
         stories.extend(transition_stories)
+        food_for_living = self._food_ratio_by_region(alive_now)
+        for p in alive_now:
+            self._clamp_living_context(p)
+        self._evolve_living_contexts(alive_now, food_for_living)
         self._update_ecology(alive_now)
         adjustments = self._auto_adjust_parameters(alive_now, available_food)
         event_deaths, event_stories = self._process_world_events(year, alive_now)
@@ -423,6 +471,7 @@ class SimulationEngine:
             "adjustments": adjustments,
         }
         self._train_learned_goal_policy(year)
+        self._decay_regional_disaster_years()
         return births, deaths, available_food
 
     def _pick_father_for_birth(self, mother: Individual, males: list[Individual]) -> Individual:
@@ -449,7 +498,9 @@ class SimulationEngine:
         w = [score(m) for m in top]
         return self.rng.choices(top, weights=w, k=1)[0]
 
-    def _generate_births(self, alive: list[Individual], era_birth_multiplier: float = 1.0) -> list[Individual]:
+    def _generate_births(
+        self, alive: list[Individual], era_birth_multiplier: float = 1.0
+    ) -> tuple[list[Individual], int]:
         cfg = self.config.demographics
         pathogen_names = [p.name for p in self.config.pathogens]
         alive_count = len(alive)
@@ -457,6 +508,8 @@ class SimulationEngine:
         food_ratio_by_region = self._food_ratio_by_region(alive)
         infection_ratio_by_region = self._infection_ratio_by_region(alive)
         bcfg = self.config.behavior
+        wrm = self.config.world_realism
+        maternal_deaths = 0
         females = [
             p
             for p in alive
@@ -473,7 +526,7 @@ class SimulationEngine:
         ]
 
         if not females or not males:
-            return []
+            return [], 0
 
         macro_birth = self._compute_macro_goal_cache(alive, food_ratio_by_region)
         civ_birth = (
@@ -508,6 +561,8 @@ class SimulationEngine:
             fertility_score *= 1.0 + ((mother.knowledge + father.knowledge) * 0.08)
             fertility_score *= max(0.4, 0.8 + (self._individual_productivity(mother) + self._individual_productivity(father)) * 0.15)
             fertility_score *= crowding_penalty
+            if wrm.enabled and mother.is_married and mother.love_partner_id == father.person_id:
+                fertility_score *= 1.0 + wrm.married_birth_fertility_bonus
             fertility_score = max(0.0, min(1.0, fertility_score))
             if self.rng.random() >= fertility_score:
                 continue
@@ -544,11 +599,22 @@ class SimulationEngine:
                 civ_w=civ_birth,
                 macro=macro_birth,
             )
+            child_living = (
+                mother.living_context
+                if self.rng.random() < 0.68
+                else self._sample_living_context(mother.region_id)
+            )
+            child_nutrition = max(
+                0.22,
+                min(1.12, self.rng.gauss(mother.nutrition_ema, 0.055)),
+            )
             child = Individual(
                 person_id=self.next_person_id,
                 age=0,
                 gender=Gender.FEMALE if self.rng.random() < 0.5 else Gender.MALE,
                 region_id=mother.region_id,
+                living_context=child_living,
+                nutrition_ema=child_nutrition,
                 alive=True,
                 health=ch,
                 disease_susceptibility=max(0.2, min(1.8, self.rng.gauss(1.0, 0.2))),
@@ -595,13 +661,24 @@ class SimulationEngine:
                 observed_food_ema=1.0,
                 observed_food_trend=0.0,
             )
+            self._clamp_living_context(child)
             self.next_person_id += 1
 
             if self.rng.random() < cfg.child_mortality:
                 child.alive = False
             else:
                 newborns.append(child)
-        return newborns
+                if wrm.enabled and wrm.maternal_mortality_enabled:
+                    mm = wrm.maternal_mortality_base * (wrm.maternal_mortality_health_scale - mother.health * 0.52)
+                    if self.current_era == "hunter-gatherer":
+                        mm *= 1.32
+                    if "country" in self.unlocked_milestones:
+                        mm *= 0.74
+                    mm = max(0.0, min(0.11, mm))
+                    if self.rng.random() < mm:
+                        mother.alive = False
+                        maternal_deaths += 1
+        return newborns, maternal_deaths
 
     def _sync_season(self, year: int) -> None:
         sc = self.config.seasons
@@ -699,6 +776,8 @@ class SimulationEngine:
             regional_food *= max(0.75, 1.0 + self.region_food_adjustments.get(region_id, 0.0))
             regional_food *= self._ecology_food_factor(region_id)
             regional_food *= self._season_food_mult
+            regional_food *= self._region_harvest_mult(region_id)
+            regional_food *= self._region_disaster_food_mult(region_id)
             total += regional_food
         return total
 
@@ -716,6 +795,8 @@ class SimulationEngine:
             available *= max(0.75, 1.0 + self.region_food_adjustments.get(region_id, 0.0))
             available *= self._ecology_food_factor(region_id)
             available *= self._season_food_mult
+            available *= self._region_harvest_mult(region_id)
+            available *= self._region_disaster_food_mult(region_id)
             modifier = max(0.2, 1.0 + self.food_system_bonus - self.temp_food_penalty)
             ratios[region_id] = (available * modifier) / count if count else 0.0
         return ratios
@@ -1248,11 +1329,16 @@ class SimulationEngine:
         food_rr = self._food_ratio_by_region(alive)
         slc = self.config.social_life
         jw = slc.jail_wealth_multiplier if slc.enabled else 1.0
+        wrx = self.config.world_realism
+        rent_drag = wrx.dense_housing_rent_drag if wrx.enabled else 0.0
         for p in alive:
             fr = food_rr.get(p.region_id, 1.0)
             prod = self._individual_productivity(p)
             wm = jw if slc.enabled and p.jail_years_remaining > 0 else 1.0
             p.wealth += 0.017 * prod * (0.55 + 0.45 * fr) * wm
+            if rent_drag > 0 and p.living_context in ("town", "city") and fr < 0.92:
+                scarcity = max(0.0, (0.92 - fr) / 0.92)
+                p.wealth *= max(0.92, 1.0 - rent_drag * scarcity * (1.15 + p.stress * 0.35))
             p.wealth = min(40.0, max(0.0, p.wealth))
         id_map = {p.person_id: p for p in alive}
         for person in alive:
@@ -1323,6 +1409,17 @@ class SimulationEngine:
             ecfg.inter_region_trade_volume,
             civ_w,
         )
+        if wrx.enabled and wrx.treasury_corruption_enabled:
+            for rid in range(rc):
+                enf = float(self.region_policies.get(rid, {}).get("theft_enforcement", 0.5))
+                if enf >= wrx.treasury_corruption_enforcement_lt:
+                    continue
+                bal = self.region_treasury.get(rid, 0.0)
+                if bal <= 0.08:
+                    continue
+                gap = max(0.0, wrx.treasury_corruption_enforcement_lt - enf + 0.1)
+                skim = bal * self.rng.uniform(0.0028, wrx.treasury_corruption_max_fraction) * gap
+                self.region_treasury[rid] = max(0.0, bal - skim)
         out.extend(self._city_public_communication(alive, year, id_map))
         return out
 
@@ -1409,6 +1506,151 @@ class SimulationEngine:
             delta = fr - p.observed_food_ema
             p.observed_food_ema = 0.82 * p.observed_food_ema + 0.18 * fr
             p.observed_food_trend = 0.76 * p.observed_food_trend + 0.24 * delta
+        self._step_nutrition_tracking(alive, food_ratio_by_region)
+
+    def _region_harvest_mult(self, region_id: int) -> float:
+        wr = self.config.world_realism
+        if not wr.enabled or not wr.harvest_weather_enabled:
+            return 1.0
+        return float(self.region_harvest_factor.get(region_id, 1.0))
+
+    def _region_disaster_food_mult(self, region_id: int) -> float:
+        wr = self.config.world_realism
+        if not wr.enabled or not wr.regional_disaster_enabled:
+            return 1.0
+        if self.region_disaster_years_left.get(region_id, 0) <= 0:
+            return 1.0
+        return float(self.region_disaster_food_mult.get(region_id, 1.0))
+
+    def _roll_new_regional_disasters(self, year: int) -> list[str]:
+        wr = self.config.world_realism
+        out: list[str] = []
+        if not wr.enabled or not wr.regional_disaster_enabled:
+            return out
+        n_reg = self.config.demographics.region_count
+        lo = max(0.35, min(0.95, wr.regional_disaster_food_mult_low))
+        hi = max(lo + 0.02, min(0.98, wr.regional_disaster_food_mult_high))
+        dmin = max(1, wr.regional_disaster_min_years)
+        dmax = max(dmin, wr.regional_disaster_max_years)
+        for rid in range(n_reg):
+            if self.region_disaster_years_left.get(rid, 0) > 0:
+                continue
+            if self.rng.random() > wr.regional_disaster_probability:
+                continue
+            dur = self.rng.randint(dmin, dmax)
+            mult = self.rng.uniform(lo, hi)
+            self.region_disaster_years_left[rid] = dur
+            self.region_disaster_food_mult[rid] = mult
+            kind = self.rng.choice(
+                ("drought", "flood", "crop blight", "hailstorm", "livestock loss", "river flood")
+            )
+            out.append(
+                self._register_timeline_transition(
+                    year,
+                    f"{self._region_name(rid)}: {kind}",
+                    f"Food production reduced for about {dur} year(s).",
+                )
+            )
+        return out
+
+    def _decay_regional_disaster_years(self) -> None:
+        wr = self.config.world_realism
+        if not wr.enabled or not wr.regional_disaster_enabled:
+            return
+        for rid in list(self.region_disaster_years_left.keys()):
+            yl = int(self.region_disaster_years_left[rid]) - 1
+            if yl <= 0:
+                self.region_disaster_years_left.pop(rid, None)
+                self.region_disaster_food_mult.pop(rid, None)
+            else:
+                self.region_disaster_years_left[rid] = yl
+
+    def _apply_contact_bereavement(self, cohort: list[Individual]) -> None:
+        wr = self.config.world_realism
+        if not wr.enabled or not wr.bereavement_enabled:
+            return
+        if wr.bereavement_stress <= 0:
+            return
+        alive_map = {p.person_id: p for p in cohort if p.alive}
+        cap = max(1, min(24, wr.bereavement_max_contacts))
+        for dead in cohort:
+            if dead.alive:
+                continue
+            for nid in self.contact_graph.get(dead.person_id, [])[:cap]:
+                n = alive_map.get(nid)
+                if n is None:
+                    continue
+                n.stress = min(1.0, n.stress + wr.bereavement_stress)
+                n.happiness = max(0.0, n.happiness - wr.bereavement_happiness_hit)
+
+    def _step_mutual_aid_scarcity(
+        self, alive: list[Individual], food_ratio_by_region: dict[int, float]
+    ) -> None:
+        wr = self.config.world_realism
+        if not wr.enabled or not wr.mutual_aid_enabled or not alive:
+            return
+        thr = max(0.5, min(0.95, wr.mutual_aid_food_below))
+        p_try = max(0.0, min(0.55, wr.mutual_aid_attempt_probability))
+        idm = {p.person_id: p for p in alive}
+        for p in alive:
+            if p.jail_years_remaining > 0:
+                continue
+            fr = food_ratio_by_region.get(p.region_id, 1.0)
+            if fr >= thr:
+                continue
+            if self.rng.random() > p_try:
+                continue
+            for oid in self.contact_graph.get(p.person_id, []):
+                o = idm.get(oid)
+                if o is None or o.region_id != p.region_id or o.jail_years_remaining > 0:
+                    continue
+                pr = normalize_pair(p.person_id, o.person_id)
+                tr = self._pair_trust.get(pr, 0.5)
+                if tr < wr.mutual_aid_min_trust:
+                    continue
+                p.happiness = min(1.0, p.happiness + wr.mutual_aid_happiness)
+                o.happiness = min(1.0, o.happiness + wr.mutual_aid_happiness * 0.85)
+                self._pair_trust[pr] = min(1.0, tr + wr.mutual_aid_trust)
+                break
+
+    def _tick_regional_harvest_weather(self) -> None:
+        wr = self.config.world_realism
+        if not wr.enabled or not wr.harvest_weather_enabled:
+            return
+        for rid in range(self.config.demographics.region_count):
+            shock = 1.0 + self.rng.gauss(0.0, wr.harvest_volatility)
+            shock = max(wr.harvest_min_factor, min(wr.harvest_max_factor, shock))
+            prev = float(self.region_harvest_factor.get(rid, 1.0))
+            blended = wr.harvest_persistence * prev + (1.0 - wr.harvest_persistence) * shock
+            self.region_harvest_factor[rid] = max(
+                wr.harvest_min_factor, min(wr.harvest_max_factor, blended)
+            )
+
+    def _urban_crowding_disease_mult(self, alive: list[Individual]) -> float:
+        wr = self.config.world_realism
+        if not wr.enabled or wr.urban_crowding_disease_boost <= 0 or not alive:
+            return 1.0
+        dense = sum(1 for p in alive if p.living_context in ("town", "city"))
+        frac = dense / len(alive)
+        return 1.0 + wr.urban_crowding_disease_boost * frac
+
+    def _step_nutrition_tracking(
+        self, alive: list[Individual], food_ratio_by_region: dict[int, float]
+    ) -> None:
+        wr = self.config.world_realism
+        if not wr.enabled or not wr.nutrition_tracking_enabled:
+            return
+        a = max(0.04, min(0.45, wr.nutrition_ema_alpha))
+        thr = max(0.35, min(0.75, wr.nutrition_stress_threshold))
+        for p in alive:
+            fr = food_ratio_by_region.get(p.region_id, 1.0)
+            p.nutrition_ema = (1.0 - a) * p.nutrition_ema + a * fr
+            p.nutrition_ema = max(0.12, min(1.35, p.nutrition_ema))
+            if p.nutrition_ema < thr:
+                p.stress = min(1.0, p.stress + wr.nutrition_chronic_stress_per_year)
+                p.health = max(0.0, p.health - wr.nutrition_chronic_health_penalty * (thr - p.nutrition_ema) / thr)
+            elif p.nutrition_ema > 1.02:
+                p.health = min(1.0, p.health + wr.nutrition_recovery_health_bonus * (p.nutrition_ema - 1.0))
 
     def _apply_migration(self, alive: list[Individual]) -> None:
         mcfg = self.config.migration
@@ -1489,11 +1731,15 @@ class SimulationEngine:
             migrate_prob = min(1.0, migrate_prob * sm)
 
             if self.rng.random() < migrate_prob:
+                prev_r = person.region_id
                 if bcfg.enabled and target_region != person.region_id:
                     person.region_id = target_region
                 else:
                     options = [r for r in range(self.config.demographics.region_count) if r != person.region_id]
                     person.region_id = self.rng.choice(options)
+                if person.region_id != prev_r:
+                    person.living_context = self._sample_living_context(person.region_id)
+                    self._clamp_living_context(person)
 
     def _apply_vaccination_policy(self, alive: list[Individual], year: int) -> None:
         vcfg = self.config.vaccination
@@ -1640,6 +1886,17 @@ class SimulationEngine:
             rate_t = learn_scale * 0.01 * (1.0 + 0.45 * iq) * min(1.2, head_t * 1.75)
             person.knowledge = min(1.0, person.knowledge + rate_k * teacher.knowledge + self.knowledge_boost)
             person.tool_skill = min(1.0, person.tool_skill + rate_t * teacher.tool_skill)
+            wrlearn = self.config.world_realism
+            if (
+                wrlearn.enabled
+                and self._has_structure_in_region("school", person.region_id)
+                and person.age <= wrlearn.school_max_age
+            ):
+                person.knowledge = min(
+                    1.0,
+                    person.knowledge
+                    + wrlearn.school_learning_bonus * (0.52 + 0.48 * person.cognitive_iq),
+                )
 
             # Belief: spiritual learners adopt mentors; skeptics drift toward well-informed teachers; rare schisms.
             if teacher.belief_group != person.belief_group:
@@ -1689,35 +1946,157 @@ class SimulationEngine:
             if p.jail_years_remaining > 0:
                 p.jail_years_remaining -= 1
 
+    def _sanitation_transmission_scale(self, alive: list[Individual]) -> float:
+        wr = self.config.world_realism
+        if not wr.enabled:
+            return 1.0
+        if not alive:
+            return 1.0
+        by_r: dict[int, int] = defaultdict(int)
+        for p in alive:
+            by_r[p.region_id] += 1
+        tw = sum(self._settlement_tier(rid) * by_r[rid] for rid in by_r)
+        mt = tw / len(alive)
+        return sanitation_transmission_multiplier(
+            mt,
+            has_writing_milestone=("writing" in self.unlocked_milestones),
+            min_mean_tier=wr.sanitation_min_mean_settlement_tier,
+            max_reduction=wr.sanitation_transmission_reduction,
+        )
+
+    def _step_civic_unrest(
+        self,
+        alive: list[Individual],
+        year: int,
+        food_ratio_by_region: dict[int, float],
+    ) -> list[str]:
+        wr = self.config.world_realism
+        if not wr.enabled or len(alive) < 35:
+            return []
+        by_r: dict[int, list[Individual]] = defaultdict(list)
+        for p in alive:
+            by_r[p.region_id].append(p)
+        stories: list[str] = []
+        hit = 0
+        for rid, people in by_r.items():
+            fr = food_ratio_by_region.get(rid, 1.0)
+            ms = sum(p.stress for p in people) / len(people)
+            if fr >= wr.unrest_food_ratio_below or ms <= wr.unrest_region_mean_stress_above:
+                continue
+            if self.rng.random() > wr.unrest_event_probability:
+                continue
+            hit += 1
+            self.world_dynamics.global_instability = min(
+                1.0,
+                self.world_dynamics.global_instability + wr.unrest_instability_bump,
+            )
+            for p in people:
+                if self.rng.random() < 0.17:
+                    p.stress = min(1.0, p.stress + 0.042)
+                    p.happiness = max(0.0, p.happiness - 0.028)
+        if hit:
+            stories.append(
+                self._register_timeline_transition(
+                    year,
+                    "Civic unrest",
+                    f"Hunger and strain sparked protests or riots in {hit} region(s).",
+                )
+            )
+        return stories
+
     def _step_social_life(self, alive: list[Individual], year: int) -> list[str]:
         sl = self.config.social_life
-        if not sl.enabled or len(alive) < 12:
+        wrm = self.config.world_realism
+        if len(alive) < 12:
             return []
         stories: list[str] = []
         id_map = {p.person_id: p for p in alive}
 
-        for p in alive:
-            if p.jail_years_remaining > 0:
-                p.stress = min(1.0, p.stress + 0.022)
-                p.happiness = max(0.0, p.happiness - 0.035)
-                p.reputation = max(0.0, p.reputation - 0.006)
+        if sl.enabled:
+            for p in alive:
+                if p.jail_years_remaining > 0:
+                    p.stress = min(1.0, p.stress + 0.022)
+                    p.happiness = max(0.0, p.happiness - 0.035)
+                    p.reputation = max(0.0, p.reputation - 0.006)
+
+        jp = wrm.partner_jail_stress if wrm.enabled else 0.0
+        if jp > 0:
+            for p in alive:
+                if p.jail_years_remaining > 0:
+                    continue
+                lid = p.love_partner_id
+                if lid is None:
+                    continue
+                o = id_map.get(lid)
+                if o is not None and o.alive and o.jail_years_remaining > 0:
+                    p.stress = min(1.0, p.stress + jp)
+                    p.happiness = max(0.0, p.happiness - jp * 0.72)
 
         for p in alive:
             lid = p.love_partner_id
             if lid is None:
+                p.is_married = False
                 continue
             o = id_map.get(lid)
             if o is None or not o.alive:
                 p.love_partner_id = None
+                p.is_married = False
                 continue
             if o.love_partner_id != p.person_id:
                 p.love_partner_id = None
+                p.is_married = False
         for p in alive:
             if p.love_partner_id is None:
+                p.is_married = False
                 continue
             o = id_map.get(p.love_partner_id)
             if o is None or o.love_partner_id != p.person_id:
                 p.love_partner_id = None
+                p.is_married = False
+
+        if wrm.enabled:
+            splits = 0
+            for p in alive:
+                lid = p.love_partner_id
+                if lid is None:
+                    continue
+                o = id_map.get(lid)
+                if o is None or not o.alive:
+                    continue
+                pair = normalize_pair(p.person_id, o.person_id)
+                if pair in self.enmities:
+                    p.love_partner_id = None
+                    o.love_partner_id = None
+                    p.is_married = False
+                    o.is_married = False
+                    splits += 1
+                    continue
+                if p.region_id != o.region_id and self.rng.random() < wrm.breakup_long_distance_probability:
+                    p.love_partner_id = None
+                    o.love_partner_id = None
+                    p.is_married = False
+                    o.is_married = False
+                    splits += 1
+                    continue
+                if max(p.stress, o.stress) >= wrm.breakup_high_stress_threshold and self.rng.random() < 0.24:
+                    p.love_partner_id = None
+                    o.love_partner_id = None
+                    p.is_married = False
+                    o.is_married = False
+                    splits += 1
+                    continue
+                tr = self._pair_trust.get(pair, 0.5)
+                if tr < wrm.breakup_low_trust and self.rng.random() < wrm.breakup_low_trust_probability:
+                    p.love_partner_id = None
+                    o.love_partner_id = None
+                    p.is_married = False
+                    o.is_married = False
+                    splits += 1
+            if splits and self.rng.random() < 0.26:
+                stories.append(f"Y{year + 1}: {splits} couples separated (stress, distance, or feud).")
+
+        if not sl.enabled:
+            return stories
 
         attempts = min(sl.love_pair_attempts_per_year, max(30, len(alive) * 4))
         singles = [
@@ -1762,6 +2141,34 @@ class SimulationEngine:
         if formed_love and self.rng.random() < 0.28:
             stories.append(f"Y{year + 1}: {formed_love} new love bonds among neighbors")
 
+        if wrm.enabled:
+            seen_m: set[tuple[int, int]] = set()
+            wed = 0
+            for p in alive:
+                lid = p.love_partner_id
+                if lid is None or p.is_married:
+                    continue
+                o = id_map.get(lid)
+                if o is None or o.is_married:
+                    continue
+                a, b = sorted((p.person_id, o.person_id))
+                if (a, b) in seen_m:
+                    continue
+                seen_m.add((a, b))
+                if p.age < wrm.marriage_min_age or o.age < wrm.marriage_min_age:
+                    continue
+                pair_m = normalize_pair(a, b)
+                if self._pair_trust.get(pair_m, 0.5) < wrm.marriage_min_trust:
+                    continue
+                if self.rng.random() < wrm.marriage_probability_if_eligible:
+                    p.is_married = True
+                    o.is_married = True
+                    p.happiness = min(1.0, p.happiness + 0.018)
+                    o.happiness = min(1.0, o.happiness + 0.018)
+                    wed += 1
+            if wed and self.rng.random() < 0.3:
+                stories.append(f"Y{year + 1}: {wed} marriage(s) formalized among partners.")
+
         n_as = min(sl.assault_samples_per_year, max(24, len(alive) // 2))
         assaults = 0
         jailed_assault = 0
@@ -1802,6 +2209,20 @@ class SimulationEngine:
             stories.append(
                 f"Y{year + 1}: {assaults} violent assaults; {jailed_assault} aggressors jailed."
             )
+
+        for p in alive:
+            lid = p.love_partner_id
+            if lid is None:
+                continue
+            o = id_map.get(lid)
+            if o is None:
+                continue
+            pair_e = normalize_pair(p.person_id, o.person_id)
+            if pair_e in self.enmities:
+                p.love_partner_id = None
+                o.love_partner_id = None
+                p.is_married = False
+                o.is_married = False
 
         n_prophets = sum(1 for p in alive if p.is_prophet)
         world_temple = any(s.get("kind") == "temple" for s in self.world_structures)
@@ -2473,6 +2894,71 @@ class SimulationEngine:
             return f"Region-{region_id}"
         return str(settlement.get("name", f"Region-{region_id}"))
 
+    def _settlement_level_max_band_index(self, level: str) -> int:
+        return {"camp": 0, "village": 1, "town": 2, "city": 3}.get(level, 0)
+
+    def _sample_living_context(self, region_id: int) -> str:
+        st = self._get_settlement_structure(region_id)
+        level = str(st.get("level", "camp")) if st else "camp"
+        max_i = self._settlement_level_max_band_index(level)
+        bands = self._LIVING_BANDS[: max_i + 1]
+        if len(bands) == 1:
+            return bands[0]
+        polity = str(st.get("polity", "city")) if st and level == "city" else "city"
+        if max_i == 1:
+            weights = [0.52, 0.48]
+        elif max_i == 2:
+            weights = [0.34, 0.36, 0.30]
+        else:
+            w_city = 0.38
+            if polity == "country":
+                w_city = 0.32
+            elif polity == "empire":
+                w_city = 0.44
+            rem = 1.0 - w_city
+            weights = [rem * 0.42, rem * 0.33, rem * 0.25, w_city]
+        return self.rng.choices(bands, weights=weights, k=1)[0]
+
+    def _clamp_living_context(self, person: Individual) -> None:
+        st = self._get_settlement_structure(person.region_id)
+        level = str(st.get("level", "camp")) if st else "camp"
+        max_i = self._settlement_level_max_band_index(level)
+        try:
+            ci = self._LIVING_BANDS.index(person.living_context)
+        except ValueError:
+            ci = 0
+        if ci > max_i:
+            person.living_context = self._LIVING_BANDS[max_i]
+
+    def _bootstrap_living_contexts(self, alive: list[Individual]) -> None:
+        for p in alive:
+            p.living_context = self._sample_living_context(p.region_id)
+            self._clamp_living_context(p)
+
+    def _evolve_living_contexts(self, alive: list[Individual], food_ratio_by_region: dict[int, float]) -> None:
+        for p in alive:
+            if p.jail_years_remaining > 0:
+                continue
+            if self.rng.random() >= 0.042:
+                continue
+            fr = food_ratio_by_region.get(p.region_id, 1.0)
+            urban_bias = p.ambition * 0.22 + min(1.0, p.wealth / 2.8) * 0.2 + p.knowledge * 0.12
+            rural_bias = max(0.0, 0.9 - fr) * 0.55
+            try:
+                i = self._LIVING_BANDS.index(p.living_context)
+            except ValueError:
+                i = 0
+            st = self._get_settlement_structure(p.region_id)
+            level = str(st.get("level", "camp")) if st else "camp"
+            max_i = self._settlement_level_max_band_index(level)
+            if rural_bias > urban_bias + 0.08 and i > 0:
+                p.living_context = self._LIVING_BANDS[i - 1]
+            elif urban_bias > rural_bias + 0.08 and i < max_i:
+                p.living_context = self._LIVING_BANDS[i + 1]
+            else:
+                p.living_context = self._sample_living_context(p.region_id)
+            self._clamp_living_context(p)
+
     def _effective_government(self, settlement_level: str, civ: float, polity: str = "city") -> str:
         mode = self.config.politics.government_mode
         if settlement_level == "camp":
@@ -2901,6 +3387,7 @@ class SimulationEngine:
             newcomer_region = len(self.environments)
             self.environments.append(Environment(self.config.environment, self.rng))
             self.config.demographics.region_count = len(self.environments)
+            self.region_harvest_factor[newcomer_region] = self.rng.uniform(0.86, 1.07)
 
             split_by_faction: dict[str, list[Individual]] = defaultdict(list)
             for p in residents:
@@ -2915,10 +3402,6 @@ class SimulationEngine:
 
             self.rng.shuffle(movers)
             movers = movers[: max(12, min(len(movers), int(len(residents) * 0.45)))]
-            for p in movers:
-                p.region_id = newcomer_region
-                p.stress = max(0.0, p.stress - 0.06)
-
             new_name = self._generate_settlement_name(newcomer_region)
             new_level = "village" if len(movers) < 80 else "town"
             self.world_structures.append(
@@ -2934,6 +3417,11 @@ class SimulationEngine:
                     "religion": self._dominant_belief(movers),
                 }
             )
+            for p in movers:
+                p.region_id = newcomer_region
+                p.living_context = self._sample_living_context(newcomer_region)
+                self._clamp_living_context(p)
+                p.stress = max(0.0, p.stress - 0.06)
 
             if event == "civil_war":
                 casualties = self._apply_direct_deaths(movers, 0.07, 2)
