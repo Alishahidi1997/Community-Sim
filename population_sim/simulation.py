@@ -80,6 +80,9 @@ class SimulationEngine:
         self._pair_trust: dict[tuple[int, int], float] = {}
         # Cultural tech shared across the world; individuals contribute via invention events.
         self.world_inventions: set[str] = set()
+        # Farming/herding/wildlife (abstract headcounts + indices); feeds food and the realtime view.
+        self.livestock_by_region: dict[int, float] = {}
+        self.wildlife_index: float = 1.0
         self._initialize_population()
 
     def _initialize_population(self) -> None:
@@ -291,6 +294,7 @@ class SimulationEngine:
         self._update_civilization_metrics(alive_now)
         transition_stories = self._update_world_structures(year, alive_now)
         stories.extend(transition_stories)
+        self._update_ecology(alive_now)
         adjustments = self._auto_adjust_parameters(alive_now, available_food)
         event_deaths, event_stories = self._process_world_events(year, alive_now)
         deaths += event_deaths
@@ -436,6 +440,66 @@ class SimulationEngine:
                 newborns.append(child)
         return newborns
 
+    def _ecology_food_factor(self, region_id: int) -> float:
+        hunt = 0.015 * self.wildlife_index
+        if not self.agriculture_unlocked and "animal_husbandry" not in self.world_inventions:
+            return 1.0 + min(0.06, hunt * 2.2)
+        fields = sum(
+            1
+            for s in self.world_structures
+            if s.get("kind") == "field" and int(s.get("region_id", -1)) == region_id
+        )
+        lv = float(self.livestock_by_region.get(region_id, 0.0))
+        farm = min(0.15, fields * 0.024) if self.agriculture_unlocked else 0.0
+        herd = min(0.13, lv * 0.0048)
+        if "animal_husbandry" in self.world_inventions:
+            herd *= 1.28
+        wild = 0.006 * self.wildlife_index if self.agriculture_unlocked else 0.014 * self.wildlife_index
+        return 1.0 + farm + herd + wild + hunt * 0.35
+
+    def total_livestock(self) -> float:
+        return float(sum(self.livestock_by_region.values()))
+
+    def _update_ecology(self, alive: list[Individual]) -> None:
+        if not alive:
+            return
+        by_region: dict[int, list[Individual]] = defaultdict(list)
+        for p in alive:
+            by_region[p.region_id].append(p)
+        field_n: dict[int, int] = defaultdict(int)
+        for s in self.world_structures:
+            if s.get("kind") == "field":
+                field_n[int(s.get("region_id", 0))] += 1
+        n_regions = self.config.demographics.region_count
+        global_pop = len(alive)
+        pressure = min(2.8, global_pop / max(120.0, 15.0 * n_regions))
+        for rid in range(n_regions):
+            pop = len(by_region.get(rid, []))
+            fields = field_n.get(rid, 0)
+            cur = float(self.livestock_by_region.get(rid, 0.0))
+            target = 0.0
+            if self.agriculture_unlocked or "animal_husbandry" in self.world_inventions:
+                target += min(38.0, pop * 0.22 + fields * 3.4)
+            if "animal_husbandry" in self.world_inventions:
+                target *= 1.45
+            if "wheel" in self.world_inventions:
+                target *= 1.08
+            target += self.rng.gauss(0, 0.55)
+            target = max(0.0, target)
+            self.livestock_by_region[rid] = max(0.0, min(55.0, cur * 0.88 + target * 0.12))
+        stress_w = sum(p.stress for p in alive) / global_pop
+        self.wildlife_index = max(
+            0.18,
+            min(
+                1.85,
+                self.wildlife_index * 0.985
+                + 0.018 * (1.15 - pressure * 0.12)
+                - 0.01 * stress_w
+                - (0.008 * n_regions if self.agriculture_unlocked else 0.0)
+                + self.rng.uniform(-0.012, 0.012),
+            ),
+        )
+
     def _available_food_total(self, alive: list[Individual]) -> float:
         by_region = defaultdict(int)
         for person in alive:
@@ -444,6 +508,7 @@ class SimulationEngine:
         for region_id, count in by_region.items():
             regional_food = self.environments[region_id].available_food(count)
             regional_food *= max(0.75, 1.0 + self.region_food_adjustments.get(region_id, 0.0))
+            regional_food *= self._ecology_food_factor(region_id)
             total += regional_food
         return total
 
@@ -459,6 +524,7 @@ class SimulationEngine:
         for region_id, count in by_region.items():
             available = self.environments[region_id].available_food(count)
             available *= max(0.75, 1.0 + self.region_food_adjustments.get(region_id, 0.0))
+            available *= self._ecology_food_factor(region_id)
             modifier = max(0.2, 1.0 + self.food_system_bonus - self.temp_food_penalty)
             ratios[region_id] = (available * modifier) / count if count else 0.0
         return ratios
@@ -1268,7 +1334,8 @@ class SimulationEngine:
                     "kind": "settlement",
                     "level": "camp",
                     "region_id": region_id,
-                    "slot": 0.5,
+                    "slot": max(0.1, min(0.9, self.rng.uniform(0.18, 0.82))),
+                    "slot_y": max(0.38, min(0.9, self.rng.uniform(0.48, 0.86))),
                     "culture": "tribal",
                     "religion": "ancestor",
                 }
@@ -1307,7 +1374,8 @@ class SimulationEngine:
                     "kind": "settlement",
                     "level": "camp",
                     "region_id": region_id,
-                    "slot": max(0.08, min(0.92, self.rng.uniform(0.18, 0.82))),
+                    "slot": max(0.08, min(0.92, self.rng.uniform(0.12, 0.88))),
+                    "slot_y": max(0.34, min(0.92, self.rng.uniform(0.42, 0.88))),
                     "culture": "tribal",
                     "religion": "ancestor",
                 }
@@ -1353,14 +1421,14 @@ class SimulationEngine:
                 target_fields = min(8, max(1, int(len(residents) / 26)))
                 while existing_by_region.get(region_id, 0) < target_fields:
                     idx = len([s for s in self.world_structures if s.get("kind") == "field"])
-                    slot = 0.12 + (existing_by_region[region_id] % 8) * 0.1
                     self.world_structures.append(
                         {
                             "id": f"field_{region_id}_{idx}",
                             "kind": "field",
                             "level": 1,
                             "region_id": region_id,
-                            "slot": max(0.08, min(0.92, slot)),
+                            "slot": max(0.06, min(0.94, self.rng.uniform(0.08, 0.92))),
+                            "slot_y": max(0.32, min(0.94, self.rng.uniform(0.36, 0.92))),
                         }
                     )
                     existing_by_region[region_id] += 1
@@ -1385,7 +1453,14 @@ class SimulationEngine:
 
             if ravg_knowledge > 0.55 and rpop >= 45 and not self._has_structure_in_region("school", region_id):
                 self.world_structures.append(
-                    {"id": f"school_{region_id}", "kind": "school", "level": 1, "region_id": region_id, "slot": 0.3}
+                    {
+                        "id": f"school_{region_id}",
+                        "kind": "school",
+                        "level": 1,
+                        "region_id": region_id,
+                        "slot": max(0.08, min(0.9, self.rng.uniform(0.15, 0.45))),
+                        "slot_y": max(0.4, min(0.9, self.rng.uniform(0.5, 0.88))),
+                    }
                 )
                 stories.append(
                     self._register_timeline_transition(
@@ -1396,7 +1471,14 @@ class SimulationEngine:
                 )
             if ravg_tools > 0.58 and rpop >= 40 and not self._has_structure_in_region("workshop", region_id):
                 self.world_structures.append(
-                    {"id": f"workshop_{region_id}", "kind": "workshop", "level": 1, "region_id": region_id, "slot": 0.68}
+                    {
+                        "id": f"workshop_{region_id}",
+                        "kind": "workshop",
+                        "level": 1,
+                        "region_id": region_id,
+                        "slot": max(0.1, min(0.92, self.rng.uniform(0.55, 0.9))),
+                        "slot_y": max(0.42, min(0.9, self.rng.uniform(0.52, 0.86))),
+                    }
                 )
                 stories.append(
                     self._register_timeline_transition(
@@ -1410,7 +1492,14 @@ class SimulationEngine:
                 region_id,
             ):
                 self.world_structures.append(
-                    {"id": f"temple_{region_id}", "kind": "temple", "level": 1, "region_id": region_id, "slot": 0.5}
+                    {
+                        "id": f"temple_{region_id}",
+                        "kind": "temple",
+                        "level": 1,
+                        "region_id": region_id,
+                        "slot": max(0.1, min(0.9, self.rng.uniform(0.25, 0.75))),
+                        "slot_y": max(0.38, min(0.88, self.rng.uniform(0.44, 0.82))),
+                    }
                 )
                 stories.append(
                     self._register_timeline_transition(
@@ -1895,6 +1984,7 @@ class SimulationEngine:
                     "level": new_level,
                     "region_id": newcomer_region,
                     "slot": max(0.1, min(0.9, self.rng.uniform(0.2, 0.82))),
+                    "slot_y": max(0.36, min(0.9, self.rng.uniform(0.44, 0.86))),
                     "culture": "mixed",
                     "religion": self._dominant_belief(movers),
                 }

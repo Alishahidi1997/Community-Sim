@@ -26,6 +26,16 @@ class VisualAgent:
 
 
 @dataclass
+class VisualAnimal:
+    x: float
+    y: float
+    vx: float
+    vy: float
+    species: str
+    region_id: int
+
+
+@dataclass
 class UISlider:
     label: str
     min_value: float
@@ -97,6 +107,11 @@ class RealtimeVisualizer:
         self._build_sliders()
         self._cloud_offsets: list[tuple[float, float, float, int]] = []
         self._init_cloud_layout()
+        self.visual_animals: list[VisualAnimal] = []
+        self._scatter_veg: list[tuple[float, float, str, float]] = []
+        self._decor_crops: list[tuple[float, float, float]] = []
+        self._rebuild_world_decor()
+        self._sync_visual_animals()
 
     def _init_cloud_layout(self) -> None:
         r = self.terrain_seed
@@ -124,6 +139,34 @@ class RealtimeVisualizer:
             max(0, min(255, int(rgb[1] * factor))),
             max(0, min(255, int(rgb[2] * factor))),
         )
+
+    def _world_rect(self) -> pygame.Rect:
+        return pygame.Rect(self.left_panel_width, 0, self.width - self.panel_width - self.left_panel_width, self.height)
+
+    def _rebuild_world_decor(self) -> None:
+        wr = self._world_rect()
+        r = self.terrain_seed
+        self._scatter_veg = []
+        self._decor_crops = []
+        count = max(36, min(220, wr.width * wr.height // 9000))
+        for i in range(count):
+            nx = r.random()
+            ny = 0.22 + r.random() * 0.76
+            if 0.56 < ny < 0.72 and 0.38 < nx < 0.62:
+                continue
+            roll = r.random()
+            if roll < 0.52:
+                kind = "tree"
+                sc = r.uniform(0.75, 1.35)
+            elif roll < 0.78:
+                kind = "bush"
+                sc = r.uniform(0.5, 1.0)
+            else:
+                kind = "rock"
+                sc = r.uniform(0.4, 0.85)
+            self._scatter_veg.append((nx, ny, kind, sc))
+        for _ in range(max(12, min(80, wr.width // 25))):
+            self._decor_crops.append((r.random(), 0.5 + r.random() * 0.44, r.uniform(0.7, 1.2)))
 
     def _desktop_pixel_size(self) -> tuple[int, int]:
         """Primary monitor size in pixels (for clamping window and true fullscreen)."""
@@ -180,6 +223,7 @@ class RealtimeVisualizer:
         self._layout_panels()
         self.hills = self._build_hills()
         self._build_sliders()
+        self._rebuild_world_decor()
         self._clamp_agents_to_regions()
 
     def _clamp_agents_to_regions(self) -> None:
@@ -235,6 +279,7 @@ class RealtimeVisualizer:
             if not self.paused:
                 self._tick_simulation()
                 self._move_agents(dt)
+                self._move_visual_animals(dt)
             self._draw(screen, font, small_font)
             pygame.display.flip()
 
@@ -311,6 +356,7 @@ class RealtimeVisualizer:
             self._push_message(story)
         self._update_timeline_cache()
         self.year += 1
+        self._sync_visual_animals()
         if self.year >= self.engine.config.years:
             self.paused = True
 
@@ -430,6 +476,8 @@ class RealtimeVisualizer:
                 if sample_lines > max_lines:
                     break
 
+        self._draw_animals(screen)
+
         for person in alive_people:
             agent = self.visual_state.get(person.person_id)
             if agent is None:
@@ -460,7 +508,11 @@ class RealtimeVisualizer:
         self._draw_ground_gradient(screen, ground_rect)
         self._draw_river(screen, world_rect)
         self._draw_region_fields(screen)
+        self._draw_world_vegetation(screen)
+        self._draw_decorative_farmland(screen)
+        self._draw_scattered_homesteads(screen)
         self._draw_world_structures(screen)
+        self._draw_livestock_enclosures(screen)
         self._draw_roads(screen)
 
     def _draw_hud(self, screen: pygame.Surface, font: pygame.font.Font, alive_people: list) -> None:
@@ -482,6 +534,7 @@ class RealtimeVisualizer:
             f"Politics: {self._politics_summary()}",
             f"Factions: {self._faction_summary_line()}   Preset: {self.engine.config.conflict.preset}   World aggression: {self.engine._world_aggression():.2f}",
             f"Trade routes: {len(getattr(self.engine, 'region_trade_links', []))}   Regions: {self.engine.config.demographics.region_count}",
+            f"Wildlife: {getattr(self.engine, 'wildlife_index', 1.0):.2f}   Livestock: {self.engine.total_livestock():.0f}   Farms (fields): {sum(1 for s in self.engine.world_structures if s.get('kind') == 'field')}",
             f"Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}",
             "Controls: SPACE pause | drag window edges to resize | sliders | ,/. speed | L | ESC",
         ]
@@ -685,8 +738,8 @@ class RealtimeVisualizer:
             pygame.draw.rect(screen, color, handle, border_radius=4)
 
         tips = [
+            "World: trees/rocks, crop patches, huts, herds (sheep/cattle), wildlife",
             "Icons: yellow=scholar, gray=toolmaker, purple=spiritual",
-            "Lines show social interaction links.",
         ]
         y = self.height - 52
         for tip in tips:
@@ -751,6 +804,189 @@ class RealtimeVisualizer:
             grid = self._mul_rgb(self.grid_color, 0.78)
             for x in range(rect.left, rect.right, 36):
                 pygame.draw.line(screen, grid, (x, rect.bottom - 22), (x + 14, rect.bottom - 2), 1)
+
+    def _draw_world_vegetation(self, screen: pygame.Surface) -> None:
+        wr = self._world_rect()
+        for nx, ny, kind, sc in self._scatter_veg:
+            x = int(wr.left + nx * wr.width)
+            y = int(wr.top + ny * wr.height)
+            if kind == "tree":
+                trunk = self._mul_rgb((86, 62, 48), sc)
+                foliage = self._mul_rgb((48, 92, 54), sc)
+                hi = self._mul_rgb((72, 118, 68), sc)
+                pygame.draw.rect(screen, trunk, pygame.Rect(x - 2, y - 4, 4, int(14 * sc)))
+                pygame.draw.circle(screen, foliage, (x, y - int(16 * sc)), int(10 * sc))
+                pygame.draw.circle(screen, hi, (x - int(4 * sc), y - int(18 * sc)), int(5 * sc))
+            elif kind == "bush":
+                pygame.draw.circle(screen, (56, 98, 58), (x, y), int(7 * sc))
+                pygame.draw.circle(screen, (68, 112, 72), (x + int(4 * sc), y - 2), int(5 * sc))
+            else:
+                pygame.draw.ellipse(screen, (108, 104, 98), pygame.Rect(x - int(6 * sc), y - int(4 * sc), int(12 * sc), int(8 * sc)))
+                pygame.draw.ellipse(screen, (88, 84, 80), pygame.Rect(x - int(4 * sc), y - int(3 * sc), int(8 * sc), int(6 * sc)))
+
+    def _draw_decorative_farmland(self, screen: pygame.Surface) -> None:
+        if not self.engine.agriculture_unlocked:
+            return
+        wr = self._world_rect()
+        for nx, ny, sc in self._decor_crops:
+            x = int(wr.left + nx * wr.width)
+            y = int(wr.top + ny * wr.height)
+            w, h = max(10, int(22 * sc)), max(6, int(10 * sc))
+            pygame.draw.ellipse(screen, (138, 162, 72), pygame.Rect(x - w // 2, y - h // 2, w, h))
+            pygame.draw.line(screen, (110, 138, 58), (x - w // 2 + 2, y), (x + w // 2 - 2, y), 1)
+
+    def _draw_scattered_homesteads(self, screen: pygame.Surface) -> None:
+        by_region: dict[int, int] = {i: 0 for i in range(self.engine.config.demographics.region_count)}
+        for p in self.engine.population:
+            if p.alive:
+                by_region[p.region_id] = by_region.get(p.region_id, 0) + 1
+        for region_id, rpop in by_region.items():
+            if rpop <= 0:
+                continue
+            rect = self._region_rect(region_id)
+            n = min(11, max(0, rpop // 20))
+            rr = random.Random(self.engine.config.random_seed + region_id * 9973 + self.year * 31)
+            for _ in range(n):
+                sx = rr.uniform(0.07, 0.93)
+                sy = rr.uniform(0.34, 0.92)
+                x = int(rect.left + sx * rect.width)
+                y = int(rect.top + sy * rect.height)
+                pygame.draw.polygon(screen, (142, 108, 78), [(x - 7, y + 4), (x, y - 8), (x + 7, y + 4)])
+                pygame.draw.rect(screen, (120, 92, 68), pygame.Rect(x - 5, y + 2, 10, 5))
+
+    def _draw_livestock_enclosures(self, screen: pygame.Surface) -> None:
+        lv_map = getattr(self.engine, "livestock_by_region", {})
+        for region_id in range(self.engine.config.demographics.region_count):
+            lv = float(lv_map.get(region_id, 0.0))
+            if lv < 6.0:
+                continue
+            rect = self._region_rect(region_id)
+            rr = random.Random(self.engine.config.random_seed + region_id * 12011 + 3)
+            cx = int(rect.left + rr.uniform(0.2, 0.8) * rect.width)
+            cy = int(rect.top + rr.uniform(0.48, 0.88) * rect.height)
+            w, h = max(28, int(36 + min(40, lv))), max(20, int(24 + min(30, lv * 0.5)))
+            pygame.draw.rect(screen, (118, 98, 72), pygame.Rect(cx - w // 2, cy - h // 2, w, h), 2)
+            pygame.draw.line(screen, (92, 78, 58), (cx - w // 2, cy), (cx + w // 2, cy), 1)
+
+    def _sync_visual_animals(self) -> None:
+        wr = self._world_rect()
+        wi = float(getattr(self.engine, "wildlife_index", 1.0))
+        total_lv = self.engine.total_livestock()
+        n_regions = max(1, self.engine.config.demographics.region_count)
+        n_bird = int(8 + 16 * min(1.5, wi))
+        n_deer = int(2 + int(7 * min(1.3, wi) * 0.55))
+        n_sheep = min(42, int(total_lv * 0.14 + 2))
+        n_cattle = min(28, int(total_lv * 0.07 + 1))
+        target = min(115, n_bird + n_deer + n_sheep + n_cattle)
+        rr = random.Random(self.engine.config.random_seed + self.year * 4049 + 17)
+        lv_map = dict(getattr(self.engine, "livestock_by_region", {}))
+        best_rid = 0
+        if lv_map:
+            best_rid = max(lv_map.keys(), key=lambda k: float(lv_map.get(k, 0.0)))
+
+        def spawn(species: str, region_id: int) -> VisualAnimal:
+            if species == "bird":
+                x = rr.uniform(wr.left + 8, wr.right - 8)
+                y = rr.uniform(wr.top + wr.height * 0.2, wr.top + wr.height * 0.55)
+                sp = 20.0
+            else:
+                rid = max(0, min(n_regions - 1, region_id))
+                rect = self._region_rect(rid)
+                x = rr.uniform(rect.left + 6, rect.right - 6)
+                y = rr.uniform(rect.top + rect.height * 0.28, rect.bottom - 8)
+                sp = 12.0
+            ang = rr.uniform(0, math.tau)
+            r_id = 0 if species == "bird" else max(0, min(n_regions - 1, region_id))
+            return VisualAnimal(
+                x=x,
+                y=y,
+                vx=math.cos(ang) * sp,
+                vy=math.sin(ang) * sp,
+                species=species,
+                region_id=r_id,
+            )
+
+        new_list: list[VisualAnimal] = []
+        for _ in range(n_bird):
+            new_list.append(spawn("bird", 0))
+        for _ in range(n_deer):
+            new_list.append(spawn("deer", rr.randint(0, n_regions - 1)))
+        for i in range(n_sheep):
+            rid = best_rid if total_lv >= 1.0 else (i % n_regions)
+            new_list.append(spawn("sheep", rid))
+        for i in range(n_cattle):
+            rid = best_rid if total_lv >= 2.0 else ((i * 2) % n_regions)
+            new_list.append(spawn("cattle", rid))
+        while len(new_list) > target > 0:
+            new_list.pop(rr.randint(0, len(new_list) - 1))
+        self.visual_animals = new_list if target > 0 else []
+
+    def _move_visual_animals(self, dt: float) -> None:
+        wr = self._world_rect()
+        rr = self.rng
+        for a in self.visual_animals:
+            if a.species == "bird":
+                a.vx += rr.uniform(-40, 40) * dt
+                a.vy += rr.uniform(-26, 26) * dt
+            else:
+                a.vx += rr.uniform(-22, 22) * dt
+                a.vy += rr.uniform(-18, 18) * dt
+            cap = 55.0 if a.species == "bird" else 38.0
+            sp = math.hypot(a.vx, a.vy)
+            if sp > cap:
+                a.vx *= cap / sp
+                a.vy *= cap / sp
+            a.x += a.vx * dt
+            a.y += a.vy * dt
+            if a.species == "bird":
+                if a.x < wr.left:
+                    a.x = wr.left
+                    a.vx *= -0.85
+                elif a.x > wr.right:
+                    a.x = wr.right
+                    a.vx *= -0.85
+                if a.y < wr.top:
+                    a.y = wr.top
+                    a.vy *= -0.85
+                elif a.y > wr.top + wr.height * 0.62:
+                    a.y = wr.top + wr.height * 0.62
+                    a.vy *= -0.85
+            else:
+                rect = self._region_rect(max(0, min(self.engine.config.demographics.region_count - 1, a.region_id)))
+                pad = 10.0
+                if a.x < rect.left + pad:
+                    a.x = rect.left + pad
+                    a.vx *= -0.82
+                elif a.x > rect.right - pad:
+                    a.x = rect.right - pad
+                    a.vx *= -0.82
+                if a.y < rect.top + rect.height * 0.22:
+                    a.y = rect.top + rect.height * 0.22
+                    a.vy *= -0.82
+                elif a.y > rect.bottom - pad:
+                    a.y = rect.bottom - pad
+                    a.vy *= -0.82
+
+    def _draw_animals(self, screen: pygame.Surface) -> None:
+        for a in self.visual_animals:
+            x, y = int(a.x), int(a.y)
+            if a.species == "bird":
+                pygame.draw.line(screen, (52, 56, 62), (x - 4, y), (x, y - 2), 2)
+                pygame.draw.line(screen, (52, 56, 62), (x, y - 2), (x + 5, y + 1), 2)
+            elif a.species == "deer":
+                pygame.draw.ellipse(screen, (118, 86, 62), pygame.Rect(x - 5, y - 3, 12, 7))
+                pygame.draw.circle(screen, (138, 100, 72), (x + 4, y - 5), 3)
+                pygame.draw.line(screen, (72, 58, 48), (x - 2, y - 8), (x - 4, y - 11), 1)
+                pygame.draw.line(screen, (72, 58, 48), (x + 1, y - 8), (x + 2, y - 12), 1)
+            elif a.species == "sheep":
+                pygame.draw.circle(screen, (230, 228, 235), (x, y), 6)
+                pygame.draw.circle(screen, (210, 208, 218), (x - 3, y - 2), 4)
+                pygame.draw.circle(screen, (52, 48, 44), (x + 4, y - 1), 2)
+            else:
+                pygame.draw.ellipse(screen, (102, 74, 52), pygame.Rect(x - 9, y - 5, 18, 10))
+                pygame.draw.circle(screen, (72, 56, 44), (x + 7, y - 3), 4)
+                pygame.draw.line(screen, (48, 42, 38), (x - 6, y + 4), (x - 6, y + 9), 2)
+                pygame.draw.line(screen, (48, 42, 38), (x + 2, y + 4), (x + 2, y + 9), 2)
 
     def _draw_sky_gradient(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
         cycle = (self.year % 240) / 240.0
@@ -986,23 +1222,23 @@ class RealtimeVisualizer:
         )
         screen.blit(footer, (ledger_rect.left + 8, ledger_rect.bottom - 22))
 
-    def _world_rect(self) -> pygame.Rect:
-        return pygame.Rect(self.left_panel_width, 0, self.width - self.panel_width - self.left_panel_width, self.height)
-
     def _structure_screen_pos(self, structure: dict) -> tuple[int, int]:
         region_id = int(structure.get("region_id", 0))
         rect = self._region_rect(region_id)
         slot = float(structure.get("slot", 0.5))
+        sy = float(structure.get("slot_y", 0.78))
+        sy = max(0.12, min(0.96, sy))
         x = int(rect.left + slot * rect.width)
+        y_base = rect.top + sy * rect.height
         kind = structure.get("kind")
         if kind == "field":
-            y = int(rect.bottom - 14)
+            y = int(y_base)
         elif kind == "settlement":
-            y = int(rect.bottom - 30)
+            y = int(y_base - 10)
         elif kind in ("school", "workshop", "temple"):
-            y = int(rect.bottom - 52)
+            y = int(y_base - 14)
         else:
-            y = int(rect.bottom - 26)
+            y = int(y_base - 6)
         return x, y
 
     def _draw_world_structures(self, screen: pygame.Surface) -> None:
@@ -1010,8 +1246,9 @@ class RealtimeVisualizer:
             kind = structure.get("kind")
             x, y = self._structure_screen_pos(structure)
             if kind == "field":
-                pygame.draw.rect(screen, (160, 190, 90), pygame.Rect(x - 12, y - 4, 24, 8))
-                pygame.draw.line(screen, (130, 160, 70), (x - 10, y), (x + 10, y), 1)
+                pygame.draw.ellipse(screen, (148, 176, 78), pygame.Rect(x - 18, y - 10, 36, 20))
+                for off in (-5, 0, 5):
+                    pygame.draw.line(screen, (118, 142, 58), (x - 14, y + off), (x + 14, y + off), 1)
             elif kind == "settlement":
                 level = structure.get("level", "camp")
                 if level == "camp":
