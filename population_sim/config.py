@@ -23,6 +23,24 @@ class EnvironmentConfig:
 
 
 @dataclass
+class SeasonConfig:
+    """Annual cycle: each simulated year advances one season (spring→summer→autumn→winter)."""
+
+    enabled: bool = True
+    names: tuple[str, str, str, str] = ("spring", "summer", "autumn", "winter")
+    # Applied to regional food after environment.available_food and trade/ecology modifiers.
+    food_multiplier: tuple[float, float, float, float] = (0.93, 1.14, 1.03, 0.81)
+    # Extra migration pressure (e.g. harsh winter / lean season movement).
+    migration_multiplier: tuple[float, float, float, float] = (1.02, 0.94, 1.04, 1.16)
+    # Contact-season transmission (e.g. winter crowding).
+    disease_transmission_multiplier: tuple[float, float, float, float] = (0.95, 0.97, 1.03, 1.1)
+    # Foraging / wild harvest / pasture quality (scaled on non-field ecology bonus only).
+    wildlife_food_multiplier: tuple[float, float, float, float] = (1.03, 1.06, 0.97, 0.86)
+    # Shifts which season year 0 uses: index = (year + phase_offset) % 4.
+    phase_offset: int = 0
+
+
+@dataclass
 class MigrationConfig:
     enabled: bool = True
     migration_rate: float = 0.02
@@ -75,6 +93,36 @@ class PoliticsConfig:
 
 
 @dataclass
+class CognitionConfig:
+    """Global + per-agent cognition: goal choice and migration use a softmax 'brain'."""
+
+    # Slider / dial: how sharp collective decisions are (higher → more rational, lower → noisier).
+    world_iq: float = 0.65
+    # 0 ≈ newborns cluster near average IQ; 1 ≈ full spread (matches legacy wide uniform).
+    birth_iq_diversity: float = 1.0
+    # Learned MLP over agent+macro features (NumPy REINFORCE + imitation); see learned_policy.py.
+    learned_goal_network: bool = True
+    # Blend: (1-mix)*heuristic_logits + mix*MLP_logits before softmax sample.
+    learned_goal_mix: float = 0.22
+    learned_goal_hidden: int = 24
+    # Years of behavioral cloning toward heuristic before policy-gradient updates dominate.
+    learned_goal_imitation_years: int = 22
+    learned_goal_lr: float = 0.035
+    learned_goal_lr_imitation: float = 0.07
+
+
+@dataclass
+class EconomyConfig:
+    """Currency, trade, theft, and local rules (treasury + policies per region)."""
+
+    enabled: bool = True
+    pairwise_trade_attempts: int = 2  # per person per year (capped by contacts)
+    trade_goal_bias: float = 0.22
+    theft_attempts: int = 1
+    inter_region_trade_volume: float = 0.07
+
+
+@dataclass
 class DemographicsConfig:
     initial_population: int = 500
     region_count: int = 3
@@ -95,11 +143,14 @@ class SimulationConfig:
     random_seed: int = 42
     demographics: DemographicsConfig = field(default_factory=DemographicsConfig)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
+    seasons: SeasonConfig = field(default_factory=SeasonConfig)
     migration: MigrationConfig = field(default_factory=MigrationConfig)
     vaccination: VaccinationPolicyConfig = field(default_factory=VaccinationPolicyConfig)
     contact_network: ContactNetworkConfig = field(default_factory=ContactNetworkConfig)
     behavior: BehaviorConfig = field(default_factory=BehaviorConfig)
     conflict: ConflictConfig = field(default_factory=ConflictConfig)
     politics: PoliticsConfig = field(default_factory=PoliticsConfig)
+    cognition: CognitionConfig = field(default_factory=CognitionConfig)
+    economy: EconomyConfig = field(default_factory=EconomyConfig)
     pathogens: list[PathogenConfig] = field(default_factory=lambda: [PathogenConfig()])
 

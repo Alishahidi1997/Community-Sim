@@ -134,11 +134,13 @@ class WorldDynamics:
         has_trade: bool,
         year: int,
         world_aggression: float = 1.0,
+        world_iq: float = 0.65,
     ) -> tuple[str | None, float]:
         """Update latent tension/goodwill; return event type and war intensity in [0,1].
 
         Event is None most years; 'trade_open', 'war', or 'trade_break' when thresholds cross.
         """
+        iq_c = _clamp(world_iq, 0.12, 1.0)
         pair = (ra, rb) if ra < rb else (rb, ra)
         key = pair
         prev = self.border_tension.get(key, 0.35)
@@ -159,6 +161,7 @@ class WorldDynamics:
             + self.border_phase_jitter(ra, rb)
         )
         pressure *= 0.45 + 0.55 * wa
+        pressure *= 1.05 - 0.38 * iq_c
         if has_trade:
             pressure *= 0.62
             pressure -= 0.06
@@ -183,24 +186,30 @@ class WorldDynamics:
             + (1.0 - scarcity) * 0.18
         )
         gw = self.border_trade_goodwill.get(key, 0.0)
+        coop = 0.78 + 0.28 * iq_c
         if not has_trade:
-            gw = _clamp(gw + 0.045 * (dip - 0.55) + 0.02 * (1.0 - new_tension), 0.0, 1.2)
+            gw = _clamp(
+                gw + coop * (0.045 * (dip - 0.55) + 0.02 * (1.0 - new_tension)),
+                0.0,
+                1.2,
+            )
         else:
-            gw = _clamp(0.92 * gw + 0.04 * dip, 0.0, 1.2)
+            gw = _clamp(0.92 * gw + coop * 0.04 * dip, 0.0, 1.2)
         self.border_trade_goodwill[key] = gw
 
         event: str | None = None
         war_intensity = 0.0
 
         # War: release when tension is high OR sharp rise under scarcity (no p < roll)
-        hi = _clamp(0.84 - 0.07 * max(0.0, wa - 1.0), 0.62, 0.9)
-        lo = _clamp(0.62 - 0.06 * max(0.0, wa - 1.0), 0.48, 0.62)
+        hi = _clamp(0.84 - 0.07 * max(0.0, wa - 1.0), 0.62, 0.9) + 0.055 * iq_c
+        lo = _clamp(0.62 - 0.06 * max(0.0, wa - 1.0), 0.48, 0.62) + 0.035 * iq_c
         spike = _clamp(0.085 - 0.02 * max(0.0, wa - 1.0), 0.045, 0.1)
         sc_need = _clamp(0.38 - 0.06 * max(0.0, wa - 1.0), 0.22, 0.42)
         war_ready = new_tension > hi or (new_tension > lo and d_tension > spike and scarcity > sc_need)
         if war_ready and years_since_war >= 5:
             event = "war"
             war_intensity = _clamp(0.35 + 0.55 * new_tension + 0.15 * scarcity, 0.0, 1.0)
+            war_intensity = _clamp(war_intensity * (1.08 - 0.48 * iq_c), 0.0, 1.0)
             self.border_tension[key] = _clamp(new_tension - 0.38 - 0.1 * war_intensity, 0.08, 0.95)
             self.last_border_war_year[key] = year
             self.border_trade_goodwill[key] = max(0.0, gw - 0.55)

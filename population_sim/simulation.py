@@ -1,21 +1,48 @@
 from __future__ import annotations
 
+import math
 import random
 from collections import defaultdict
 
+import numpy as np
+
 from population_sim.agent_cognition import (
+    GOAL_VALUES,
+    WorldGoalContext,
+    _softmax_sample_index,
+    brain_choose_migration_region,
+    brain_choose_primary_goal,
+    brain_choose_primary_goal_fields,
+    effective_cognition_iq,
     goal_migration_multipliers,
+    heuristic_goal_logits,
     normalize_pair,
-    replan_primary_goal,
+)
+from population_sim.learned_policy import (
+    LearnedGoalMLP,
+    GOAL_POLICY_INPUT_DIM,
+    blend_goal_logits,
+    build_goal_feature_vector,
 )
 from population_sim.config import SimulationConfig
+from population_sim.economy import (
+    apply_income_taxes,
+    default_region_policy,
+    inter_region_trade,
+    pairwise_market_trade,
+    region_wealth_medians,
+    theft_attempt,
+)
 from population_sim.disease import MultiDiseaseModel
 from population_sim.environment import Environment
 from population_sim.models import (
     DiseaseState,
     Gender,
     Individual,
+    inherit_cognitive_iq,
     inherit_emotions,
+    inherit_reputation,
+    inherit_wealth,
     inherit_riding,
     inherit_social_profile,
     inherit_traits,
@@ -78,6 +105,25 @@ class SimulationEngine:
         self._region_food_prev: dict[int, float] = {}
         self._region_food_trend: dict[int, float] = {}
         self._pair_trust: dict[tuple[int, int], float] = {}
+        self.current_season_index: int = 0
+        self.current_season_name: str = "—"
+        self._season_food_mult: float = 1.0
+        self._season_migration_mult: float = 1.0
+        self._season_disease_mult: float = 1.0
+        self._season_wildlife_mult: float = 1.0
+        rc = config.demographics.region_count
+        self.region_treasury: dict[int, float] = {i: 0.0 for i in range(rc)}
+        self.region_policies: dict[int, dict[str, float]] = {
+            i: default_region_policy(0) for i in range(rc)
+        }
+        self.goal_policy: LearnedGoalMLP | None = None
+        self._goal_policy_batch: list[dict[str, object]] = []
+        if self.config.cognition.learned_goal_network:
+            self.goal_policy = LearnedGoalMLP(
+                seed=self.config.random_seed + 7919,
+                in_dim=GOAL_POLICY_INPUT_DIM,
+                hidden=max(8, int(self.config.cognition.learned_goal_hidden)),
+            )
         # Cultural tech shared across the world; individuals contribute via invention events.
         self.world_inventions: set[str] = set()
         # Farming/herding/wildlife (abstract headcounts + indices); feeds food and the realtime view.
@@ -97,6 +143,10 @@ class SimulationEngine:
                 language = self.language_names[0]
                 h0 = self.rng.uniform(0.8, 1.0)
                 age0 = self.rng.randint(18, 24)
+                cog_iq = self._sample_birth_cognitive_iq()
+                wealth0 = self.rng.uniform(0.45, 1.25)
+                rep0 = self.rng.uniform(0.38, 0.68)
+                gctx = self._bootstrap_goal_ctx(1.0)
                 person = Individual(
                     person_id=self.next_person_id,
                     age=age0,
@@ -125,7 +175,26 @@ class SimulationEngine:
                     inventions_made=0,
                     mutation_burden=0.0,
                     political_power=self.rng.uniform(0.14, 0.28),
-                    primary_goal=replan_primary_goal(h0, stress, ambition, age0),
+                    cognitive_iq=cog_iq,
+                    wealth=wealth0,
+                    reputation=rep0,
+                    primary_goal=brain_choose_primary_goal_fields(
+                        self.config.cognition.world_iq,
+                        cog_iq,
+                        health=h0,
+                        stress=stress,
+                        ambition=ambition,
+                        age=age0,
+                        happiness=happiness,
+                        knowledge=knowledge,
+                        tool_skill=tool_skill,
+                        observed_food_ema=1.0,
+                        observed_food_trend=0.0,
+                        wealth=wealth0,
+                        reputation=rep0,
+                        ctx=gctx,
+                        rng=self.rng,
+                    ),
                     observed_food_ema=1.0,
                     observed_food_trend=0.0,
                 )
@@ -141,6 +210,10 @@ class SimulationEngine:
                 faction = self.rng.choice(self.faction_names)
                 language = self.rng.choice(self.language_names[:3])
                 h0 = self.rng.uniform(0.6, 1.0)
+                cog_iq = self._sample_birth_cognitive_iq()
+                wealth0 = self.rng.uniform(0.32, 1.55)
+                rep0 = self.rng.uniform(0.32, 0.72)
+                gctx = self._bootstrap_goal_ctx(1.0)
                 person = Individual(
                     person_id=self.next_person_id,
                     age=age,
@@ -169,7 +242,26 @@ class SimulationEngine:
                     inventions_made=0,
                     mutation_burden=0.0,
                     political_power=self.rng.uniform(0.12, 0.32),
-                    primary_goal=replan_primary_goal(h0, stress, ambition, age),
+                    cognitive_iq=cog_iq,
+                    wealth=wealth0,
+                    reputation=rep0,
+                    primary_goal=brain_choose_primary_goal_fields(
+                        self.config.cognition.world_iq,
+                        cog_iq,
+                        health=h0,
+                        stress=stress,
+                        ambition=ambition,
+                        age=age,
+                        happiness=happiness,
+                        knowledge=knowledge,
+                        tool_skill=tool_skill,
+                        observed_food_ema=1.0,
+                        observed_food_trend=0.0,
+                        wealth=wealth0,
+                        reputation=rep0,
+                        ctx=gctx,
+                        rng=self.rng,
+                    ),
                     observed_food_ema=1.0,
                     observed_food_trend=0.0,
                 )
@@ -206,6 +298,7 @@ class SimulationEngine:
         if not alive:
             return 0, 0, 0.0
 
+        self._sync_season(year)
         era = self._era_profile(year)
         self.current_era = era["name"]
         for env in self.environments:
@@ -230,7 +323,7 @@ class SimulationEngine:
         available_food *= max(0.2, 1.0 + self.food_system_bonus - self.temp_food_penalty)
         food_ratio_by_region = self._food_ratio_by_region(alive)
         self._step_regional_food_trends(food_ratio_by_region)
-        self._replan_agent_goals(alive)
+        self._replan_agent_goals(alive, civ_w, food_ratio_by_region, year)
 
         self._apply_migration(alive)
         self._update_personal_food_memory(alive)
@@ -239,6 +332,7 @@ class SimulationEngine:
         self._prune_social_edges(alive)
         self._simulate_social_dynamics(alive)
         self._rebuild_social_degree_cache()
+        stories.extend(self._step_economy(alive, year, civ_w))
         self._apply_social_learning(alive)
         self._step_belief_evolution(alive)
         self._craft_tools_and_books(alive, year)
@@ -249,6 +343,7 @@ class SimulationEngine:
             alive,
             self.contact_graph,
             self.config.migration.cross_region_contact_rate,
+            transmission_scale=self._season_disease_mult,
         )
 
         for person in alive:
@@ -307,6 +402,7 @@ class SimulationEngine:
             "stories": stories,
             "adjustments": adjustments,
         }
+        self._train_learned_goal_policy(year)
         return births, deaths, available_food
 
     def _pick_father_for_birth(self, mother: Individual, males: list[Individual]) -> Individual:
@@ -359,6 +455,14 @@ class SimulationEngine:
         if not females or not males:
             return []
 
+        macro_birth = self._compute_macro_goal_cache(alive, food_ratio_by_region)
+        civ_birth = (
+            (sum(p.knowledge for p in alive) / alive_count) * 0.55
+            + (sum(p.tool_skill for p in alive) / alive_count) * 0.45
+            if alive_count
+            else 0.2
+        )
+
         newborns: list[Individual] = []
         for mother in females:
             if self.rng.random() > cfg.partner_match_rate:
@@ -387,6 +491,14 @@ class SimulationEngine:
             traits = inherit_traits(mother, father, self.rng)
             knowledge, tool_skill, spiritual, belief_group = inherit_social_profile(mother, father, self.rng)
             happiness, stress, aggression, ambition = inherit_emotions(mother, father, self.rng)
+            cognitive_iq = inherit_cognitive_iq(
+                mother,
+                father,
+                self.rng,
+                self.config.cognition.birth_iq_diversity,
+            )
+            c_wealth = inherit_wealth(mother, father, self.rng)
+            c_rep = inherit_reputation(mother, father, self.rng)
             riding_skill = inherit_riding(mother, father, self.rng)
             political_power = max(
                 0.0,
@@ -400,6 +512,14 @@ class SimulationEngine:
             if "digital_age" in self.unlocked_milestones and self.rng.random() < 0.08:
                 language = self.rng.choice(self.language_names)
             ch = self.rng.uniform(0.7, 1.0)
+            gctx = self._world_goal_context_from_demographics(
+                region_id=mother.region_id,
+                faction=faction,
+                wealth=c_wealth,
+                food_ratio_by_region=food_ratio_by_region,
+                civ_w=civ_birth,
+                macro=macro_birth,
+            )
             child = Individual(
                 person_id=self.next_person_id,
                 age=0,
@@ -428,7 +548,26 @@ class SimulationEngine:
                 inventions_made=0,
                 mutation_burden=0.0,
                 political_power=political_power,
-                primary_goal=replan_primary_goal(ch, stress, ambition, 0),
+                cognitive_iq=cognitive_iq,
+                wealth=c_wealth,
+                reputation=c_rep,
+                primary_goal=brain_choose_primary_goal_fields(
+                    self.config.cognition.world_iq,
+                    cognitive_iq,
+                    health=ch,
+                    stress=stress,
+                    ambition=ambition,
+                    age=0,
+                    happiness=happiness,
+                    knowledge=knowledge,
+                    tool_skill=tool_skill,
+                    observed_food_ema=1.0,
+                    observed_food_trend=0.0,
+                    wealth=c_wealth,
+                    reputation=c_rep,
+                    ctx=gctx,
+                    rng=self.rng,
+                ),
                 observed_food_ema=1.0,
                 observed_food_trend=0.0,
             )
@@ -440,10 +579,34 @@ class SimulationEngine:
                 newborns.append(child)
         return newborns
 
+    def _sync_season(self, year: int) -> None:
+        sc = self.config.seasons
+        n = len(sc.names)
+        if not sc.enabled or n == 0:
+            self.current_season_index = 0
+            self.current_season_name = "—"
+            self._season_food_mult = 1.0
+            self._season_migration_mult = 1.0
+            self._season_disease_mult = 1.0
+            self._season_wildlife_mult = 1.0
+            return
+
+        def _pick(t: tuple[float, ...], i: int) -> float:
+            return float(t[i % len(t)])
+
+        idx = (int(year) + int(sc.phase_offset)) % n
+        self.current_season_index = idx
+        self.current_season_name = str(sc.names[idx])
+        self._season_food_mult = _pick(sc.food_multiplier, idx)
+        self._season_migration_mult = _pick(sc.migration_multiplier, idx)
+        self._season_disease_mult = _pick(sc.disease_transmission_multiplier, idx)
+        self._season_wildlife_mult = _pick(sc.wildlife_food_multiplier, idx)
+
     def _ecology_food_factor(self, region_id: int) -> float:
         hunt = 0.015 * self.wildlife_index
+        wm = max(0.05, min(2.5, self._season_wildlife_mult))
         if not self.agriculture_unlocked and "animal_husbandry" not in self.world_inventions:
-            return 1.0 + min(0.06, hunt * 2.2)
+            return 1.0 + min(0.06, hunt * 2.2 * wm)
         fields = sum(
             1
             for s in self.world_structures
@@ -455,7 +618,9 @@ class SimulationEngine:
         if "animal_husbandry" in self.world_inventions:
             herd *= 1.28
         wild = 0.006 * self.wildlife_index if self.agriculture_unlocked else 0.014 * self.wildlife_index
-        return 1.0 + farm + herd + wild + hunt * 0.35
+        base_core = 1.0 + farm + herd
+        extra = wild + hunt * 0.35
+        return base_core + extra * wm
 
     def total_livestock(self) -> float:
         return float(sum(self.livestock_by_region.values()))
@@ -509,6 +674,7 @@ class SimulationEngine:
             regional_food = self.environments[region_id].available_food(count)
             regional_food *= max(0.75, 1.0 + self.region_food_adjustments.get(region_id, 0.0))
             regional_food *= self._ecology_food_factor(region_id)
+            regional_food *= self._season_food_mult
             total += regional_food
         return total
 
@@ -525,6 +691,7 @@ class SimulationEngine:
             available = self.environments[region_id].available_food(count)
             available *= max(0.75, 1.0 + self.region_food_adjustments.get(region_id, 0.0))
             available *= self._ecology_food_factor(region_id)
+            available *= self._season_food_mult
             modifier = max(0.2, 1.0 + self.food_system_bonus - self.temp_food_penalty)
             ratios[region_id] = (available * modifier) / count if count else 0.0
         return ratios
@@ -673,6 +840,7 @@ class SimulationEngine:
                 has_trade,
                 year,
                 self._world_aggression(),
+                self.config.cognition.world_iq,
             )
 
             if event == "trade_open":
@@ -745,9 +913,398 @@ class SimulationEngine:
             if region_id not in food_ratio_by_region:
                 self._region_food_prev.setdefault(region_id, 1.0)
 
-    def _replan_agent_goals(self, alive: list[Individual]) -> None:
+    def _bootstrap_goal_ctx(self, mean_food: float = 1.0) -> WorldGoalContext:
+        return WorldGoalContext(
+            civ_index=max(0.06, min(1.0, self.civilization_index * 0.9 + 0.05)),
+            global_instability=self.world_dynamics.global_instability,
+            food_inequality=self.world_dynamics.food_inequality,
+            mean_food_ratio=mean_food,
+            settlement_tier=0,
+            regional_wealth_poor=0.0,
+            local_food_vs_world=0.0,
+            resource_index_local=0.5,
+            treasury_strength_local=0.5,
+            policy_tax_burden=0.06,
+            policy_security=0.32,
+            policy_institutional_openness=0.48,
+            region_trade_connected=0.0,
+            faction_local_power=0.45,
+            wealth_spread_local=0.22,
+        )
+
+    def _compute_macro_goal_cache(
+        self,
+        alive: list[Individual],
+        food_ratio_by_region: dict[int, float],
+    ) -> dict[str, object]:
+        """Per-year aggregates: resources, treasuries, trade access, faction shares, local inequality."""
+        rc = self.config.demographics.region_count
+        by_region: dict[int, list[Individual]] = defaultdict(list)
         for p in alive:
-            p.primary_goal = replan_primary_goal(p.health, p.stress, p.ambition, p.age)
+            by_region[p.region_id].append(p)
+
+        fr_list = list(food_ratio_by_region.values()) if food_ratio_by_region else [1.0]
+        mean_f = sum(fr_list) / len(fr_list)
+
+        r_raw = [self.environments[i].resource_score() for i in range(rc)]
+        r_max = max(r_raw) if r_raw else 1.0
+        if r_max < 1e-9:
+            r_norm = {i: 0.5 for i in range(rc)}
+        else:
+            r_norm = {i: r_raw[i] / r_max for i in range(rc)}
+
+        tpc = {
+            rid: self.region_treasury.get(rid, 0.0) / max(1, len(by_region.get(rid, [])))
+            for rid in range(rc)
+        }
+        t_vals = [tpc[i] for i in range(rc)]
+        lo, hi = (min(t_vals), max(t_vals)) if t_vals else (0.0, 1.0)
+        if hi - lo < 1e-9:
+            t_norm = {i: 0.5 for i in range(rc)}
+        else:
+            t_norm = {i: (tpc[i] - lo) / (hi - lo) for i in range(rc)}
+
+        trade_conn = {i: 0.0 for i in range(rc)}
+        for ra, rb in self._adjacent_region_pairs():
+            pair = (ra, rb) if ra < rb else (rb, ra)
+            if pair in self.region_trade_links:
+                trade_conn[ra] = 1.0
+                trade_conn[rb] = 1.0
+
+        faction_share: dict[int, dict[str, float]] = {i: {} for i in range(rc)}
+        wealth_spread: dict[int, float] = {}
+        med_by_r: dict[int, float] = {}
+        for rid in range(rc):
+            people = by_region.get(rid, [])
+            n = len(people)
+            if n == 0:
+                med_by_r[rid] = 0.5
+                wealth_spread[rid] = 0.2
+                faction_share[rid] = {}
+                continue
+            ws = sorted(p.wealth for p in people)
+            med_by_r[rid] = ws[n // 2]
+            if n < 2:
+                wealth_spread[rid] = 0.12
+            else:
+                mean_w = sum(ws) / n
+                var = sum((x - mean_w) ** 2 for x in ws) / (n - 1)
+                std = math.sqrt(max(0.0, var))
+                wealth_spread[rid] = min(1.0, std / (mean_w + 0.12))
+            fc: dict[str, int] = defaultdict(int)
+            for p in people:
+                fc[p.faction] += 1
+            faction_share[rid] = {f: c / n for f, c in fc.items()}
+
+        return {
+            "mean_f": mean_f,
+            "med_by_r": med_by_r,
+            "r_norm": r_norm,
+            "t_norm": t_norm,
+            "trade_conn": trade_conn,
+            "faction_share": faction_share,
+            "wealth_spread": wealth_spread,
+        }
+
+    def _world_goal_context_from_demographics(
+        self,
+        *,
+        region_id: int,
+        faction: str,
+        wealth: float,
+        food_ratio_by_region: dict[int, float],
+        civ_w: float,
+        macro: dict[str, object],
+    ) -> WorldGoalContext:
+        mean_f = float(macro["mean_f"])
+        med_by_r: dict[int, float] = macro["med_by_r"]  # type: ignore[assignment]
+        med = max(0.08, med_by_r.get(region_id, 0.5))
+        rel_poor = max(0.0, min(1.0, (med - wealth) / (med + 0.12)))
+        lf = food_ratio_by_region.get(region_id, mean_f) - mean_f
+        lf = max(-0.55, min(0.55, lf)) / 0.55
+        pol = self.region_policies.get(region_id, {})
+        fshare: dict[str, float] = macro["faction_share"][region_id]  # type: ignore[index]
+        fp = fshare.get(faction, 1.0 / max(1, len(fshare)))
+        return WorldGoalContext(
+            civ_index=civ_w,
+            global_instability=self.world_dynamics.global_instability,
+            food_inequality=self.world_dynamics.food_inequality,
+            mean_food_ratio=mean_f,
+            settlement_tier=self._settlement_tier(region_id),
+            regional_wealth_poor=rel_poor,
+            local_food_vs_world=lf,
+            resource_index_local=float(macro["r_norm"][region_id]),  # type: ignore[index]
+            treasury_strength_local=float(macro["t_norm"][region_id]),  # type: ignore[index]
+            policy_tax_burden=float(pol.get("income_tax", 0.06)),
+            policy_security=float(pol.get("theft_enforcement", 0.35)),
+            policy_institutional_openness=float(pol.get("public_gossip", 0.5)),
+            region_trade_connected=float(macro["trade_conn"][region_id]),  # type: ignore[index]
+            faction_local_power=min(1.0, max(0.0, fp)),
+            wealth_spread_local=float(macro["wealth_spread"][region_id]),  # type: ignore[index]
+        )
+
+    def _world_goal_context_for_person(
+        self,
+        person: Individual,
+        food_ratio_by_region: dict[int, float],
+        civ_w: float,
+        macro: dict[str, object],
+    ) -> WorldGoalContext:
+        return self._world_goal_context_from_demographics(
+            region_id=person.region_id,
+            faction=person.faction,
+            wealth=person.wealth,
+            food_ratio_by_region=food_ratio_by_region,
+            civ_w=civ_w,
+            macro=macro,
+        )
+
+    def _migration_institution_bonus(self, region_id: int, goal: str, macro: dict[str, object]) -> float:
+        """Extra migration pull from treasuries, taxes, trade routes, openness, resources (goal-weighted)."""
+        pol = self.region_policies.get(region_id, {})
+        tax = float(pol.get("income_tax", 0.06))
+        opn = float(pol.get("public_gossip", 0.5))
+        t_stab = float(macro["t_norm"][region_id])  # type: ignore[index]
+        trc = float(macro["trade_conn"][region_id])  # type: ignore[index]
+        r_n = float(macro["r_norm"][region_id])  # type: ignore[index]
+        tax_ease = 1.0 - min(1.0, tax / 0.2)
+        w_trade = 1.0 if goal == "trade" else (0.55 if goal == "connect" else 0.35)
+        w_survive = 1.0 if goal == "survive" else (0.62 if goal == "prosper" else 0.42)
+        b = 0.11 * t_stab * w_survive
+        b += 0.07 * tax_ease * (1.15 if goal == "accumulate" else 0.82)
+        b += 0.12 * trc * w_trade
+        b += 0.055 * opn * (1.0 if goal in ("connect", "trade") else 0.68)
+        b += 0.052 * r_n * (1.0 if goal in ("accumulate", "status") else 0.78)
+        return b
+
+    def _sample_birth_cognitive_iq(self) -> float:
+        d = max(0.0, min(1.0, float(self.config.cognition.birth_iq_diversity)))
+        mid = 0.58
+        half_w = 0.1 + 0.34 * d
+        x = self.rng.uniform(mid - half_w, mid + half_w)
+        x += self.rng.gauss(0.0, 0.018 + 0.11 * d)
+        return max(0.08, min(0.98, x))
+
+    def _settlement_tier(self, region_id: int) -> int:
+        st = self._get_settlement_structure(region_id)
+        if st is None:
+            return 0
+        lvl = str(st.get("level", "camp"))
+        return {"camp": 0, "village": 1, "town": 2, "city": 3}.get(lvl, 0)
+
+    def _refresh_region_policies(self) -> None:
+        for rid in range(self.config.demographics.region_count):
+            tier = self._settlement_tier(rid)
+            pol = default_region_policy(tier)
+            gov = str(self.politics_by_region.get(rid, {}).get("government", "informal"))
+            if gov in ("democracy", "republic"):
+                pol["theft_enforcement"] = max(0.12, pol["theft_enforcement"] - 0.09)
+                pol["public_gossip"] = min(0.98, pol["public_gossip"] + 0.08)
+                pol["income_tax"] = min(0.15, pol["income_tax"] + 0.01)
+            elif gov in ("autocracy", "monarchy"):
+                pol["theft_enforcement"] = min(0.94, pol["theft_enforcement"] + 0.12)
+                pol["public_gossip"] = max(0.22, pol["public_gossip"] - 0.06)
+                pol["income_tax"] = min(0.18, pol["income_tax"] + 0.025)
+            elif gov == "chiefdom":
+                pol["theft_enforcement"] = min(0.88, pol["theft_enforcement"] + 0.04)
+            self.region_policies[rid] = pol
+
+    def _city_public_communication(
+        self,
+        alive: list[Individual],
+        year: int,
+        id_map: dict[int, Individual],
+    ) -> list[str]:
+        out: list[str] = []
+        by_region: dict[int, list[Individual]] = defaultdict(list)
+        for p in alive:
+            by_region[p.region_id].append(p)
+        any_broadcast = False
+        for rid, residents in by_region.items():
+            if self._settlement_tier(rid) < 2:
+                continue
+            st = self._get_settlement_structure(rid)
+            if st is None:
+                continue
+            pol_state = self.politics_by_region.get(rid, {})
+            lid = pol_state.get("leader_id")
+            gossip = float(self.region_policies.get(rid, {}).get("public_gossip", 0.5))
+            if lid is not None and int(lid) in id_map:
+                leader = id_map[int(lid)]
+                spread = 0.0035 * (0.55 + leader.knowledge) * (0.45 + gossip)
+                for p in residents:
+                    if p.person_id == leader.person_id:
+                        continue
+                    p.knowledge = min(1.0, p.knowledge + spread * self.rng.uniform(0.85, 1.15))
+                    if self.rng.random() < 0.05 * gossip:
+                        p.reputation = min(1.0, p.reputation + 0.0025)
+                topic = self.rng.choice(
+                    (
+                        "market fair measures",
+                        "shared well repair",
+                        "guest rights",
+                        "granary rules after scarcity",
+                    )
+                )
+                st["last_edict"] = f"Y{year + 1}: leader #{leader.person_id} — {topic}."
+            else:
+                st["last_edict"] = f"Y{year + 1}: elders and guilds exchanged news on roads and storage."
+            any_broadcast = True
+            if gossip > 0.55 and len(residents) > 4 and self.rng.random() < 0.12:
+                a = self.rng.choice(residents)
+                b = self.rng.choice(residents)
+                if a.person_id != b.person_id:
+                    pr = normalize_pair(a.person_id, b.person_id)
+                    self._pair_trust[pr] = min(1.0, self._pair_trust.get(pr, 0.5) + 0.012 * gossip)
+        if any_broadcast and self.rng.random() < 0.18:
+            out.append(f"Y{year + 1}: towns posted public rules and news between districts.")
+        return out
+
+    def _step_economy(self, alive: list[Individual], year: int, civ_w: float) -> list[str]:
+        ecfg = self.config.economy
+        out: list[str] = []
+        if not ecfg.enabled or not alive:
+            return out
+        self._refresh_region_policies()
+        food_rr = self._food_ratio_by_region(alive)
+        for p in alive:
+            fr = food_rr.get(p.region_id, 1.0)
+            prod = self._individual_productivity(p)
+            p.wealth += 0.017 * prod * (0.55 + 0.45 * fr)
+            p.wealth = min(40.0, max(0.0, p.wealth))
+        id_map = {p.person_id: p for p in alive}
+        for person in alive:
+            nbs = [id_map[n] for n in self.contact_graph.get(person.person_id, []) if n in id_map]
+            if not nbs:
+                continue
+            for _ in range(ecfg.pairwise_trade_attempts):
+                pairwise_market_trade(
+                    self.rng,
+                    person,
+                    self.rng.choice(nbs),
+                    self._pair_trust,
+                    ecfg.trade_goal_bias,
+                )
+        theft_rounds = max(1, min(len(alive) // 60, 400)) * ecfg.theft_attempts
+        theft_seen = 0
+        for _ in range(theft_rounds):
+            thief = self.rng.choice(alive)
+            nbs = [id_map[n] for n in self.contact_graph.get(thief.person_id, []) if n in id_map]
+            if not nbs:
+                continue
+            victim = self.rng.choice(nbs)
+            if victim.person_id == thief.person_id:
+                continue
+            enf = float(self.region_policies.get(thief.region_id, {}).get("theft_enforcement", 0.3))
+            r = theft_attempt(
+                self.rng,
+                thief,
+                victim,
+                enf,
+                self._pair_trust,
+                self.friendships,
+                self.enmities,
+            )
+            if r == "theft_caught":
+                theft_seen += 1
+                self.region_treasury[thief.region_id] = self.region_treasury.get(thief.region_id, 0.0) + min(
+                    0.22,
+                    max(0.0, thief.wealth) * 0.06,
+                )
+            elif r == "theft_success":
+                theft_seen += 1
+        if theft_seen and self.rng.random() < 0.22:
+            out.append(f"Y{year + 1}: {theft_seen} theft incidents (fines or quiet losses).")
+        medians = region_wealth_medians(alive)
+        apply_income_taxes(alive, medians, self.region_policies, self.region_treasury)
+        rc = self.config.demographics.region_count
+        rscores = [self.environments[i].resource_score() for i in range(rc)]
+        inter_region_trade(
+            self.rng,
+            self.region_treasury,
+            rc,
+            rscores,
+            ecfg.inter_region_trade_volume,
+            civ_w,
+        )
+        out.extend(self._city_public_communication(alive, year, id_map))
+        return out
+
+    def _assign_replanned_goal(
+        self,
+        p: Individual,
+        ctx: WorldGoalContext,
+        wiq: float,
+        year: int,
+    ) -> None:
+        cc = self.config.cognition
+        if self.goal_policy is None:
+            p.primary_goal = brain_choose_primary_goal(p, wiq, self.rng, ctx)
+            return
+        h_vec = np.array(heuristic_goal_logits(p, ctx), dtype=np.float64)
+        x = build_goal_feature_vector(p, ctx)
+        l_vec = self.goal_policy.forward_logits(x)
+        im = max(1, cc.learned_goal_imitation_years)
+        mix = cc.learned_goal_mix * min(1.0, (year + 1) / float(im))
+        blended = blend_goal_logits(h_vec, l_vec, mix)
+        eff = effective_cognition_iq(wiq, p.cognitive_iq)
+        temp = max(0.07, 0.64 * math.exp(2.35 * (1.0 - eff)))
+        idx = _softmax_sample_index(blended.tolist(), temp, self.rng)
+        p.primary_goal = GOAL_VALUES[idx]
+        self._goal_policy_batch.append(
+            {
+                "pid": p.person_id,
+                "x": x.copy(),
+                "action": idx,
+                "h_logits": h_vec.copy(),
+                "h0": p.health,
+                "hp0": p.happiness,
+                "w0": p.wealth,
+            }
+        )
+
+    def _train_learned_goal_policy(self, year: int) -> None:
+        if self.goal_policy is None:
+            self._goal_policy_batch.clear()
+            return
+        if not self._goal_policy_batch:
+            return
+        cc = self.config.cognition
+        n_im = cc.learned_goal_imitation_years
+        id_map = {p.person_id: p for p in self.population}
+        for rec in self._goal_policy_batch:
+            x = rec["x"]  # type: ignore[assignment]
+            h_tgt = rec["h_logits"]  # type: ignore[assignment]
+            assert isinstance(x, np.ndarray) and isinstance(h_tgt, np.ndarray)
+            if year < n_im:
+                self.goal_policy.backward_imitation(x, h_tgt, cc.learned_goal_lr_imitation)
+            else:
+                pid = int(rec["pid"])  # type: ignore[arg-type]
+                p = id_map.get(pid)
+                if p is None or not p.alive:
+                    r = -1.25
+                else:
+                    r = (
+                        1.75 * (p.health - float(rec["h0"]))
+                        + 0.95 * (p.happiness - float(rec["hp0"]))
+                        + 0.11 * (p.wealth - float(rec["w0"]))
+                    )
+                r = max(-2.0, min(2.0, r))
+                self.goal_policy.backward_reinforce(x, int(rec["action"]), r, cc.learned_goal_lr)  # type: ignore[arg-type]
+        self._goal_policy_batch.clear()
+
+    def _replan_agent_goals(
+        self,
+        alive: list[Individual],
+        civ_w: float,
+        food_ratio_by_region: dict[int, float],
+        year: int,
+    ) -> None:
+        wiq = self.config.cognition.world_iq
+        macro = self._compute_macro_goal_cache(alive, food_ratio_by_region)
+        for p in alive:
+            ctx = self._world_goal_context_for_person(p, food_ratio_by_region, civ_w, macro)
+            self._assign_replanned_goal(p, ctx, wiq, year)
 
     def _update_personal_food_memory(self, alive: list[Individual]) -> None:
         food_ratio_by_region = self._food_ratio_by_region(alive)
@@ -764,6 +1321,9 @@ class SimulationEngine:
         infection_by_region = self._infection_ratio_by_region(alive)
         food_ratio_by_region = self._food_ratio_by_region(alive)
         bcfg = self.config.behavior
+        macro_mig = (
+            self._compute_macro_goal_cache(alive, food_ratio_by_region) if bcfg.enabled else {}
+        )
         for person in alive:
             migrate_prob = mcfg.migration_rate
             target_region = person.region_id
@@ -772,7 +1332,7 @@ class SimulationEngine:
                 gf, gi, gr = goal_migration_multipliers(person.primary_goal)
                 iq = 0.5 * person.knowledge + 0.5 * person.tool_skill
                 trend_scale = 0.28 + 0.55 * iq
-                best_score = -10.0
+                region_scores: list[float] = []
                 for region_id in range(self.config.demographics.region_count):
                     food_score = food_ratio_by_region.get(region_id, 1.0)
                     reg_trend = self._region_food_trend.get(region_id, 0.0)
@@ -784,9 +1344,17 @@ class SimulationEngine:
                         + inf_score * bcfg.migration_infection_weight * gi
                         + resource_score * (0.18 + person.ambition * 0.16) * gr
                     )
-                    if score > best_score:
-                        best_score = score
-                        target_region = region_id
+                    score += self._migration_institution_bonus(
+                        region_id, person.primary_goal, macro_mig
+                    )
+                    region_scores.append(score)
+                best_score = max(region_scores)
+                target_region = brain_choose_migration_region(
+                    region_scores,
+                    self.config.cognition.world_iq,
+                    person.cognitive_iq,
+                    self.rng,
+                )
 
                 cur_food = food_ratio_by_region.get(person.region_id, 1.0)
                 cur_trend = self._region_food_trend.get(person.region_id, 0.0)
@@ -795,6 +1363,9 @@ class SimulationEngine:
                     cur_food_eff * bcfg.migration_food_weight * gf
                     + (1.0 - infection_by_region.get(person.region_id, 0.0)) * bcfg.migration_infection_weight * gi
                     + self.environments[person.region_id].resource_score() * (0.18 + person.ambition * 0.16) * gr
+                )
+                current_score += self._migration_institution_bonus(
+                    person.region_id, person.primary_goal, macro_mig
                 )
                 advantage = best_score - current_score
                 ride_mobility = 1.0
@@ -815,6 +1386,9 @@ class SimulationEngine:
                     )
                 if "animal_husbandry" in self.world_inventions and bcfg.enabled:
                     migrate_prob = min(1.0, migrate_prob * (1.0 + 0.2 * person.riding_skill))
+
+            sm = max(0.05, min(2.2, self._season_migration_mult))
+            migrate_prob = min(1.0, migrate_prob * sm)
 
             if self.rng.random() < migrate_prob:
                 if bcfg.enabled and target_region != person.region_id:
@@ -986,8 +1560,10 @@ class SimulationEngine:
             head_k = max(0.07, 1.0 - person.knowledge)
             head_t = max(0.07, 1.0 - person.tool_skill)
             iq = 0.5 * person.knowledge + 0.5 * person.tool_skill
-            rate_k = 0.012 * (1.0 + 0.5 * iq) * min(1.2, head_k * 1.75)
-            rate_t = 0.01 * (1.0 + 0.45 * iq) * min(1.2, head_t * 1.75)
+            wiq = max(0.12, min(1.0, float(self.config.cognition.world_iq)))
+            learn_scale = 0.48 + 0.58 * wiq
+            rate_k = learn_scale * 0.012 * (1.0 + 0.5 * iq) * min(1.2, head_k * 1.75)
+            rate_t = learn_scale * 0.01 * (1.0 + 0.45 * iq) * min(1.2, head_t * 1.75)
             person.knowledge = min(1.0, person.knowledge + rate_k * teacher.knowledge + self.knowledge_boost)
             person.tool_skill = min(1.0, person.tool_skill + rate_t * teacher.tool_skill)
 

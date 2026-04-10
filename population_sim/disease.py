@@ -31,6 +31,7 @@ class MultiDiseaseModel:
         population: list[Individual],
         contacts: dict[int, list[int]],
         cross_region_contact_rate: float,
+        transmission_scale: float = 1.0,
     ) -> None:
         alive_map = {p.person_id: p for p in population if p.alive}
         to_infect: dict[str, set[int]] = defaultdict(set)
@@ -56,16 +57,30 @@ class MultiDiseaseModel:
                             dst=person,
                             weight=weight_ab,
                             candidates=gpu_candidates,
+                            transmission_scale=transmission_scale,
                         )
                         self._collect_pair_transmission_candidates(
                             src=person,
                             dst=neighbor,
                             weight=weight_ab,
                             candidates=gpu_candidates,
+                            transmission_scale=transmission_scale,
                         )
                     else:
-                        self._try_pair_transmission(src=neighbor, dst=person, weight=weight_ab, to_infect=to_infect)
-                        self._try_pair_transmission(src=person, dst=neighbor, weight=weight_ab, to_infect=to_infect)
+                        self._try_pair_transmission(
+                            src=neighbor,
+                            dst=person,
+                            weight=weight_ab,
+                            to_infect=to_infect,
+                            transmission_scale=transmission_scale,
+                        )
+                        self._try_pair_transmission(
+                            src=person,
+                            dst=neighbor,
+                            weight=weight_ab,
+                            to_infect=to_infect,
+                            transmission_scale=transmission_scale,
+                        )
 
         if self.gpu_enabled:
             self._resolve_gpu_transmission_candidates(gpu_candidates, to_infect)
@@ -80,6 +95,7 @@ class MultiDiseaseModel:
         dst: Individual,
         weight: float,
         candidates: dict[str, list[tuple[int, float]]],
+        transmission_scale: float = 1.0,
     ) -> None:
         if weight <= 0:
             return
@@ -99,6 +115,7 @@ class MultiDiseaseModel:
                 * (1.0 - immunity)
                 * vaccination_factor
                 * weight
+                * max(0.0, min(2.0, transmission_scale))
             )
             risk = max(0.0, min(1.0, risk))
             if risk > 0:
@@ -137,6 +154,7 @@ class MultiDiseaseModel:
         dst: Individual,
         weight: float,
         to_infect: dict[str, set[int]],
+        transmission_scale: float = 1.0,
     ) -> None:
         if weight <= 0:
             return
@@ -157,6 +175,7 @@ class MultiDiseaseModel:
                 * (1.0 - immunity)
                 * vaccination_factor
                 * weight
+                * max(0.0, min(2.0, transmission_scale))
             )
             if self.rng.random() < max(0.0, min(1.0, risk)):
                 to_infect[pathogen_name].add(dst.person_id)

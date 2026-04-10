@@ -46,6 +46,12 @@ class Individual:
     inventions_made: int  # count of breakthroughs this person originated
     mutation_burden: float
     political_power: float  # 0–1; wealth, skill, age, and office compound over time
+    # Inherited trait; combined with config.cognition.world_iq for softmax decision temperature
+    cognitive_iq: float
+    # Stored value in abstract currency (production, trade, theft, taxes)
+    wealth: float
+    # Local standing: affects theft outcomes, status goal, institutional trust
+    reputation: float
     # Yearly replanned; migration/social use these for trend-aware, goal-directed behavior
     primary_goal: str
     observed_food_ema: float
@@ -113,6 +119,28 @@ def inherit_social_profile(
 
 def inherit_riding(mother: Individual, father: Individual, rng: random.Random) -> float:
     base = (mother.riding_skill + father.riding_skill) / 2.0
+    return max(0.0, min(1.0, rng.gauss(base, 0.07)))
+
+
+def inherit_cognitive_iq(
+    mother: Individual,
+    father: Individual,
+    rng: random.Random,
+    diversity: float = 1.0,
+) -> float:
+    base = (mother.cognitive_iq + father.cognitive_iq) / 2.0
+    d = max(0.0, min(1.0, diversity))
+    std = 0.035 + 0.085 * d
+    return max(0.08, min(0.98, rng.gauss(base, std)))
+
+
+def inherit_wealth(mother: Individual, father: Individual, rng: random.Random) -> float:
+    base = max(0.05, (mother.wealth + father.wealth) / 2.0)
+    return max(0.0, rng.gauss(base, base * 0.12 + 0.08))
+
+
+def inherit_reputation(mother: Individual, father: Individual, rng: random.Random) -> float:
+    base = (mother.reputation + father.reputation) / 2.0
     return max(0.0, min(1.0, rng.gauss(base, 0.07)))
 
 

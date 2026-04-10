@@ -4,6 +4,50 @@ This project simulates a human population from early hunter-gatherer origins tow
 
 The model emphasizes **emergent outcomes**: pressure, memory, and resource geography accumulate over time—so wars, alliances, and trade arise from **world state**, not only one-off random rolls.
 
+## How the system works: “brain” vs rules
+
+### What “intelligence” means here
+
+There is **no** large language model. Goal choice uses **softmax sampling** with **temperature** from IQ. The hand-designed **heuristic** produces teacher logits; a **small learned MLP** (NumPy, trained in the loop) contributes blended logits when enabled—so part of the policy is **actually optimized** (imitation + REINFORCE), not only fixed rules. This is still **not** frontier deep RL—tiny network, simple reward—but it is legitimate **learned** structure, not “AI” as marketing-only language.
+
+### Brain-like (softmax) decisions
+
+Implemented in `population_sim/agent_cognition.py` and wired from `simulation.py`:
+
+- **Yearly primary goal** — Each living person picks among six goals: `survive`, `prosper`, `status`, `trade`, `connect`, `accumulate`. Logits combine **personal state** (health, stress, ambition, age, happiness, knowledge, tools, remembered food, wealth, reputation) with **`WorldGoalContext`**: civilization level, global instability, food inequality, mean food across regions, local settlement tier (camp→city), and how poor the person is versus the regional median wealth. **Macro layer (same context):** local food vs world mean, **resource endowment vs other regions**, **public treasury per capita** (normalized), **local policies** (income tax, theft enforcement, institutional openness), whether the **region has an open border trade route**, **faction strength in that region** (coalition/country-like bloc), and **within-region wealth spread**.
+- **Learned policy (optional but on by default)** — `population_sim/learned_policy.py` defines a **small NumPy MLP** (two layers, softmax over the same six goals). Each year its logits are **blended** with the hand-designed heuristic logits (`learned_goal_mix`), then sampled with the same IQ temperature. The network is trained **online**: first **behavioral cloning** (cross-entropy toward the heuristic distribution) for `learned_goal_imitation_years`, then **REINFORCE** using a simple end-of-year reward from health, happiness, and wealth change (penalty if the agent died). That is a **real learned policy**, not the same thing as fixed if/then rules—though it is small, not deep RL at scale. Set `CognitionConfig.learned_goal_network = False` to disable and use only the heuristic teacher.
+- **Migration destination** — Each region gets a score from food, infection, resources, and goal weights, plus a **goal-weighted institution bonus** (treasury stability, low-tax attractiveness for accumulators, trade-route hubs for traders, openness for “connect”). The engine **samples** a destination with softmax temperature from **effective IQ** (world + personal), instead of always moving to the single best region.
+
+### IQ-related settings
+
+- **`cognitive_iq`** (per person, inherited): enters **effective cognition IQ** with **`world_iq`** to set softmax temperature for goals and migration.
+- **`CognitionConfig.world_iq`** (global, “Brain IQ” slider in realtime): sharper or noisier collective decisions; also **scales social learning** (knowledge/tool copy rate) and **modulates border diplomacy** in `world_dynamics.py` (pressure, trade goodwill growth, war thresholds, war intensity).
+- **`CognitionConfig.birth_iq_diversity`** (“IQ spread (birth)” slider): how wide new people’s `cognitive_iq` is at **initial spawn** and **birth**; existing agents are unchanged when you move the slider.
+
+### Rule-based majority (explicit simulation logic)
+
+Most of the world still runs on **equations, thresholds, and config**:
+
+- Health, aging, nutrition, eras; disease transmission and outcomes; birth and death formulas; contact graphs; friendship/enmity **margin vs threshold** rules; invention unlocks; settlement upgrades (population/civ gates); war **casualty fractions** after a war event fires; taxes and treasury arithmetic.
+
+**Randomness** appears in many places (disease checks, some culture events, theft/trade attempts in the economy layer), but that is usually **event sampling from tuned probabilities**, not the same unified logits+softmax “brain” used for goals and migration.
+
+### Economy, currency, and local rules
+
+`population_sim/economy.py` and engine state add **wealth**, **reputation**, **regional treasuries**, **per-region policies** (tax rate, theft enforcement, public “gossip” openness), **pairwise trade** along contacts, **theft** with catch rules, **inter-regional treasury flows**, and **town/city broadcasts** (`last_edict` on settlements) that nudge knowledge and trust. These are **mechanical + stochastic**, not softmax policies.
+
+### Where to read the code
+
+| Piece | File(s) |
+|--------|---------|
+| Goals, softmax, `WorldGoalContext`, heuristic logits, migration sample | `agent_cognition.py` |
+| Learned goal MLP (imitation + REINFORCE) | `learned_policy.py` |
+| Economy helpers | `economy.py` |
+| Year loop, macro cache for goals/migration, policies, city comms | `simulation.py` |
+| Border tension, trade goodwill, `world_iq` diplomacy tuning | `world_dynamics.py` |
+| Person fields, inheritance | `models.py` |
+| Config (cognition, economy, …) | `config.py` |
+
 ## Demo
 
 ![Demo](Demo.gif)
@@ -30,13 +74,16 @@ The model emphasizes **emergent outcomes**: pressure, memory, and resource geogr
   - `knowledge`, `tool_skill`, `spiritual_tendency`
   - `belief_group`, `faction`, `language`
   - **`political_power`** (compounds with skills, age, and office)
+  - **`cognitive_iq`** (inherited; with `world_iq`, controls softmax “sharpness” for goals and migration)
+  - **`wealth`**, **`reputation`** (economy and standing; affect goals and some events)
+  - **`primary_goal`** (replanned yearly via logits + softmax: survive / prosper / status / trade / connect / accumulate)
 - Communication through **contact networks**
 - Relationship graph: **friendships** and **enmities** (formation is gated by trust/conflict margins modulated by **global mood**, not only independent dice)
 - Emotions and relationships affect productivity, health trajectory, and fertility outcomes
 
-### World Dynamics (Latent “AI” Layer)
+### World Dynamics (Latent global state)
 
-`population_sim/world_dynamics.py` keeps **slow-moving state** that couples regions and years:
+`population_sim/world_dynamics.py` keeps **slow-moving state** that couples regions and years (this is **not** the same as the per-agent softmax “brain,” but it drives geopolitical mood):
 
 - **Global instability**, **collective stress**, **food inequality** (spread of food per capita across regions)
 - **Per-border tension** and **trade goodwill** (inertia: pressure builds and releases)
@@ -47,7 +94,8 @@ Outcomes are **unpredictable but not meaningless**: the same snapshot rarely gua
 
 ### Geography, Resources, and Migration
 
-- **Multiple regions** (configurable `region_count`) act as a larger map; migration prefers better food, lower infection, and **regional resource scores**
+- **Seasons** — Each simulated year advances one phase in a **four-season cycle** (`SeasonConfig`: spring / summer / autumn / winter by default). Tunable multipliers adjust **regional food**, **wildlife/forage** (ecology bonus), **migration pressure**, and **disease transmission**. Disable with `seasons.enabled = False` or shift the calendar with `phase_offset`.
+- **Multiple regions** (configurable `region_count`) act as a larger map; migration uses **scored** regions (food, infection, resources, goal weights) and **softmax sampling** over those scores when behavior is enabled—not only a single “best tile” rule
 - Each region’s `Environment` carries **natural resource richness** (water, fertile land, timber, ore) and **territory size**, feeding into food and attractiveness
 - **Carrying-capacity-style** food scaling avoids runaway population that would make the sim unusably slow in late years
 
@@ -105,7 +153,7 @@ The window opens **fitted to your primary monitor** (it will not be wider or tal
 
 - **Left panel**: world timeline, city ledger, recent events
 - **Center world**: regions, terrain, structures, NPCs, social links
-- **Right panel**: live sliders for policy/parameter tuning
+- **Right panel**: live sliders for policy/parameter tuning (including **Brain IQ (world)**, **IQ spread (birth)**, and **Learned goal mix** when the MLP is enabled in config)
 
 ### Realtime Controls
 
@@ -156,12 +204,14 @@ Dependencies:
 - `main.py`: batch simulation entrypoint + summary logging
 - `realtime_view.py`: realtime visualization entrypoint
 - `run_sweep.py`: parameter grid/sensitivity runner
-- `population_sim/config.py`: configuration dataclasses
+- `population_sim/config.py`: configuration dataclasses (including cognition, economy, seasons)
 - `population_sim/models.py`: individual model + inheritance helpers
+- `population_sim/agent_cognition.py`: goals, `WorldGoalContext`, softmax sampling, migration sample helper
+- `population_sim/economy.py`: taxes, trade/theft helpers, regional policy defaults
 - `population_sim/environment.py`: regional resources and food dynamics
-- `population_sim/world_dynamics.py`: latent global/border state (tension, trade goodwill, war charge)
+- `population_sim/world_dynamics.py`: latent global/border state (tension, trade goodwill, war charge; `world_iq` hooks)
 - `population_sim/disease.py`: multi-disease transmission (optional GPU batch sampling)
-- `population_sim/simulation.py`: core engine, geopolitics, social dynamics, settlements
+- `population_sim/simulation.py`: core engine, geopolitics, social dynamics, settlements, economy step
 - `population_sim/stats.py`: metrics, CSV export
 - `population_sim/visualize.py`: batch chart rendering
 - `population_sim/sweep.py`: sweep automation
@@ -180,8 +230,8 @@ Dependencies:
 
 ## Notes
 
-- Agents are **rule-based with stateful world dynamics**, not a trained neural policy.
-- **Randomness** still appears where a continuous system needs a discrete outcome (e.g. some disease checks), but **large-scale conflict and diplomacy** lean on **accumulated pressure and thresholds** in `world_dynamics.py`.
+- **Goals** use **heuristic logits blended with a learned MLP** (optional), then **softmax + IQ temperature**; **migration** uses scored regions + softmax. Almost everything else is **rule-based** or **rule-based with random draws**.
+- **Diplomacy and war** still come from **accumulated border tension and thresholds** in `world_dynamics.py`, with **`world_iq` scaling** those dynamics—not a separate neural model.
 
 ## Suggested Next Extensions
 

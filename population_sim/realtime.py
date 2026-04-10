@@ -110,6 +110,7 @@ class RealtimeVisualizer:
         self.ui_accent = (64, 148, 220)
         self.ui_text_dim = (168, 174, 188)
         self.recent_messages: list[tuple[str, int]] = []
+        self._hud_plate_bottom = 120
         self.timeline_cache: list[str] = []
         self.last_major_event_count = 0
         self.city_scroll_offset = 0
@@ -750,9 +751,9 @@ class RealtimeVisualizer:
                 screen.blit(text, (lx + 8, ly - 26))
 
         self._draw_hud(screen, font, alive_people)
-        self._draw_messages(screen, small_font)
         self._draw_control_panel(screen, font, small_font)
         self._draw_hover_tooltip(screen, small_font)
+        self._draw_messages(screen, small_font)
 
     def _draw_regions(self, screen: pygame.Surface) -> None:
         vp = self._world_rect()
@@ -788,7 +789,8 @@ class RealtimeVisualizer:
         pathogen_rate = self.engine.config.pathogens[0].infection_rate if self.engine.config.pathogens else 0.0
         lines = [
             f"Year: {self.year}/{self.engine.config.years}   Population: {pop}   Infected: {infected}   Vaccinated: {vaccinated}",
-            f"Era: {self.engine.current_era}   CivIndex: {self.engine.civilization_index:.2f}   Cults: {self.engine.cult_count}",
+            f"Era: {self.engine.current_era}   Season: {self.engine.current_season_name}   "
+            f"CivIndex: {self.engine.civilization_index:.2f}   Cults: {self.engine.cult_count}",
             f"Emotion H/S: {avg_happiness:.2f}/{avg_stress:.2f}   Friends: {len(self.engine.friendships)}   Enemies: {len(self.engine.enmities)}   Alliances: {len(self.engine.alliances)}",
             f"Tools: {self.engine.total_tools_crafted}   Books: {self.engine.total_books_written}",
             f"Cities: {len(self.engine.city_summaries)} {self._city_line_summary()}",
@@ -820,15 +822,39 @@ class RealtimeVisualizer:
             text = font.render(line, True, col)
             screen.blit(text, (wr.left + 16, y))
             y += line_h
+        self._hud_plate_bottom = 6 + plate_h
 
     def _draw_messages(self, screen: pygame.Surface, small_font: pygame.font.Font) -> None:
         self.recent_messages = [(m, ttl - 1) for m, ttl in self.recent_messages if ttl > 1]
         wr = self._world_rect()
-        y = self._hud_top() - 4
-        for msg, _ in self.recent_messages[-6:]:
-            t = small_font.render(msg, True, (42, 48, 60))
-            screen.blit(t, (wr.left + 14, y))
-            y += max(14, min(20, self.height // 55))
+        slice_msgs = self.recent_messages[-6:]
+        if not slice_msgs:
+            return
+        line_h = max(16, min(22, self.height // 52))
+        pad_x, pad_y = 12, 10
+        rendered: list[pygame.Surface] = []
+        for msg, _ in slice_msgs:
+            text = msg if len(msg) <= 220 else msg[:217] + "…"
+            rendered.append(small_font.render(text, True, (238, 240, 248)))
+        inner_w = max(s.get_width() for s in rendered) if rendered else 0
+        block_w = min(max(160, wr.width - 24), inner_w + pad_x * 2)
+        block_h = pad_y * 2 + len(rendered) * line_h
+        y0 = self._hud_plate_bottom + 10
+        max_y = self.height - 8
+        if y0 + block_h > max_y:
+            y0 = max(8, max_y - block_h)
+        x0 = wr.left + 10
+        box = pygame.Rect(x0, y0, block_w, block_h)
+        plate = pygame.Surface((box.w, box.h), pygame.SRCALPHA)
+        plate.fill((18, 20, 28, 244))
+        pygame.draw.rect(plate, (255, 255, 255, 42), plate.get_rect(), border_radius=10)
+        blend = getattr(pygame, "BLEND_ALPHA_SDL2", 0)
+        screen.blit(plate, box.topleft, special_flags=blend)
+        pygame.draw.rect(screen, (96, 148, 212), box, 1, border_radius=10)
+        cy = y0 + pad_y
+        for surf in rendered:
+            screen.blit(surf, (x0 + pad_x, cy))
+            cy += line_h
 
     def _draw_human(self, screen: pygame.Surface, person, agent: VisualAgent) -> None:
         body_color = self._health_color(person)
@@ -910,7 +936,7 @@ class RealtimeVisualizer:
         top = max(96, min(120, int(self.height * 0.095)))
         inner_w = max(120, self.panel_width - 2 * margin_x)
         h = max(12, min(18, self.height // 70))
-        n_sliders = 8
+        n_sliders = 11
         footer = max(56, min(90, self.height // 12))
         usable = max(h * n_sliders + 8, self.height - top - footer)
         gap = max(40, min(60, usable // max(n_sliders, 1)))
@@ -965,12 +991,36 @@ class RealtimeVisualizer:
                 rect=pygame.Rect(left, top + gap * 5, inner_w, h),
             ),
             UISlider(
+                label="Brain IQ (world)",
+                min_value=0.15,
+                max_value=1.0,
+                getter=lambda: self.engine.config.cognition.world_iq,
+                setter=lambda v: setattr(self.engine.config.cognition, "world_iq", v),
+                rect=pygame.Rect(left, top + gap * 6, inner_w, h),
+            ),
+            UISlider(
+                label="IQ spread (birth)",
+                min_value=0.0,
+                max_value=1.0,
+                getter=lambda: self.engine.config.cognition.birth_iq_diversity,
+                setter=lambda v: setattr(self.engine.config.cognition, "birth_iq_diversity", v),
+                rect=pygame.Rect(left, top + gap * 7, inner_w, h),
+            ),
+            UISlider(
+                label="Learned goal mix",
+                min_value=0.0,
+                max_value=0.85,
+                getter=lambda: self.engine.config.cognition.learned_goal_mix,
+                setter=lambda v: setattr(self.engine.config.cognition, "learned_goal_mix", v),
+                rect=pygame.Rect(left, top + gap * 8, inner_w, h),
+            ),
+            UISlider(
                 label="Vaccination coverage",
                 min_value=0.0,
                 max_value=0.5,
                 getter=lambda: self.engine.config.vaccination.annual_coverage_fraction,
                 setter=lambda v: setattr(self.engine.config.vaccination, "annual_coverage_fraction", v),
-                rect=pygame.Rect(left, top + gap * 6, inner_w, h),
+                rect=pygame.Rect(left, top + gap * 9, inner_w, h),
             ),
             UISlider(
                 label="Simulation speed",
@@ -978,7 +1028,7 @@ class RealtimeVisualizer:
                 max_value=1800.0,
                 getter=lambda: float(self.step_every_frames),
                 setter=lambda v: setattr(self, "step_every_frames", max(1, min(1800, int(round(v))))),
-                rect=pygame.Rect(left, top + gap * 7, inner_w, h),
+                rect=pygame.Rect(left, top + gap * 10, inner_w, h),
             ),
         ]
 
@@ -1143,7 +1193,13 @@ class RealtimeVisualizer:
             lines.append(f"Infected: {', '.join(inf)}")
         if person.vaccinated:
             lines.append("Vaccinated: yes")
-        lines.append(f"Goal: {person.primary_goal} · Know {person.knowledge:.2f} · Tools {person.tool_skill:.2f}")
+        lines.append(
+            f"Goal: {person.primary_goal} · IQ {person.cognitive_iq:.2f} · "
+            f"Know {person.knowledge:.2f} · Tools {person.tool_skill:.2f}"
+        )
+        lines.append(
+            f"Wealth {person.wealth:.2f} · Reputation {person.reputation:.2f} (local standing)"
+        )
         if person.riding_skill > 0.08:
             lines.append(f"Riding {person.riding_skill:.2f} · Inventions made {person.inventions_made}")
         else:
@@ -1176,6 +1232,18 @@ class RealtimeVisualizer:
         if "level" in s:
             lines.append(f"Level: {s['level']}")
         lines.append(f"Id: {s.get('id', '?')}")
+        if kind == "settlement":
+            tr = float(self.engine.region_treasury.get(rid, 0.0))
+            pol = self.engine.region_policies.get(rid, {})
+            lines.append(f"Public treasury: {tr:.2f}")
+            lines.append(
+                f"Rules: tax {float(pol.get('income_tax', 0)):.2f} · "
+                f"theft watch {float(pol.get('theft_enforcement', 0)):.2f} · "
+                f"public word {float(pol.get('public_gossip', 0)):.2f}"
+            )
+            edict = s.get("last_edict")
+            if edict:
+                lines.append(str(edict)[:96])
         return lines
 
     def _clamp_tooltip_top_left(self, ox: int, oy: int, box_w: int, box_h: int) -> tuple[int, int]:
