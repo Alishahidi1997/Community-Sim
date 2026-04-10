@@ -87,6 +87,11 @@ class RealtimeVisualizer:
         self.dragging_slider: UISlider | None = None
         self.mouse_pos: tuple[int, int] = (0, 0)
         self.pinned_person_id: int | None = None
+        self.camera_x = 0.0
+        self.camera_y = 0.0
+        self.zoom = 1.0
+        self.world_dragging = False
+        self.world_drag_last: tuple[int, int] = (0, 0)
 
         self.region_colors = [
             (72, 96, 70),
@@ -149,7 +154,87 @@ class RealtimeVisualizer:
         )
 
     def _world_rect(self) -> pygame.Rect:
+        """Viewport (screen) rectangle where the map is drawn — fixed to window."""
         return pygame.Rect(self.left_panel_width, 0, self.width - self.panel_width - self.left_panel_width, self.height)
+
+    def _viewport_size(self) -> tuple[int, int]:
+        vw = max(80, self.width - self.panel_width - self.left_panel_width)
+        vh = self.height
+        return vw, vh
+
+    def _map_dimensions(self) -> tuple[int, int]:
+        """Logical world size in pixels (wider than the viewport for scrolling)."""
+        vw, vh = self._viewport_size()
+        regions = max(1, self.engine.config.demographics.region_count)
+        map_w = max(int(vw * 3.0), int(vw * min(5.0, 1.15 * regions)))
+        map_h = int(vh * 2.05)
+        return map_w, map_h
+
+    def _map_world_rect(self) -> pygame.Rect:
+        mw, mh = self._map_dimensions()
+        return pygame.Rect(0, 0, mw, mh)
+
+    def _w2s(self, wx: float, wy: float) -> tuple[int, int]:
+        z = max(0.001, self.zoom)
+        sx = int(self.left_panel_width + (wx - self.camera_x) * z)
+        sy = int((wy - self.camera_y) * z)
+        return sx, sy
+
+    def _s2w(self, sx: float, sy: float) -> tuple[float, float]:
+        z = max(0.001, self.zoom)
+        wx = (sx - self.left_panel_width) / z + self.camera_x
+        wy = sy / z + self.camera_y
+        return float(wx), float(wy)
+
+    def _zs(self, d: float) -> float:
+        """Scale a world-space length to screen pixels (for sprite sizes, stroke widths)."""
+        return d * max(0.001, self.zoom)
+
+    def _zi(self, d: float) -> int:
+        v = int(round(self._zs(d)))
+        return max(1, v) if d > 0.05 else max(0, v)
+
+    def _clamp_camera(self) -> None:
+        vw, vh = self._viewport_size()
+        mw, mh = self._map_dimensions()
+        z = max(0.001, self.zoom)
+        max_cx = max(0.0, float(mw - vw / z))
+        max_cy = max(0.0, float(mh - vh / z))
+        self.camera_x = max(0.0, min(max_cx, self.camera_x))
+        self.camera_y = max(0.0, min(max_cy, self.camera_y))
+
+    def _world_on_screen(self, wx: float, wy: float, margin: float = 80.0) -> bool:
+        vw, vh = self._viewport_size()
+        z = max(0.001, self.zoom)
+        mw = margin / z
+        return (
+            self.camera_x - mw <= wx <= self.camera_x + vw / z + mw
+            and self.camera_y - mw <= wy <= self.camera_y + vh / z + mw
+        )
+
+    def _set_zoom(self, new_zoom: float, anchor_sx: float | None = None, anchor_sy: float | None = None) -> None:
+        z = max(0.32, min(2.85, float(new_zoom)))
+        old = max(0.001, self.zoom)
+        if abs(z - old) < 1e-6:
+            return
+        vw, vh = self._viewport_size()
+        lp = float(self.left_panel_width)
+        ax = lp + vw / 2.0 if anchor_sx is None else float(anchor_sx)
+        ay = vh / 2.0 if anchor_sy is None else float(anchor_sy)
+        wx = (ax - lp) / old + self.camera_x
+        wy = ay / old + self.camera_y
+        self.zoom = z
+        self.camera_x = wx - (ax - lp) / z
+        self.camera_y = wy - ay / z
+        self._clamp_camera()
+
+    def _reset_camera_centered(self) -> None:
+        vw, vh = self._viewport_size()
+        mw, mh = self._map_dimensions()
+        z = max(0.001, self.zoom)
+        self.camera_x = max(0.0, (mw - vw / z) / 2.0)
+        self.camera_y = max(0.0, (mh - vh / z) / 2.0)
+        self._clamp_camera()
 
     def _ocean_band_height(self, world_rect: pygame.Rect) -> int:
         return max(44, min(168, int(world_rect.height * 0.14)))
@@ -173,7 +258,7 @@ class RealtimeVisualizer:
         return False
 
     def _rebuild_world_decor(self) -> None:
-        wr = self._world_rect()
+        wr = self._map_world_rect()
         r = self.terrain_seed
         self._scatter_veg = []
         self._scatter_reeds = []
@@ -320,6 +405,7 @@ class RealtimeVisualizer:
         self._build_sliders()
         self._rebuild_world_decor()
         self._clamp_agents_to_regions()
+        self._reset_camera_centered()
 
     def _clamp_agents_to_regions(self) -> None:
         for person in self.engine.population:
@@ -364,7 +450,9 @@ class RealtimeVisualizer:
                     self._layout_panels()
                     self.hills = self._build_hills()
                     self._build_sliders()
+                    self._rebuild_world_decor()
                     self._clamp_agents_to_regions()
+                    self._reset_camera_centered()
             if self._pending_resize is not None and not self._fullscreen:
                 nw, nh = self._pending_resize
                 self._pending_resize = None
@@ -374,6 +462,7 @@ class RealtimeVisualizer:
                 self._tick_simulation()
                 self._move_agents(dt)
                 self._move_visual_animals(dt)
+            self._update_camera_from_input(dt)
             self._draw(screen, font, small_font)
             pygame.display.flip()
 
@@ -403,6 +492,13 @@ class RealtimeVisualizer:
                     self._scroll_city_ledger(-3)
                 elif event.key == pygame.K_PAGEDOWN:
                     self._scroll_city_ledger(3)
+                elif event.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
+                    self._set_zoom(self.zoom * 1.12)
+                elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                    self._set_zoom(self.zoom / 1.12)
+                elif event.key == pygame.K_0:
+                    self.zoom = 1.0
+                    self._reset_camera_centered()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
                 hit_slider = False
@@ -423,16 +519,63 @@ class RealtimeVisualizer:
                 if self.dragging_slider is not None:
                     self.dragging_slider.active = False
                 self.dragging_slider = None
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 2:
+                mx, my = event.pos
+                if self.left_panel_width <= mx < self.width - self.panel_width:
+                    self.world_dragging = True
+                    self.world_drag_last = event.pos
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 2:
+                self.world_dragging = False
             elif event.type == pygame.MOUSEMOTION:
                 self.mouse_pos = event.pos
+                if self.world_dragging:
+                    mx, my = event.pos
+                    lx, ly = self.world_drag_last
+                    z = max(0.001, self.zoom)
+                    self.camera_x -= (mx - lx) / z
+                    self.camera_y -= (my - ly) / z
+                    self.world_drag_last = event.pos
+                    self._clamp_camera()
                 if self.dragging_slider is not None:
                     self.dragging_slider.set_from_x(event.pos[0])
             elif event.type == pygame.MOUSEWHEEL:
-                self._scroll_city_ledger(-event.y)
+                mx, my = self.mouse_pos
+                mods = pygame.key.get_mods()
+                if mx < self.left_panel_width:
+                    self._scroll_city_ledger(-event.y)
+                elif mx < self.width - self.panel_width:
+                    if mods & pygame.KMOD_CTRL:
+                        factor = 1.1 ** event.y
+                        self._set_zoom(self.zoom * factor, float(mx), float(my))
+                    else:
+                        z = max(0.001, self.zoom)
+                        self.camera_y -= event.y * 56.0 / z
+                        self._clamp_camera()
+                # else: over right panel — ignore wheel
             elif event.type == pygame.VIDEORESIZE and not self._fullscreen:
                 nw = max(1, int(getattr(event, "w", event.size[0])))
                 nh = max(1, int(getattr(event, "h", event.size[1])))
                 self._pending_resize = self._clamp_to_desktop(nw, nh)
+
+    def _update_camera_from_input(self, dt: float) -> None:
+        keys = pygame.key.get_pressed()
+        z = max(0.001, self.zoom)
+        spd = 480.0 * dt / z
+        moved = False
+        if keys[pygame.K_LEFT] or keys[pygame.K_a]:
+            self.camera_x -= spd
+            moved = True
+        if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+            self.camera_x += spd
+            moved = True
+        if keys[pygame.K_UP] or keys[pygame.K_w]:
+            self.camera_y -= spd
+            moved = True
+        if keys[pygame.K_DOWN] or keys[pygame.K_s]:
+            self.camera_y += spd
+            moved = True
+        if moved:
+            self._clamp_camera()
 
     def _tick_simulation(self) -> None:
         self.frame_counter += 1
@@ -468,18 +611,20 @@ class RealtimeVisualizer:
     def _hud_top(self) -> int:
         return max(64, min(88, self.height // 14))
 
+    @staticmethod
+    def _map_hud_top(map_h: int) -> int:
+        return max(64, min(88, map_h // 14))
+
     def _region_rect(self, region_id: int) -> pygame.Rect:
         regions = max(1, self.engine.config.demographics.region_count)
-        world_left = self.left_panel_width
-        world_width = self.width - self.panel_width - self.left_panel_width
-        world_width = max(80, world_width)
-        region_width = world_width / regions
-        x0 = int(world_left + region_id * region_width + 10)
-        top = self._hud_top()
-        bottom_margin = max(28, min(48, self.height // 22))
-        world_rect = self._world_rect()
-        oh = self._ocean_band_height(world_rect)
-        land_bottom = self.height - bottom_margin - oh
+        mw, mh = self._map_dimensions()
+        region_width = mw / regions
+        x0 = int(region_id * region_width + 10)
+        top = self._map_hud_top(mh)
+        bottom_margin = max(28, min(48, mh // 22))
+        mmap = self._map_world_rect()
+        oh = self._ocean_band_height(mmap)
+        land_bottom = mh - bottom_margin - oh
         return pygame.Rect(x0, top, int(region_width - 20), max(60, land_bottom - top))
 
     def _spawn_visual_agent(self, person_id: int, region_id: int) -> VisualAgent:
@@ -575,11 +720,15 @@ class RealtimeVisualizer:
                 dst = self.visual_state.get(neighbor_id)
                 if dst is None:
                     continue
+                if not self._world_on_screen(src.x, src.y, 120) and not self._world_on_screen(dst.x, dst.y, 120):
+                    continue
                 dx = src.x - dst.x
                 dy = src.y - dst.y
                 if (dx * dx + dy * dy) > 140 * 140:
                     continue
-                pygame.draw.line(screen, (100, 112, 124), (int(src.x), int(src.y)), (int(dst.x), int(dst.y)), 1)
+                a = self._w2s(src.x, src.y)
+                b = self._w2s(dst.x, dst.y)
+                pygame.draw.line(screen, (100, 112, 124), a, b, 1)
                 sample_lines += 1
                 if sample_lines > max_lines:
                     break
@@ -590,12 +739,15 @@ class RealtimeVisualizer:
             agent = self.visual_state.get(person.person_id)
             if agent is None:
                 continue
+            if not self._world_on_screen(agent.x, agent.y, 48):
+                continue
             self._draw_human(screen, person, agent)
 
             if self.show_labels and person.person_id % 20 == 0:
                 label = f"{person.person_id}:{person.health:.2f}"
                 text = small_font.render(label, True, (16, 18, 22))
-                screen.blit(text, (int(agent.x) + 8, int(agent.y) - 26))
+                lx, ly = self._w2s(agent.x, agent.y)
+                screen.blit(text, (lx + 8, ly - 26))
 
         self._draw_hud(screen, font, alive_people)
         self._draw_messages(screen, small_font)
@@ -603,30 +755,25 @@ class RealtimeVisualizer:
         self._draw_hover_tooltip(screen, small_font)
 
     def _draw_regions(self, screen: pygame.Surface) -> None:
-        world_rect = pygame.Rect(self.left_panel_width, 0, self.width - self.panel_width - self.left_panel_width, self.height)
-        self._draw_sky_gradient(screen, world_rect)
-        self._draw_sun_and_clouds(screen, world_rect)
-        self._draw_hills(screen, world_rect)
-        ground_top = max(56, self._hud_top() - 8)
-        ocean_h = self._ocean_band_height(world_rect)
-        land_h = max(50, self.height - ground_top - ocean_h)
-        ground_rect = pygame.Rect(
-            self.left_panel_width,
-            ground_top,
-            self.width - self.panel_width - self.left_panel_width,
-            land_h,
-        )
-        self._draw_ground_gradient(screen, ground_rect)
-        self._draw_river(screen, world_rect)
-        self._draw_ocean_and_seas(screen, world_rect)
+        vp = self._world_rect()
+        clip_prev = screen.get_clip()
+        screen.set_clip(vp)
+        self._draw_sky_gradient(screen, vp)
+        self._draw_sun_and_clouds(screen, vp)
+        self._draw_hills(screen, vp)
+        self._draw_ground_gradient_world(screen)
+        self._draw_river_world(screen)
+        self._draw_ocean_and_seas_world(screen)
         self._draw_region_fields(screen)
         self._draw_world_vegetation(screen)
-        self._draw_reeds_and_shore_plants(screen, world_rect)
+        mmap = self._map_world_rect()
+        self._draw_reeds_and_shore_plants(screen, mmap)
         self._draw_decorative_farmland(screen)
         self._draw_scattered_homesteads(screen)
         self._draw_world_structures(screen)
         self._draw_livestock_enclosures(screen)
         self._draw_roads(screen)
+        screen.set_clip(clip_prev)
 
     def _draw_hud(self, screen: pygame.Surface, font: pygame.font.Font, alive_people: list) -> None:
         wr = self._world_rect()
@@ -650,7 +797,7 @@ class RealtimeVisualizer:
             f"Trade routes: {len(getattr(self.engine, 'region_trade_links', []))}   Regions: {self.engine.config.demographics.region_count}",
             f"Wildlife: {getattr(self.engine, 'wildlife_index', 1.0):.2f}   Livestock: {self.engine.total_livestock():.0f}   Farms (fields): {sum(1 for s in self.engine.world_structures if s.get('kind') == 'field')}",
             f"Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}",
-            "Hover: tooltip on people, animals, settlements & fields | Controls: SPACE | sliders | ,/. | L | ESC",
+            "Map: WASD pan · wheel (Ctrl+zoom) · +/- keys · 0=reset · middle-drag | SPACE ,/. L ESC",
         ]
         line_h = max(16, min(22, self.height // 48))
         plate_h = len(lines) * line_h + 16
@@ -688,9 +835,9 @@ class RealtimeVisualizer:
         shade = self._mul_rgb(body_color, 0.78)
         accent = (52, 98, 148) if person.gender == Gender.MALE else (142, 72, 118)
         accent_soft = self._lerp_rgb(accent, (240, 240, 242), 0.35)
-        scale = max(4, min(14, int(4 + person.age / 10)))
-        x = int(agent.x)
-        y = int(agent.y)
+        zt = max(0.001, self.zoom)
+        scale = max(2, min(22, int((max(4, min(14, int(4 + person.age / 10)))) * zt)))
+        x, y = self._w2s(agent.x, agent.y)
 
         foot_y = y + scale + scale // 2 + 1
         pygame.draw.ellipse(screen, (26, 34, 30), pygame.Rect(x - scale, foot_y - 2, scale * 2, max(4, scale // 2)))
@@ -893,8 +1040,8 @@ class RealtimeVisualizer:
             pygame.draw.rect(screen, (100, 108, 124), handle, 1, border_radius=5)
 
         tips = [
-            "World: coast & land plants stay separate from the sea",
-            "Hover for details; click a person to pin a following card",
+            "Zoom: Ctrl+wheel or +/- keys · 0 resets view",
+            "Pan: WASD · wheel · middle-drag · hover / click people",
         ]
         y = self.height - 52
         for tip in tips:
@@ -904,14 +1051,17 @@ class RealtimeVisualizer:
 
     def _person_hover_radius(self, person) -> float:
         scale = max(4, min(14, int(4 + person.age / 10)))
-        return max(18.0, float(scale) * 2.7)
+        z = max(0.001, self.zoom)
+        return max(18.0, float(scale) * 2.7) / z
 
     def _animal_hover_radius(self, a: VisualAnimal) -> float:
-        return float({"bird": 12.0, "deer": 17.0, "sheep": 14.0, "cattle": 22.0}.get(a.species, 14.0))
+        z = max(0.001, self.zoom)
+        return float({"bird": 12.0, "deer": 17.0, "sheep": 14.0, "cattle": 22.0}.get(a.species, 14.0)) / z
 
     def _pick_at(self, mx: int, my: int):
         if mx < self.left_panel_width or mx >= self.width - self.panel_width:
             return None
+        wx, wy = self._s2w(mx, my)
 
         best_p = None
         best_pd = 1e9
@@ -921,7 +1071,7 @@ class RealtimeVisualizer:
             ag = self.visual_state.get(p.person_id)
             if ag is None:
                 continue
-            d = math.hypot(mx - ag.x, my - ag.y)
+            d = math.hypot(wx - ag.x, wy - ag.y)
             r = self._person_hover_radius(p)
             if d <= r and d < best_pd:
                 best_pd = d
@@ -932,7 +1082,7 @@ class RealtimeVisualizer:
         best_a = None
         best_ad = 1e9
         for a in self.visual_animals:
-            d = math.hypot(mx - a.x, my - a.y)
+            d = math.hypot(wx - a.x, wy - a.y)
             rr = self._animal_hover_radius(a)
             if d <= rr and d < best_ad:
                 best_ad = d
@@ -943,9 +1093,9 @@ class RealtimeVisualizer:
         best_s = None
         best_sd = 1e9
         for s in self.engine.world_structures:
-            sx, sy = self._structure_screen_pos(s)
-            d = math.hypot(mx - sx, my - sy)
-            if d <= 28.0 and d < best_sd:
+            sx, sy = self._structure_world_pos(s)
+            d = math.hypot(wx - sx, wy - sy)
+            if d <= 28.0 / max(0.001, self.zoom) and d < best_sd:
                 best_sd = d
                 best_s = s
         if best_s is not None:
@@ -1105,7 +1255,7 @@ class RealtimeVisualizer:
             max_w = max(max_w, t.get_width())
         box_w = max_w + pad * 2
         box_h = len(lines) * lh + pad * 2
-        ax, ay = int(agent.x), int(agent.y)
+        ax, ay = self._w2s(agent.x, agent.y)
         ox = ax + 16
         oy = ay - box_h - 12
         if oy < self._hud_top() + 4:
@@ -1153,20 +1303,15 @@ class RealtimeVisualizer:
         self.recent_messages.append((msg, 240))
 
     def _build_hills(self) -> list[list[tuple[int, int]]]:
-        world_width = self.width - self.panel_width - self.left_panel_width
+        mw, mh = self._map_dimensions()
         layers = []
         for layer_idx in range(3):
             points = []
-            base_y = int(self.height * 0.19) + layer_idx * max(36, int(self.height * 0.048))
-            for x in range(0, world_width + 40, 40):
+            base_y = int(mh * 0.19) + layer_idx * max(36, int(mh * 0.048))
+            for x in range(0, mw + 40, 40):
                 y = base_y + self.terrain_seed.randint(-25, 25)
-                points.append((self.left_panel_width + x, y))
-            points.extend(
-                [
-                    (self.left_panel_width + world_width, self.height),
-                    (self.left_panel_width, self.height),
-                ]
-            )
+                points.append((x, y))
+            points.extend([(mw, mh), (0, mh)])
             layers.append(points)
         return layers
 
@@ -1193,19 +1338,64 @@ class RealtimeVisualizer:
                 1,
             )
 
+    def _draw_ground_gradient_world(self, screen: pygame.Surface) -> None:
+        mw, mh = self._map_dimensions()
+        mmap = self._map_world_rect()
+        ground_top_w = max(56, self._map_hud_top(mh) - 8)
+        oh = self._ocean_band_height(mmap)
+        land_h = max(50, mh - ground_top_w - oh)
+        vw, vh = self._viewport_size()
+        z = max(0.001, self.zoom)
+        vy0 = int(self.camera_y)
+        vy1 = int(self.camera_y + vh / z) + 2
+        h = land_h
+        base = self.ground_color
+        dark = self._mul_rgb(base, 0.72)
+        light = self._mul_rgb(base, 1.12)
+        g0 = ground_top_w
+        g1 = ground_top_w + land_h
+        for wy in range(max(g0, vy0), min(g1, vy1)):
+            i = wy - g0
+            t = i / max(1, h - 1)
+            row = self._lerp_rgb(light, dark, t * t * 0.85)
+            if i % 7 == 0:
+                row = self._lerp_rgb(row, self._mul_rgb(row, 0.92), 0.35)
+            sx0, sy = self._w2s(0, wy)
+            sx1, _ = self._w2s(mw, wy)
+            if sx1 <= self.left_panel_width or sx0 >= self.width - self.panel_width:
+                continue
+            pygame.draw.line(screen, row, (sx0, sy), (sx1, sy), 1)
+        vx0 = int(self.camera_x)
+        vx1 = int(self.camera_x + vw / z) + 2
+        for s in range(0, mw, 17):
+            xw = s + (self.year * 3) % 11
+            if xw < vx0 - 4 or xw > vx1 + 4:
+                continue
+            shade = self._mul_rgb(dark, 0.88)
+            sx0, sy0 = self._w2s(xw, g0 + land_h // 3)
+            sx1, sy1 = self._w2s(xw + 2, g1 - 4)
+            pygame.draw.line(screen, shade, (sx0, sy0), (sx1, sy1), 1)
+
     def _draw_region_fields(self, screen: pygame.Surface) -> None:
+        z = max(0.001, self.zoom)
         for region_id in range(self.engine.config.demographics.region_count):
             rect = self._region_rect(region_id)
             base = self.region_colors[region_id % len(self.region_colors)]
             tint = pygame.Surface((max(1, rect.width), max(1, rect.height)), pygame.SRCALPHA)
             tr, tg, tb = base
             tint.fill((tr, tg, tb, 28))
-            screen.blit(tint, (rect.left, rect.top))
+            zw = max(1, int(rect.width * z))
+            zh = max(1, int(rect.height * z))
+            tint_draw = pygame.transform.smoothscale(tint, (zw, zh)) if (zw, zh) != tint.get_size() else tint
+            sl, st = self._w2s(rect.left, rect.top)
+            screen.blit(tint_draw, (sl, st))
             edge = self._mul_rgb(base, 0.55)
-            pygame.draw.rect(screen, edge, rect, 1)
+            pygame.draw.rect(screen, edge, pygame.Rect(sl, st, zw, zh), max(1, self._zi(1)))
             grid = self._mul_rgb(self.grid_color, 0.78)
             for x in range(rect.left, rect.right, 36):
-                pygame.draw.line(screen, grid, (x, rect.bottom - 22), (x + 14, rect.bottom - 2), 1)
+                p0 = self._w2s(x, rect.bottom - 22)
+                p1 = self._w2s(x + 14, rect.bottom - 2)
+                pygame.draw.line(screen, grid, p0, p1, max(1, self._zi(1)))
 
     def _draw_ocean_and_seas(self, screen: pygame.Surface, world_rect: pygame.Rect) -> None:
         oh = self._ocean_band_height(world_rect)
@@ -1255,105 +1445,185 @@ class RealtimeVisualizer:
             yf = sea_top - 4 + int(2 * math.sin((x * 0.07) + t_anim * 7))
             pygame.draw.circle(screen, (248, 252, 255), (x, yf), 1)
 
+    def _draw_ocean_and_seas_world(self, screen: pygame.Surface) -> None:
+        mmap = self._map_world_rect()
+        mw, mh = mmap.w, mmap.h
+        oh = self._ocean_band_height(mmap)
+        sea_top = mh - oh
+        t_anim = self.year * 0.07 + self.frame_counter * 0.0028
+        vw, vh = self._viewport_size()
+        z = max(0.001, self.zoom)
+        vy0 = int(self.camera_y) - 2
+        vy1 = int(self.camera_y + vh / z) + 4
+
+        y_mid = int(mh * 0.5)
+        for y in range(max(y_mid, vy0), min(mh, vy1)):
+            frac = (y - y_mid) / max(1, mh - y_mid)
+            span = int(frac * mw * 0.26) + 8
+            c = self._lerp_rgb((92, 138, 168), (34, 82, 122), min(1.0, frac * 1.05))
+            a = self._w2s(0, y)
+            b = self._w2s(span, y)
+            pygame.draw.line(screen, c, a, b, 1)
+
+        fj_w = max(24, int(mw * 0.065))
+        y0f = int(mh * 0.54)
+        for y in range(max(y0f, vy0), min(mh, vy1)):
+            frac = (y - y0f) / max(1, mh - y0f)
+            c = self._lerp_rgb((78, 128, 168), (40, 88, 128), min(1.0, frac * 0.95))
+            a = self._w2s(mw - fj_w, y)
+            b = self._w2s(mw, y)
+            pygame.draw.line(screen, c, a, b, 1)
+
+        sx0, sy0 = self._w2s(0, sea_top - 7)
+        bw = max(1, int(mw * z))
+        bh = max(1, int(9 * z))
+        pygame.draw.rect(screen, (236, 218, 182), pygame.Rect(sx0, sy0, bw, bh))
+        a = self._w2s(0, sea_top - 1)
+        b = self._w2s(mw, sea_top - 1)
+        pygame.draw.line(screen, (198, 176, 138), a, b, max(1, self._zi(2)))
+
+        shallow = (88, 154, 198)
+        mid_w = (48, 118, 168)
+        deep_w = (24, 72, 118)
+        for i in range(oh):
+            t = i / max(1, oh - 1)
+            c = self._lerp_rgb(self._lerp_rgb(shallow, mid_w, t * 0.5), deep_w, t * t * 0.88)
+            y = sea_top + i
+            if y < vy0 or y >= vy1:
+                continue
+            p0 = self._w2s(0, y)
+            p1 = self._w2s(mw, y)
+            pygame.draw.line(screen, c, p0, p1, 1)
+
+        vx0 = int(self.camera_x) - 8
+        vx1 = int(self.camera_x + vw / z) + 8
+        ew, eh = max(2, self._zi(5)), max(2, self._zi(3))
+        for x in range(max(0, vx0), min(mw, vx1), 7):
+            yw = sea_top + 12 + int(5 * math.sin((x * 0.042) + t_anim * 6))
+            sx, sy = self._w2s(x, yw)
+            pygame.draw.ellipse(screen, (120, 186, 218), pygame.Rect(sx - ew // 2, sy - eh // 2, ew, eh))
+        for x in range(max(0, vx0 + 4), min(mw, vx1), 16):
+            yf = sea_top - 4 + int(2 * math.sin((x * 0.07) + t_anim * 7))
+            sx, sy = self._w2s(x, yf)
+            pygame.draw.circle(screen, (248, 252, 255), (sx, sy), max(1, self._zi(1)))
+
     def _draw_reeds_and_shore_plants(self, screen: pygame.Surface, world_rect: pygame.Rect) -> None:
         wr = world_rect
         for nx, ny, sc in self._scatter_reeds:
-            x = int(wr.left + nx * wr.width)
-            y = int(wr.top + ny * wr.height)
-            h = int(14 * sc)
-            for off in (-3, 0, 3):
+            xw = int(wr.left + nx * wr.width)
+            yw = int(wr.top + ny * wr.height)
+            if not self._world_on_screen(float(xw), float(yw), 24):
+                continue
+            x, y = self._w2s(xw, yw)
+            h = self._zi(14 * sc)
+            for off in (-self._zi(3), 0, self._zi(3)):
                 pygame.draw.line(
                     screen,
                     (52, 108, 62),
                     (x + off, y),
                     (x + off - 1, y - h),
-                    2,
+                    max(1, self._zi(2)),
                 )
-            pygame.draw.circle(screen, (118, 168, 82), (x - 2, y - h + 2), 2)
+            pygame.draw.circle(screen, (118, 168, 82), (x - self._zi(2), y - h + self._zi(2)), max(1, self._zi(2)))
 
         oh = self._ocean_band_height(world_rect)
-        sea_top = world_rect.bottom - oh
+        sea_top = wr.bottom - oh
         for i in range(max(10, wr.width // 45)):
-            x = wr.left + 18 + (i * 53 + self.year * 7) % max(1, wr.width - 36)
-            y = sea_top - 10 + ((i * 17 + self.frame_counter // 20) % 11) - 5
-            pygame.draw.line(screen, (86, 124, 68), (x, y + 6), (x - 1, y - 8), 2)
-            pygame.draw.line(screen, (96, 138, 74), (x + 2, y + 5), (x + 1, y - 6), 1)
+            xw = wr.left + 18 + (i * 53 + self.year * 7) % max(1, wr.width - 36)
+            yw = sea_top - 10 + ((i * 17 + self.frame_counter // 20) % 11) - 5
+            if not self._world_on_screen(float(xw), float(yw), 20):
+                continue
+            x, y = self._w2s(xw, yw)
+            pygame.draw.line(screen, (86, 124, 68), (x, y + self._zi(6)), (x - 1, y - self._zi(8)), max(1, self._zi(2)))
+            pygame.draw.line(screen, (96, 138, 74), (x + self._zi(2), y + self._zi(5)), (x + 1, y - self._zi(6)), max(1, self._zi(1)))
 
     def _draw_world_vegetation(self, screen: pygame.Surface) -> None:
-        wr = self._world_rect()
+        wr = self._map_world_rect()
         for nx, ny, kind, sc in self._scatter_veg:
-            x = int(wr.left + nx * wr.width)
-            y = int(wr.top + ny * wr.height)
-            if self._is_point_over_water(wr, x, y):
+            xw = int(wr.left + nx * wr.width)
+            yw = int(wr.top + ny * wr.height)
+            if self._is_point_over_water(wr, xw, yw):
                 continue
+            if not self._world_on_screen(float(xw), float(yw), 32):
+                continue
+            x, y = self._w2s(xw, yw)
             if kind == "tree":
                 trunk = self._mul_rgb((86, 62, 48), sc)
                 foliage = self._mul_rgb((48, 92, 54), sc)
                 hi = self._mul_rgb((72, 118, 68), sc)
-                pygame.draw.rect(screen, trunk, pygame.Rect(x - 2, y - 4, 4, int(14 * sc)))
-                pygame.draw.circle(screen, foliage, (x, y - int(16 * sc)), int(10 * sc))
-                pygame.draw.circle(screen, hi, (x - int(4 * sc), y - int(18 * sc)), int(5 * sc))
+                pygame.draw.rect(screen, trunk, pygame.Rect(x - self._zi(2), y - self._zi(4), self._zi(4), self._zi(14 * sc)))
+                pygame.draw.circle(screen, foliage, (x, y - self._zi(16 * sc)), max(1, self._zi(10 * sc)))
+                pygame.draw.circle(screen, hi, (x - self._zi(4 * sc), y - self._zi(18 * sc)), max(1, self._zi(5 * sc)))
             elif kind == "pine":
                 trunk = self._mul_rgb((74, 56, 42), sc)
-                pygame.draw.rect(screen, trunk, pygame.Rect(x - 2, y - 3, 4, int(12 * sc)))
-                for i, rw in enumerate([int(14 * sc), int(11 * sc), int(8 * sc)]):
-                    oy = y - int((8 + i * 7) * sc)
+                pygame.draw.rect(screen, trunk, pygame.Rect(x - self._zi(2), y - self._zi(3), self._zi(4), self._zi(12 * sc)))
+                for i, rw in enumerate([self._zi(14 * sc), self._zi(11 * sc), self._zi(8 * sc)]):
+                    oy = y - self._zi((8 + i * 7) * sc)
                     pygame.draw.polygon(
                         screen,
                         (42, 88, 58),
-                        [(x, oy - int(10 * sc)), (x - rw, oy + 2), (x + rw, oy + 2)],
+                        [(x, oy - self._zi(10 * sc)), (x - rw, oy + self._zi(2)), (x + rw, oy + self._zi(2))],
                     )
                     pygame.draw.polygon(
                         screen,
                         (58, 118, 76),
-                        [(x, oy - int(8 * sc)), (x - rw + 2, oy + 1), (x + rw - 2, oy + 1)],
+                        [(x, oy - self._zi(8 * sc)), (x - rw + max(1, self._zi(2)), oy + 1), (x + rw - max(1, self._zi(2)), oy + 1)],
                     )
             elif kind == "palm":
                 trunk = self._mul_rgb((120, 92, 58), sc)
-                pygame.draw.rect(screen, trunk, pygame.Rect(x - 2, y - int(18 * sc), 4, int(20 * sc)))
+                pygame.draw.rect(screen, trunk, pygame.Rect(x - self._zi(2), y - self._zi(18 * sc), self._zi(4), self._zi(20 * sc)))
                 for ang in range(0, 360, 45):
                     rad = math.radians(ang + self.year * 3)
-                    x2 = x + int(14 * sc * math.cos(rad))
-                    y2 = y - int(16 * sc) + int(6 * sc * math.sin(rad))
+                    x2 = x + int(self._zs(14 * sc) * math.cos(rad))
+                    y2 = y - self._zi(16 * sc) + int(self._zs(6 * sc) * math.sin(rad))
                     pygame.draw.line(
                         screen,
                         (58, 122, 72),
-                        (x, y - int(18 * sc)),
+                        (x, y - self._zi(18 * sc)),
                         (x2, y2),
-                        2,
+                        max(1, self._zi(2)),
                     )
             elif kind == "bush":
-                pygame.draw.circle(screen, (56, 98, 58), (x, y), int(7 * sc))
-                pygame.draw.circle(screen, (68, 112, 72), (x + int(4 * sc), y - 2), int(5 * sc))
+                pygame.draw.circle(screen, (56, 98, 58), (x, y), max(1, self._zi(7 * sc)))
+                pygame.draw.circle(screen, (68, 112, 72), (x + self._zi(4 * sc), y - self._zi(2)), max(1, self._zi(5 * sc)))
             elif kind == "flowers":
+                zt = max(0.001, self.zoom)
                 for fx, fy in [(0, 0), (-4, 2), (4, 1)]:
                     ci = (x * 17 + fx * 3 + int(ny * 1000)) % 3
                     col = [(210, 92, 118), (230, 200, 88), (168, 118, 210)][ci]
-                    pygame.draw.circle(screen, col, (x + fx, y + fy), max(2, int(3 * sc)))
-                pygame.draw.line(screen, (72, 112, 58), (x, y + 4), (x, y + int(8 * sc)), 2)
+                    pygame.draw.circle(
+                        screen,
+                        col,
+                        (x + int(fx * zt), y + int(fy * zt)),
+                        max(2, self._zi(3 * sc)),
+                    )
+                pygame.draw.line(screen, (72, 112, 58), (x, y + self._zi(4)), (x, y + self._zi(8 * sc)), max(1, self._zi(2)))
             elif kind == "grass":
-                for gx in (-3, 0, 3):
-                    pygame.draw.line(screen, (64, 118, 64), (x + gx, y), (x + gx - 1, y - int(10 * sc)), 2)
+                for gx in (-self._zi(3), 0, self._zi(3)):
+                    pygame.draw.line(screen, (64, 118, 64), (x + gx, y), (x + gx - 1, y - self._zi(10 * sc)), max(1, self._zi(2)))
             elif kind == "fern":
-                pygame.draw.line(screen, (48, 98, 62), (x, y + 2), (x - int(8 * sc), y - int(10 * sc)), 2)
-                pygame.draw.line(screen, (58, 112, 72), (x, y + 2), (x + int(7 * sc), y - int(9 * sc)), 2)
-                pygame.draw.line(screen, (52, 104, 64), (x, y + 2), (x, y - int(12 * sc)), 2)
+                pygame.draw.line(screen, (48, 98, 62), (x, y + self._zi(2)), (x - self._zi(8 * sc), y - self._zi(10 * sc)), max(1, self._zi(2)))
+                pygame.draw.line(screen, (58, 112, 72), (x, y + self._zi(2)), (x + self._zi(7 * sc), y - self._zi(9 * sc)), max(1, self._zi(2)))
+                pygame.draw.line(screen, (52, 104, 64), (x, y + self._zi(2)), (x, y - self._zi(12 * sc)), max(1, self._zi(2)))
             else:
-                pygame.draw.ellipse(screen, (108, 104, 98), pygame.Rect(x - int(6 * sc), y - int(4 * sc), int(12 * sc), int(8 * sc)))
-                pygame.draw.ellipse(screen, (88, 84, 80), pygame.Rect(x - int(4 * sc), y - int(3 * sc), int(8 * sc), int(6 * sc)))
+                pygame.draw.ellipse(screen, (108, 104, 98), pygame.Rect(x - self._zi(6 * sc), y - self._zi(4 * sc), self._zi(12 * sc), self._zi(8 * sc)))
+                pygame.draw.ellipse(screen, (88, 84, 80), pygame.Rect(x - self._zi(4 * sc), y - self._zi(3 * sc), self._zi(8 * sc), self._zi(6 * sc)))
 
     def _draw_decorative_farmland(self, screen: pygame.Surface) -> None:
         if not self.engine.agriculture_unlocked:
             return
-        wr = self._world_rect()
+        wr = self._map_world_rect()
         for nx, ny, sc in self._decor_crops:
-            x = int(wr.left + nx * wr.width)
-            y = int(wr.top + ny * wr.height)
-            if self._is_point_over_water(wr, x, y):
+            xw = int(wr.left + nx * wr.width)
+            yw = int(wr.top + ny * wr.height)
+            if self._is_point_over_water(wr, xw, yw):
                 continue
-            w, h = max(10, int(22 * sc)), max(6, int(10 * sc))
+            if not self._world_on_screen(float(xw), float(yw), 28):
+                continue
+            x, y = self._w2s(xw, yw)
+            w, h = max(self._zi(10), self._zi(22 * sc)), max(self._zi(6), self._zi(10 * sc))
             pygame.draw.ellipse(screen, (138, 162, 72), pygame.Rect(x - w // 2, y - h // 2, w, h))
-            pygame.draw.line(screen, (110, 138, 58), (x - w // 2 + 2, y), (x + w // 2 - 2, y), 1)
+            pygame.draw.line(screen, (110, 138, 58), (x - w // 2 + max(1, self._zi(2)), y), (x + w // 2 - max(1, self._zi(2)), y), max(1, self._zi(1)))
 
     def _draw_scattered_homesteads(self, screen: pygame.Surface) -> None:
         by_region: dict[int, int] = {i: 0 for i in range(self.engine.config.demographics.region_count)}
@@ -1369,10 +1639,14 @@ class RealtimeVisualizer:
             for _ in range(n):
                 sx = rr.uniform(0.07, 0.93)
                 sy = rr.uniform(0.34, 0.92)
-                x = int(rect.left + sx * rect.width)
-                y = int(rect.top + sy * rect.height)
-                pygame.draw.polygon(screen, (142, 108, 78), [(x - 7, y + 4), (x, y - 8), (x + 7, y + 4)])
-                pygame.draw.rect(screen, (120, 92, 68), pygame.Rect(x - 5, y + 2, 10, 5))
+                xw = int(rect.left + sx * rect.width)
+                yw = int(rect.top + sy * rect.height)
+                if not self._world_on_screen(float(xw), float(yw), 24):
+                    continue
+                x, y = self._w2s(xw, yw)
+                o7, o8, o5 = self._zi(7), self._zi(8), self._zi(5)
+                pygame.draw.polygon(screen, (142, 108, 78), [(x - o7, y + self._zi(4)), (x, y - o8), (x + o7, y + self._zi(4))])
+                pygame.draw.rect(screen, (120, 92, 68), pygame.Rect(x - o5, y + self._zi(2), self._zi(10), self._zi(5)))
 
     def _draw_livestock_enclosures(self, screen: pygame.Surface) -> None:
         lv_map = getattr(self.engine, "livestock_by_region", {})
@@ -1382,14 +1656,18 @@ class RealtimeVisualizer:
                 continue
             rect = self._region_rect(region_id)
             rr = random.Random(self.engine.config.random_seed + region_id * 12011 + 3)
-            cx = int(rect.left + rr.uniform(0.2, 0.8) * rect.width)
-            cy = int(rect.top + rr.uniform(0.48, 0.88) * rect.height)
-            w, h = max(28, int(36 + min(40, lv))), max(20, int(24 + min(30, lv * 0.5)))
-            pygame.draw.rect(screen, (118, 98, 72), pygame.Rect(cx - w // 2, cy - h // 2, w, h), 2)
-            pygame.draw.line(screen, (92, 78, 58), (cx - w // 2, cy), (cx + w // 2, cy), 1)
+            cxw = int(rect.left + rr.uniform(0.2, 0.8) * rect.width)
+            cyw = int(rect.top + rr.uniform(0.48, 0.88) * rect.height)
+            if not self._world_on_screen(float(cxw), float(cyw), 80):
+                continue
+            cx, cy = self._w2s(cxw, cyw)
+            w = max(self._zi(28), self._zi(36 + min(40, lv)))
+            h = max(self._zi(20), self._zi(24 + min(30, lv * 0.5)))
+            pygame.draw.rect(screen, (118, 98, 72), pygame.Rect(cx - w // 2, cy - h // 2, w, h), max(1, self._zi(2)))
+            pygame.draw.line(screen, (92, 78, 58), (cx - w // 2, cy), (cx + w // 2, cy), max(1, self._zi(1)))
 
     def _sync_visual_animals(self) -> None:
-        wr = self._world_rect()
+        wr = self._map_world_rect()
         wi = float(getattr(self.engine, "wildlife_index", 1.0))
         total_lv = self.engine.total_livestock()
         n_regions = max(1, self.engine.config.demographics.region_count)
@@ -1458,7 +1736,7 @@ class RealtimeVisualizer:
         self.visual_animals = new_list if target > 0 else []
 
     def _move_visual_animals(self, dt: float) -> None:
-        wr = self._world_rect()
+        wr = self._map_world_rect()
         rr = self.rng
         for a in self.visual_animals:
             if a.species == "bird":
@@ -1505,24 +1783,26 @@ class RealtimeVisualizer:
 
     def _draw_animals(self, screen: pygame.Surface) -> None:
         for a in self.visual_animals:
-            x, y = int(a.x), int(a.y)
+            if not self._world_on_screen(a.x, a.y, 40):
+                continue
+            x, y = self._w2s(a.x, a.y)
             if a.species == "bird":
-                pygame.draw.line(screen, (52, 56, 62), (x - 4, y), (x, y - 2), 2)
-                pygame.draw.line(screen, (52, 56, 62), (x, y - 2), (x + 5, y + 1), 2)
+                pygame.draw.line(screen, (52, 56, 62), (x - self._zi(4), y), (x, y - self._zi(2)), max(1, self._zi(2)))
+                pygame.draw.line(screen, (52, 56, 62), (x, y - self._zi(2)), (x + self._zi(5), y + 1), max(1, self._zi(2)))
             elif a.species == "deer":
-                pygame.draw.ellipse(screen, (118, 86, 62), pygame.Rect(x - 5, y - 3, 12, 7))
-                pygame.draw.circle(screen, (138, 100, 72), (x + 4, y - 5), 3)
-                pygame.draw.line(screen, (72, 58, 48), (x - 2, y - 8), (x - 4, y - 11), 1)
-                pygame.draw.line(screen, (72, 58, 48), (x + 1, y - 8), (x + 2, y - 12), 1)
+                pygame.draw.ellipse(screen, (118, 86, 62), pygame.Rect(x - self._zi(5), y - self._zi(3), self._zi(12), self._zi(7)))
+                pygame.draw.circle(screen, (138, 100, 72), (x + self._zi(4), y - self._zi(5)), max(1, self._zi(3)))
+                pygame.draw.line(screen, (72, 58, 48), (x - self._zi(2), y - self._zi(8)), (x - self._zi(4), y - self._zi(11)), max(1, self._zi(1)))
+                pygame.draw.line(screen, (72, 58, 48), (x + 1, y - self._zi(8)), (x + self._zi(2), y - self._zi(12)), max(1, self._zi(1)))
             elif a.species == "sheep":
-                pygame.draw.circle(screen, (230, 228, 235), (x, y), 6)
-                pygame.draw.circle(screen, (210, 208, 218), (x - 3, y - 2), 4)
-                pygame.draw.circle(screen, (52, 48, 44), (x + 4, y - 1), 2)
+                pygame.draw.circle(screen, (230, 228, 235), (x, y), max(2, self._zi(6)))
+                pygame.draw.circle(screen, (210, 208, 218), (x - self._zi(3), y - self._zi(2)), max(1, self._zi(4)))
+                pygame.draw.circle(screen, (52, 48, 44), (x + self._zi(4), y - 1), max(1, self._zi(2)))
             else:
-                pygame.draw.ellipse(screen, (102, 74, 52), pygame.Rect(x - 9, y - 5, 18, 10))
-                pygame.draw.circle(screen, (72, 56, 44), (x + 7, y - 3), 4)
-                pygame.draw.line(screen, (48, 42, 38), (x - 6, y + 4), (x - 6, y + 9), 2)
-                pygame.draw.line(screen, (48, 42, 38), (x + 2, y + 4), (x + 2, y + 9), 2)
+                pygame.draw.ellipse(screen, (102, 74, 52), pygame.Rect(x - self._zi(9), y - self._zi(5), self._zi(18), self._zi(10)))
+                pygame.draw.circle(screen, (72, 56, 44), (x + self._zi(7), y - self._zi(3)), max(1, self._zi(4)))
+                pygame.draw.line(screen, (48, 42, 38), (x - self._zi(6), y + self._zi(4)), (x - self._zi(6), y + self._zi(9)), max(1, self._zi(2)))
+                pygame.draw.line(screen, (48, 42, 38), (x + self._zi(2), y + self._zi(4)), (x + self._zi(2), y + self._zi(9)), max(1, self._zi(2)))
 
     def _draw_sky_gradient(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
         cycle = (self.year % 240) / 240.0
@@ -1561,7 +1841,10 @@ class RealtimeVisualizer:
     def _draw_sun_and_clouds(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
         cycle = (self.year % 240) / 240.0
         pad = max(24, min(80, rect.width // 14))
-        sun_x = int(rect.left + pad + cycle * max(20, rect.width - 2 * pad))
+        parallax = int(self.camera_x * 0.08) % max(1, rect.width // 4)
+        span = max(20, rect.width - 2 * pad)
+        sun_x = int(rect.left + pad + cycle * span - parallax)
+        sun_x = max(rect.left + pad, min(rect.right - pad, sun_x))
         sun_y = int(rect.top + 72 - max(0.0, 1.0 - abs(cycle - 0.5) * 2.0) * min(52, rect.height // 8))
         glow_r = 52
         glow = pygame.Surface((glow_r * 2, glow_r * 2), pygame.SRCALPHA)
@@ -1598,17 +1881,25 @@ class RealtimeVisualizer:
         layer_colors = [(62, 98, 74), (52, 88, 66), (44, 78, 58)]
         highlights = [(88, 128, 98), (78, 118, 90), (68, 108, 82)]
         for color, hi, points in zip(layer_colors, highlights, self.hills):
-            pygame.draw.polygon(screen, color, points)
+            spoly = [self._w2s(px, py) for px, py in points]
+            pygame.draw.polygon(screen, color, spoly)
             if len(points) >= 4:
                 ridge = points[:-2]
                 if len(ridge) >= 2:
                     for i in range(len(ridge) - 1):
-                        a, b = ridge[i], ridge[i + 1]
-                        pygame.draw.line(screen, hi, a, b, 2)
+                        a = self._w2s(*ridge[i])
+                        b = self._w2s(*ridge[i + 1])
+                        pygame.draw.line(screen, hi, a, b, max(1, self._zi(2)))
                     mid = len(ridge) // 2
                     if mid > 0:
-                        p = ridge[mid]
-                        pygame.draw.line(screen, self._mul_rgb(hi, 1.08), (p[0], p[1]), (p[0] + 2, p[1] + 8), 1)
+                        p = self._w2s(*ridge[mid])
+                        pygame.draw.line(
+                            screen,
+                            self._mul_rgb(hi, 1.08),
+                            (p[0], p[1]),
+                            (p[0] + max(1, self._zi(2)), p[1] + self._zi(8)),
+                            max(1, self._zi(1)),
+                        )
 
     def _draw_river(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
         points = []
@@ -1630,6 +1921,28 @@ class RealtimeVisualizer:
             hx, hy = points[idx]
             pygame.draw.circle(screen, (200, 230, 248), (hx, hy - 1), 2)
 
+    def _draw_river_world(self, screen: pygame.Surface) -> None:
+        mw, mh = self._map_dimensions()
+        y_base = int(mh * 0.62)
+        points: list[tuple[int, int]] = []
+        for x in range(0, mw + 1, 14):
+            wave = int(16 * math.sin((x + self.year * 2.2) * 0.0095) + 5 * math.sin(x * 0.021))
+            points.append((x, y_base + wave))
+        if len(points) < 2:
+            return
+        sp = [self._w2s(float(px), float(py)) for px, py in points]
+        b0 = max(2, self._zi(16))
+        for idx in range(len(sp) - 1):
+            pygame.draw.line(screen, (48, 92, 68), sp[idx], sp[idx + 1], b0 + max(2, self._zi(6)))
+        for idx in range(len(sp) - 1):
+            pygame.draw.line(screen, (38, 98, 138), sp[idx], sp[idx + 1], b0)
+        for idx in range(len(sp) - 1):
+            pygame.draw.line(screen, (72, 142, 188), sp[idx], sp[idx + 1], max(2, self._zi(9)))
+            pygame.draw.line(screen, (118, 186, 224), sp[idx], sp[idx + 1], max(1, self._zi(4)))
+        for idx in range(0, len(sp) - 1, 5):
+            hx, hy = sp[idx]
+            pygame.draw.circle(screen, (200, 230, 248), (hx, hy - 1), max(1, self._zi(2)))
+
     def _draw_roads(self, screen: pygame.Surface) -> None:
         structures = [s for s in self.engine.world_structures if s.get("kind") in ("settlement", "school", "workshop", "temple")]
         if not structures:
@@ -1637,13 +1950,19 @@ class RealtimeVisualizer:
         settlement = next((s for s in structures if s.get("kind") == "settlement"), None)
         if settlement is None:
             return
-        sx, sy = self._structure_screen_pos(settlement)
+        swx, swy = self._structure_world_pos(settlement)
         for s in structures:
             if s is settlement:
                 continue
-            x, y = self._structure_screen_pos(s)
-            pygame.draw.line(screen, (128, 114, 86), (sx, sy), (x, y), 2)
-            pygame.draw.line(screen, (158, 142, 108), (sx, sy), (x, y), 1)
+            twx, twy = self._structure_world_pos(s)
+            if not self._world_on_screen(float(swx), float(swy), 200) and not self._world_on_screen(
+                float(twx), float(twy), 200
+            ):
+                continue
+            sx, sy = self._w2s(swx, swy)
+            x, y = self._w2s(twx, twy)
+            pygame.draw.line(screen, (128, 114, 86), (sx, sy), (x, y), max(1, self._zi(2)))
+            pygame.draw.line(screen, (158, 142, 108), (sx, sy), (x, y), max(1, self._zi(1)))
 
     def _update_timeline_cache(self) -> None:
         if len(self.engine.timeline_events) == self.last_major_event_count:
@@ -1760,7 +2079,7 @@ class RealtimeVisualizer:
         )
         screen.blit(footer, (ledger_rect.left + 8, ledger_rect.bottom - 22))
 
-    def _structure_screen_pos(self, structure: dict) -> tuple[int, int]:
+    def _structure_world_pos(self, structure: dict) -> tuple[int, int]:
         region_id = int(structure.get("region_id", 0))
         rect = self._region_rect(region_id)
         slot = float(structure.get("slot", 0.5))
@@ -1779,35 +2098,50 @@ class RealtimeVisualizer:
             y = int(y_base - 6)
         return x, y
 
+    def _structure_screen_pos(self, structure: dict) -> tuple[int, int]:
+        return self._w2s(*self._structure_world_pos(structure))
+
     def _draw_world_structures(self, screen: pygame.Surface) -> None:
         for structure in self.engine.world_structures:
             kind = structure.get("kind")
-            x, y = self._structure_screen_pos(structure)
+            wx, wy = self._structure_world_pos(structure)
+            if not self._world_on_screen(float(wx), float(wy), 100):
+                continue
+            x, y = self._w2s(wx, wy)
             if kind == "field":
-                pygame.draw.ellipse(screen, (148, 176, 78), pygame.Rect(x - 18, y - 10, 36, 20))
-                for off in (-5, 0, 5):
-                    pygame.draw.line(screen, (118, 142, 58), (x - 14, y + off), (x + 14, y + off), 1)
+                w, h = self._zi(36), self._zi(20)
+                pygame.draw.ellipse(screen, (148, 176, 78), pygame.Rect(x - w // 2, y - h // 2, w, h))
+                for off in (-self._zi(5), 0, self._zi(5)):
+                    pygame.draw.line(
+                        screen,
+                        (118, 142, 58),
+                        (x - self._zi(14), y + off),
+                        (x + self._zi(14), y + off),
+                        max(1, self._zi(1)),
+                    )
             elif kind == "settlement":
                 level = structure.get("level", "camp")
                 if level == "camp":
-                    pygame.draw.polygon(screen, (156, 117, 82), [(x - 10, y + 3), (x, y - 10), (x + 10, y + 3)])
+                    t = self._zi(10)
+                    pygame.draw.polygon(screen, (156, 117, 82), [(x - t, y + self._zi(3)), (x, y - t), (x + t, y + self._zi(3))])
                 elif level == "village":
-                    pygame.draw.rect(screen, (150, 122, 95), pygame.Rect(x - 12, y - 12, 24, 14))
+                    pygame.draw.rect(screen, (150, 122, 95), pygame.Rect(x - self._zi(12), y - self._zi(12), self._zi(24), self._zi(14)))
                 elif level == "town":
-                    pygame.draw.rect(screen, (142, 128, 120), pygame.Rect(x - 15, y - 16, 30, 18))
-                    pygame.draw.rect(screen, (120, 108, 104), pygame.Rect(x - 8, y - 24, 16, 8))
+                    pygame.draw.rect(screen, (142, 128, 120), pygame.Rect(x - self._zi(15), y - self._zi(16), self._zi(30), self._zi(18)))
+                    pygame.draw.rect(screen, (120, 108, 104), pygame.Rect(x - self._zi(8), y - self._zi(24), self._zi(16), self._zi(8)))
                 else:  # city
-                    pygame.draw.rect(screen, (125, 125, 132), pygame.Rect(x - 16, y - 20, 32, 22))
-                    pygame.draw.rect(screen, (112, 112, 120), pygame.Rect(x - 4, y - 34, 8, 14))
+                    pygame.draw.rect(screen, (125, 125, 132), pygame.Rect(x - self._zi(16), y - self._zi(20), self._zi(32), self._zi(22)))
+                    pygame.draw.rect(screen, (112, 112, 120), pygame.Rect(x - self._zi(4), y - self._zi(34), self._zi(8), self._zi(14)))
             elif kind == "school":
-                pygame.draw.rect(screen, (204, 214, 235), pygame.Rect(x - 10, y - 14, 20, 12))
-                pygame.draw.line(screen, (95, 105, 130), (x - 8, y - 3), (x + 8, y - 3), 2)
+                pygame.draw.rect(screen, (204, 214, 235), pygame.Rect(x - self._zi(10), y - self._zi(14), self._zi(20), self._zi(12)))
+                pygame.draw.line(screen, (95, 105, 130), (x - self._zi(8), y - self._zi(3)), (x + self._zi(8), y - self._zi(3)), max(1, self._zi(2)))
             elif kind == "workshop":
-                pygame.draw.rect(screen, (168, 168, 176), pygame.Rect(x - 10, y - 14, 20, 12))
-                pygame.draw.rect(screen, (110, 110, 116), pygame.Rect(x + 4, y - 20, 4, 8))
+                pygame.draw.rect(screen, (168, 168, 176), pygame.Rect(x - self._zi(10), y - self._zi(14), self._zi(20), self._zi(12)))
+                pygame.draw.rect(screen, (110, 110, 116), pygame.Rect(x + self._zi(4), y - self._zi(20), self._zi(4), self._zi(8)))
             elif kind == "temple":
-                pygame.draw.polygon(screen, (184, 160, 205), [(x - 11, y - 2), (x, y - 16), (x + 11, y - 2)])
-                pygame.draw.rect(screen, (168, 144, 190), pygame.Rect(x - 8, y - 2, 16, 10))
+                t = self._zi(11)
+                pygame.draw.polygon(screen, (184, 160, 205), [(x - t, y - self._zi(2)), (x, y - self._zi(16)), (x + t, y - self._zi(2))])
+                pygame.draw.rect(screen, (168, 144, 190), pygame.Rect(x - self._zi(8), y - self._zi(2), self._zi(16), self._zi(10)))
 
     def _preferred_structure_target(self, person) -> tuple[float, float] | None:
         best: tuple[float, float] | None = None
@@ -1828,7 +2162,7 @@ class RealtimeVisualizer:
             elif kind == "settlement":
                 score = 0.2
             if score > best_score:
-                sx, sy = self._structure_screen_pos(structure)
+                sx, sy = self._structure_world_pos(structure)
                 best = (float(sx), float(sy))
                 best_score = score
         return best
