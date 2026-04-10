@@ -8,6 +8,11 @@ from typing import Callable
 
 import pygame
 
+try:
+    import pygame.gfxdraw as _gfxdraw
+except Exception:  # pragma: no cover
+    _gfxdraw = None
+
 from population_sim.models import DiseaseState, Gender
 from population_sim.simulation import SimulationEngine
 
@@ -90,6 +95,35 @@ class RealtimeVisualizer:
         self.terrain_seed = random.Random(engine.config.random_seed + 2026)
         self.hills = self._build_hills()
         self._build_sliders()
+        self._cloud_offsets: list[tuple[float, float, float, int]] = []
+        self._init_cloud_layout()
+
+    def _init_cloud_layout(self) -> None:
+        r = self.terrain_seed
+        self._cloud_offsets = [
+            (0.11 + r.random() * 0.04, 0.12 + r.random() * 0.06, 0.9 + r.random() * 0.35, 16 + r.randint(0, 8)),
+            (0.28 + r.random() * 0.05, 0.14 + r.random() * 0.05, 0.85 + r.random() * 0.3, 14 + r.randint(0, 7)),
+            (0.48 + r.random() * 0.06, 0.11 + r.random() * 0.05, 0.95 + r.random() * 0.4, 15 + r.randint(0, 9)),
+            (0.68 + r.random() * 0.05, 0.15 + r.random() * 0.06, 0.8 + r.random() * 0.25, 13 + r.randint(0, 6)),
+            (0.82 + r.random() * 0.04, 0.13 + r.random() * 0.05, 0.88 + r.random() * 0.3, 12 + r.randint(0, 5)),
+        ]
+
+    @staticmethod
+    def _lerp_rgb(a: tuple[int, int, int], b: tuple[int, int, int], t: float) -> tuple[int, int, int]:
+        t = max(0.0, min(1.0, t))
+        return (
+            int(a[0] + (b[0] - a[0]) * t),
+            int(a[1] + (b[1] - a[1]) * t),
+            int(a[2] + (b[2] - a[2]) * t),
+        )
+
+    @staticmethod
+    def _mul_rgb(rgb: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
+        return (
+            max(0, min(255, int(rgb[0] * factor))),
+            max(0, min(255, int(rgb[1] * factor))),
+            max(0, min(255, int(rgb[2] * factor))),
+        )
 
     def _desktop_pixel_size(self) -> tuple[int, int]:
         """Primary monitor size in pixels (for clamping window and true fullscreen)."""
@@ -167,7 +201,7 @@ class RealtimeVisualizer:
         # Default size was wider than many monitors; fit to screen on first open.
         self._apply_window_size(self.width, self.height)
         screen = pygame.display.set_mode((self.width, self.height), win_flags)
-        pygame.display.set_caption("Population Dynamics - 2D Human Agents")
+        pygame.display.set_caption("Population Dynamics — live world view")
         clock = pygame.time.Clock()
         font = pygame.font.SysFont("consolas", 18)
         small_font = pygame.font.SysFont("consolas", 15)
@@ -356,12 +390,18 @@ class RealtimeVisualizer:
     def _health_color(self, person) -> tuple[int, int, int]:
         any_infected = any(state == DiseaseState.INFECTED for state in person.disease_states.values())
         if any_infected:
-            return (220, 55, 55)
-        if person.health > 0.7:
-            return (70, 200, 90)
-        if person.health > 0.4:
-            return (240, 180, 60)
-        return (190, 95, 35)
+            return (198, 72, 82)
+        flesh_hi = (232, 205, 188)
+        flesh_mid = (214, 178, 152)
+        flesh_lo = (186, 142, 118)
+        sick = (168, 128, 108)
+        if person.health > 0.72:
+            return self._lerp_rgb(flesh_mid, flesh_hi, (person.health - 0.72) / 0.28)
+        if person.health > 0.45:
+            return self._lerp_rgb(flesh_lo, flesh_mid, (person.health - 0.45) / 0.27)
+        if person.health > 0.22:
+            return self._lerp_rgb(sick, flesh_lo, (person.health - 0.22) / 0.23)
+        return self._mul_rgb(sick, 0.92)
 
     def _draw(self, screen: pygame.Surface, font: pygame.font.Font, small_font: pygame.font.Font) -> None:
         screen.fill(self.bg_color)
@@ -385,7 +425,7 @@ class RealtimeVisualizer:
                 dy = src.y - dst.y
                 if (dx * dx + dy * dy) > 140 * 140:
                     continue
-                pygame.draw.line(screen, (56, 74, 92), (int(src.x), int(src.y)), (int(dst.x), int(dst.y)), 1)
+                pygame.draw.line(screen, (100, 112, 124), (int(src.x), int(src.y)), (int(dst.x), int(dst.y)), 1)
                 sample_lines += 1
                 if sample_lines > max_lines:
                     break
@@ -410,7 +450,6 @@ class RealtimeVisualizer:
         self._draw_sky_gradient(screen, world_rect)
         self._draw_sun_and_clouds(screen, world_rect)
         self._draw_hills(screen, world_rect)
-        self._draw_river(screen, world_rect)
         ground_top = max(56, self._hud_top() - 8)
         ground_rect = pygame.Rect(
             self.left_panel_width,
@@ -418,14 +457,9 @@ class RealtimeVisualizer:
             self.width - self.panel_width - self.left_panel_width,
             max(40, self.height - ground_top),
         )
-        pygame.draw.rect(screen, self.ground_color, ground_rect)
-
-        for region_id in range(self.engine.config.demographics.region_count):
-            rect = self._region_rect(region_id)
-            region_color = self.region_colors[region_id % len(self.region_colors)]
-            pygame.draw.rect(screen, region_color, rect, 1)
-            for x in range(rect.left, rect.right, 32):
-                pygame.draw.line(screen, self.grid_color, (x, rect.bottom - 24), (x + 16, rect.bottom), 1)
+        self._draw_ground_gradient(screen, ground_rect)
+        self._draw_river(screen, world_rect)
+        self._draw_region_fields(screen)
         self._draw_world_structures(screen)
         self._draw_roads(screen)
 
@@ -468,40 +502,64 @@ class RealtimeVisualizer:
 
     def _draw_human(self, screen: pygame.Surface, person, agent: VisualAgent) -> None:
         body_color = self._health_color(person)
-        accent = (35, 90, 180) if person.gender == Gender.MALE else (180, 65, 150)
+        shade = self._mul_rgb(body_color, 0.78)
+        accent = (52, 98, 148) if person.gender == Gender.MALE else (142, 72, 118)
+        accent_soft = self._lerp_rgb(accent, (240, 240, 242), 0.35)
         scale = max(4, min(14, int(4 + person.age / 10)))
         x = int(agent.x)
         y = int(agent.y)
 
-        head_r = max(2, scale // 3)
+        foot_y = y + scale + scale // 2 + 1
+        pygame.draw.ellipse(screen, (26, 34, 30), pygame.Rect(x - scale, foot_y - 2, scale * 2, max(4, scale // 2)))
+
+        head_r = max(3, scale // 3)
         head_y = y - scale
-        pygame.draw.circle(screen, body_color, (x, head_y), head_r)
+        hair = self._mul_rgb((72, 58, 48), 0.9 + min(0.2, person.age / 200.0))
+        if _gfxdraw is not None:
+            try:
+                _gfxdraw.filled_circle(screen, x, head_y, head_r + 1, hair)
+                _gfxdraw.filled_circle(screen, x, head_y, head_r, body_color)
+                _gfxdraw.aacircle(screen, x, head_y, head_r, body_color)
+            except (TypeError, pygame.error):
+                pygame.draw.circle(screen, hair, (x, head_y - 1), head_r + 1)
+                pygame.draw.circle(screen, body_color, (x, head_y), head_r)
+        else:
+            pygame.draw.circle(screen, hair, (x, head_y - 1), head_r + 1)
+            pygame.draw.circle(screen, body_color, (x, head_y), head_r)
 
         torso_top = (x, head_y + head_r)
         torso_bottom = (x, y + scale)
-        pygame.draw.line(screen, body_color, torso_top, torso_bottom, 2)
+        pygame.draw.line(screen, shade, (x + 1, torso_top[1]), (torso_bottom[0] + 1, torso_bottom[1]), max(2, scale // 4))
+        pygame.draw.line(screen, body_color, torso_top, torso_bottom, max(2, scale // 4))
 
-        pygame.draw.line(screen, body_color, (x - scale // 2, y - scale // 4), (x + scale // 2, y - scale // 4), 2)
+        arm_y = y - scale // 4
+        pygame.draw.line(screen, shade, (x - scale // 2 + 1, arm_y + 1), (x + scale // 2 + 1, arm_y + 1), 2)
+        pygame.draw.line(screen, body_color, (x - scale // 2, arm_y), (x + scale // 2, arm_y), 2)
+        pygame.draw.line(screen, shade, (torso_bottom[0] + 1, torso_bottom[1]), (x - scale // 2 + 1, y + scale + scale // 2 + 1), 2)
         pygame.draw.line(screen, body_color, torso_bottom, (x - scale // 2, y + scale + scale // 2), 2)
+        pygame.draw.line(screen, shade, (torso_bottom[0] + 1, torso_bottom[1]), (x + scale // 2 + 1, y + scale + scale // 2 + 1), 2)
         pygame.draw.line(screen, body_color, torso_bottom, (x + scale // 2, y + scale + scale // 2), 2)
 
         if person.gender == Gender.FEMALE:
             skirt = [(x, y + scale // 2), (x - scale // 2, y + scale + 2), (x + scale // 2, y + scale + 2)]
+            pygame.draw.polygon(screen, accent_soft, skirt)
             pygame.draw.polygon(screen, accent, skirt, 1)
         else:
-            pygame.draw.circle(screen, accent, (x, y - scale // 2), 2)
+            pygame.draw.circle(screen, accent, (x, y - scale // 2), 3)
+            pygame.draw.circle(screen, self._mul_rgb(accent, 1.15), (x - 1, y - scale // 2 - 1), 1)
 
-        # Strategy-game iconography for knowledge/tools/spiritual role.
         if person.tool_skill > 0.6:
-            pygame.draw.rect(screen, (175, 175, 185), pygame.Rect(x - 1, y + scale + 3, 3, 5))
+            pygame.draw.rect(screen, (138, 140, 148), pygame.Rect(x - 2, y + scale + 2, 4, 6))
+            pygame.draw.rect(screen, (168, 170, 178), pygame.Rect(x - 1, y + scale + 3, 2, 4))
         if person.knowledge > 0.6:
-            pygame.draw.circle(screen, (230, 230, 180), (x + scale // 2 + 2, y - scale), 2)
+            pygame.draw.circle(screen, (228, 210, 140), (x + scale // 2 + 3, head_y - 1), 3)
         if person.spiritual_tendency > 0.75:
-            pygame.draw.circle(screen, (210, 150, 230), (x - scale // 2 - 2, y - scale), 2, 1)
+            pygame.draw.circle(screen, (188, 150, 210), (x - scale // 2 - 3, head_y), 3, 1)
 
         pol = self.engine.politics_by_region.get(person.region_id, {})
         if pol.get("leader_id") == person.person_id:
-            pygame.draw.circle(screen, (218, 186, 52), (x, head_y), head_r + 4, 2)
+            pygame.draw.circle(screen, (218, 186, 52), (x, head_y), head_r + 5, 2)
+            pygame.draw.circle(screen, (240, 220, 140), (x, head_y), head_r + 3, 1)
 
     def _politics_summary(self) -> str:
         pol = self.engine.politics_by_region.get(0, {})
@@ -657,65 +715,148 @@ class RealtimeVisualizer:
             layers.append(points)
         return layers
 
+    def _draw_ground_gradient(self, screen: pygame.Surface, ground_rect: pygame.Rect) -> None:
+        h = max(1, ground_rect.height)
+        base = self.ground_color
+        dark = self._mul_rgb(base, 0.72)
+        light = self._mul_rgb(base, 1.12)
+        for i in range(h):
+            t = i / h
+            row = self._lerp_rgb(light, dark, t * t * 0.85)
+            if i % 7 == 0:
+                row = self._lerp_rgb(row, self._mul_rgb(row, 0.92), 0.35)
+            y = ground_rect.top + i
+            pygame.draw.line(screen, row, (ground_rect.left, y), (ground_rect.right, y), 1)
+        for s in range(0, ground_rect.width, 17):
+            x = ground_rect.left + s + (self.year * 3) % 11
+            shade = self._mul_rgb(dark, 0.88)
+            pygame.draw.line(
+                screen,
+                shade,
+                (x, ground_rect.top + h // 3),
+                (x + 2, ground_rect.bottom - 4),
+                1,
+            )
+
+    def _draw_region_fields(self, screen: pygame.Surface) -> None:
+        for region_id in range(self.engine.config.demographics.region_count):
+            rect = self._region_rect(region_id)
+            base = self.region_colors[region_id % len(self.region_colors)]
+            tint = pygame.Surface((max(1, rect.width), max(1, rect.height)), pygame.SRCALPHA)
+            tr, tg, tb = base
+            tint.fill((tr, tg, tb, 28))
+            screen.blit(tint, (rect.left, rect.top))
+            edge = self._mul_rgb(base, 0.55)
+            pygame.draw.rect(screen, edge, rect, 1)
+            grid = self._mul_rgb(self.grid_color, 0.78)
+            for x in range(rect.left, rect.right, 36):
+                pygame.draw.line(screen, grid, (x, rect.bottom - 22), (x + 14, rect.bottom - 2), 1)
+
     def _draw_sky_gradient(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
         cycle = (self.year % 240) / 240.0
-        day_factor = max(0.2, 1.0 - abs(cycle - 0.5) * 1.7)
-        top = (
-            int(36 + 70 * day_factor),
-            int(56 + 90 * day_factor),
-            int(90 + 140 * day_factor),
+        day_factor = max(0.22, 1.0 - abs(cycle - 0.5) * 1.65)
+        zenith = (
+            int(28 + 55 * day_factor),
+            int(48 + 85 * day_factor),
+            int(92 + 118 * day_factor),
         )
-        bottom = (
-            int(76 + 120 * day_factor),
-            int(96 + 130 * day_factor),
-            int(120 + 135 * day_factor),
+        horizon = (
+            int(118 + 95 * day_factor),
+            int(152 + 78 * day_factor),
+            int(188 + 62 * day_factor),
+        )
+        haze = (
+            int(200 + 40 * day_factor),
+            int(188 + 35 * day_factor),
+            int(168 + 50 * day_factor),
         )
         height = max(1, rect.height)
+        horizon_y = int(rect.height * 0.58)
         for i in range(height):
-            t = i / height
-            color = (
-                int(top[0] + (bottom[0] - top[0]) * t),
-                int(top[1] + (bottom[1] - top[1]) * t),
-                int(top[2] + (bottom[2] - top[2]) * t),
-            )
-            y = rect.top + i
-            pygame.draw.line(screen, color, (rect.left, y), (rect.right, y), 1)
+            y_world = rect.top + i
+            if i < horizon_y:
+                t = i / max(1, horizon_y)
+                t_ease = t * t * (3.0 - 2.0 * t)
+                color = self._lerp_rgb(zenith, horizon, t_ease)
+            else:
+                t = (i - horizon_y) / max(1, height - horizon_y)
+                color = self._lerp_rgb(horizon, haze, min(1.0, t * 1.35))
+            if i == horizon_y:
+                glow = self._lerp_rgb(horizon, (255, 228, 200), 0.22 * day_factor)
+                color = glow
+            pygame.draw.line(screen, color, (rect.left, y_world), (rect.right, y_world), 1)
 
     def _draw_sun_and_clouds(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
         cycle = (self.year % 240) / 240.0
         pad = max(24, min(80, rect.width // 14))
         sun_x = int(rect.left + pad + cycle * max(20, rect.width - 2 * pad))
-        sun_y = int(rect.top + 80 - max(0.0, 1.0 - abs(cycle - 0.5) * 2.0) * min(55, rect.height // 8))
-        pygame.draw.circle(screen, (255, 232, 140), (sun_x, sun_y), 34)
-        pygame.draw.circle(screen, (255, 244, 190), (sun_x - 8, sun_y - 8), 10)
-        cloud_color = (245, 250, 255)
+        sun_y = int(rect.top + 72 - max(0.0, 1.0 - abs(cycle - 0.5) * 2.0) * min(52, rect.height // 8))
+        glow_r = 52
+        glow = pygame.Surface((glow_r * 2, glow_r * 2), pygame.SRCALPHA)
+        for r, a in [(46, 18), (36, 35), (26, 58), (16, 85), (9, 120)]:
+            pygame.draw.circle(glow, (255, 248, 220, a), (glow_r, glow_r), r)
+        blend = getattr(pygame, "BLEND_ALPHA_SDL2", 0)
+        screen.blit(glow, (sun_x - glow_r, sun_y - glow_r), special_flags=blend)
+        pygame.draw.circle(screen, (255, 248, 210), (sun_x, sun_y), 22)
+        pygame.draw.circle(screen, (255, 255, 235), (sun_x - 6, sun_y - 5), 8)
+        drift = (self.year * 2.7 + self.frame_counter * 0.02) % (rect.width * 0.4)
         rw = max(80, rect.width)
-        for ox, oy in [(0.14, 0.16), (0.32, 0.21), (0.52, 0.17)]:
-            cx = int(rect.left + ox * rw)
-            cy = int(rect.top + oy * max(120, rect.height * 0.35))
-            pygame.draw.circle(screen, cloud_color, (cx, cy), 18)
-            pygame.draw.circle(screen, cloud_color, (cx + 20, cy - 4), 16)
-            pygame.draw.circle(screen, cloud_color, (cx + 38, cy), 14)
-        if cycle < 0.16 or cycle > 0.84:
-            step = max(48, min(90, rect.width // 10))
-            for sx in range(rect.left + 40, rect.right - 40, step):
-                pygame.draw.circle(screen, (240, 240, 255), (sx, rect.top + 42 + (sx % 20)), 1)
+        cloud_surf = pygame.Surface((rect.width, int(rect.height * 0.42) + 40), pygame.SRCALPHA)
+        for ox, oy, sc, r_base in self._cloud_offsets:
+            cx = int(ox * rw - drift * 0.15) % (rw + 80) - 20
+            cy = int(oy * max(100, rect.height * 0.32))
+            alpha = 76
+            base = (250, 252, 255, alpha)
+            sh = (205, 214, 232, min(110, alpha + 32))
+            for dx, dy, rr, col in [
+                (0, 7, max(6, int(r_base * sc * 0.45)), sh),
+                (0, 0, max(7, int(r_base * sc * 0.5)), base),
+                (max(10, int(18 * sc)), -4, max(6, int(r_base * sc * 0.42)), base),
+                (max(18, int(34 * sc)), 2, max(5, int(r_base * sc * 0.38)), base),
+            ]:
+                pygame.draw.circle(cloud_surf, col, (cx + dx, cy + dy), rr)
+        screen.blit(cloud_surf, (rect.left, rect.top), special_flags=blend)
+        if cycle < 0.14 or cycle > 0.86:
+            step = max(52, min(96, rect.width // 9))
+            for sx in range(rect.left + 36, rect.right - 36, step):
+                pygame.draw.circle(screen, (230, 232, 245), (sx, rect.top + 38 + (sx % 17)), 1)
 
     def _draw_hills(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
         del rect
-        layer_colors = [(78, 128, 92), (68, 112, 82), (60, 102, 72)]
-        for color, points in zip(layer_colors, self.hills):
+        layer_colors = [(62, 98, 74), (52, 88, 66), (44, 78, 58)]
+        highlights = [(88, 128, 98), (78, 118, 90), (68, 108, 82)]
+        for color, hi, points in zip(layer_colors, highlights, self.hills):
             pygame.draw.polygon(screen, color, points)
+            if len(points) >= 4:
+                ridge = points[:-2]
+                if len(ridge) >= 2:
+                    for i in range(len(ridge) - 1):
+                        a, b = ridge[i], ridge[i + 1]
+                        pygame.draw.line(screen, hi, a, b, 2)
+                    mid = len(ridge) // 2
+                    if mid > 0:
+                        p = ridge[mid]
+                        pygame.draw.line(screen, self._mul_rgb(hi, 1.08), (p[0], p[1]), (p[0] + 2, p[1] + 8), 1)
 
     def _draw_river(self, screen: pygame.Surface, rect: pygame.Rect) -> None:
         points = []
-        y_base = rect.top + int(rect.height * 0.64)
-        for x in range(rect.left, rect.right + 1, 20):
-            wave = int(18 * math.sin((x + self.year * 2.2) * 0.01))
+        y_base = rect.top + int(rect.height * 0.62)
+        for x in range(rect.left, rect.right + 1, 14):
+            wave = int(16 * math.sin((x + self.year * 2.2) * 0.0095) + 5 * math.sin(x * 0.021))
             points.append((x, y_base + wave))
+        if len(points) < 2:
+            return
+        bank_w = 16
         for idx in range(len(points) - 1):
-            pygame.draw.line(screen, (76, 154, 220), points[idx], points[idx + 1], 10)
-            pygame.draw.line(screen, (102, 178, 235), points[idx], points[idx + 1], 4)
+            pygame.draw.line(screen, (48, 92, 68), points[idx], points[idx + 1], bank_w + 6)
+        for idx in range(len(points) - 1):
+            pygame.draw.line(screen, (38, 98, 138), points[idx], points[idx + 1], bank_w)
+        for idx in range(len(points) - 1):
+            pygame.draw.line(screen, (72, 142, 188), points[idx], points[idx + 1], 9)
+            pygame.draw.line(screen, (118, 186, 224), points[idx], points[idx + 1], 4)
+        for idx in range(0, len(points) - 1, 5):
+            hx, hy = points[idx]
+            pygame.draw.circle(screen, (200, 230, 248), (hx, hy - 1), 2)
 
     def _draw_roads(self, screen: pygame.Surface) -> None:
         structures = [s for s in self.engine.world_structures if s.get("kind") in ("settlement", "school", "workshop", "temple")]
