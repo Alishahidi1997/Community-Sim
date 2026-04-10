@@ -16,6 +16,7 @@ from population_sim.models import (
     Gender,
     Individual,
     inherit_emotions,
+    inherit_riding,
     inherit_social_profile,
     inherit_traits,
     random_emotional_profile,
@@ -77,6 +78,8 @@ class SimulationEngine:
         self._region_food_prev: dict[int, float] = {}
         self._region_food_trend: dict[int, float] = {}
         self._pair_trust: dict[tuple[int, int], float] = {}
+        # Cultural tech shared across the world; individuals contribute via invention events.
+        self.world_inventions: set[str] = set()
         self._initialize_population()
 
     def _initialize_population(self) -> None:
@@ -115,6 +118,8 @@ class SimulationEngine:
                     language=language,
                     personal_tools=0,
                     books_authored=0,
+                    riding_skill=0.0,
+                    inventions_made=0,
                     mutation_burden=0.0,
                     political_power=self.rng.uniform(0.14, 0.28),
                     primary_goal=replan_primary_goal(h0, stress, ambition, age0),
@@ -157,6 +162,8 @@ class SimulationEngine:
                     language=language,
                     personal_tools=0,
                     books_authored=0,
+                    riding_skill=0.0,
+                    inventions_made=0,
                     mutation_burden=0.0,
                     political_power=self.rng.uniform(0.12, 0.32),
                     primary_goal=replan_primary_goal(h0, stress, ambition, age),
@@ -211,6 +218,8 @@ class SimulationEngine:
         self.world_dynamics.update_global(
             pop_n, avg_stress_w, food_ratios_list, civ_w, self._world_aggression()
         )
+        culture_stories = self._step_culture_inventions_and_riding(alive, year, civ_w)
+        stories.extend(culture_stories)
         diplomacy_stories, diplomacy_deaths = self._simulate_regional_diplomacy(alive, year)
         stories.extend(diplomacy_stories)
         deaths += diplomacy_deaths
@@ -228,6 +237,7 @@ class SimulationEngine:
         self._simulate_social_dynamics(alive)
         self._rebuild_social_degree_cache()
         self._apply_social_learning(alive)
+        self._step_belief_evolution(alive)
         self._craft_tools_and_books(alive, year)
         alliance_stories, alliance_deaths = self._simulate_alliances_and_war(alive, year)
         stories.extend(alliance_stories)
@@ -373,6 +383,7 @@ class SimulationEngine:
             traits = inherit_traits(mother, father, self.rng)
             knowledge, tool_skill, spiritual, belief_group = inherit_social_profile(mother, father, self.rng)
             happiness, stress, aggression, ambition = inherit_emotions(mother, father, self.rng)
+            riding_skill = inherit_riding(mother, father, self.rng)
             political_power = max(
                 0.0,
                 min(
@@ -409,6 +420,8 @@ class SimulationEngine:
                 language=language,
                 personal_tools=0,
                 books_authored=0,
+                riding_skill=riding_skill,
+                inventions_made=0,
                 mutation_burden=0.0,
                 political_power=political_power,
                 primary_goal=replan_primary_goal(ch, stress, ambition, 0),
@@ -453,6 +466,108 @@ class SimulationEngine:
     def _adjacent_region_pairs(self) -> list[tuple[int, int]]:
         n = self.config.demographics.region_count
         return [(i, i + 1) for i in range(max(0, n - 1))]
+
+    def _region_war_power(self, people: list[Individual], food_ratio: float) -> float:
+        if not people:
+            return 0.0
+        n = len(people)
+        h = sum(p.health for p in people) / n
+        a = sum(p.aggression for p in people) / n
+        t = sum(p.tool_skill for p in people) / n
+        r = sum(p.riding_skill for p in people) / n
+        mount = 0.06 * r if "animal_husbandry" in self.world_inventions else 0.0
+        wheel = 0.04 * r if "wheel" in self.world_inventions else 0.0
+        return n * h * (0.82 + 0.18 * a) * (1.0 + 0.14 * t + mount + wheel) * (0.88 + 0.24 * food_ratio)
+
+    def _apply_border_conquest(self, winner_rid: int, loser_rid: int, intensity: float) -> str:
+        env_w = self.environments[winner_rid]
+        env_l = self.environments[loser_rid]
+        frac = 0.035 + 0.09 * max(0.0, min(1.0, intensity))
+        t_take = env_l.territory_size * frac
+        t_take = min(t_take, max(0.0, env_l.territory_size - 0.52))
+        if t_take <= 0.008:
+            return f"{self._region_name(winner_rid)} held the border; gains were marginal."
+        env_l.territory_size = max(0.5, env_l.territory_size - t_take)
+        env_w.territory_size = min(1.85, env_w.territory_size + t_take * 0.9)
+        for k in env_l.resource_richness:
+            slice_ = min(env_l.resource_richness[k] * (0.025 + 0.05 * intensity), env_l.resource_richness[k] * 0.14)
+            env_l.resource_richness[k] = max(0.08, env_l.resource_richness[k] - slice_)
+            env_w.resource_richness[k] = min(1.0, env_w.resource_richness[k] + slice_ * 0.88)
+        return (
+            f" {self._region_name(winner_rid)} annexed border territory and resources from "
+            f"{self._region_name(loser_rid)}."
+        )
+
+    def _step_culture_inventions_and_riding(self, alive: list[Individual], year: int, civ_w: float) -> list[str]:
+        stories: list[str] = []
+        if len(alive) < 25:
+            return stories
+
+        invention_chain: list[tuple[str, float, str, str]] = [
+            (
+                "animal_husbandry",
+                0.2,
+                "Domestication",
+                "Beasts of burden and mounts spread; people learn to ride and haul.",
+            ),
+            ("wheel", 0.34, "The wheel", "Wheeled transport speeds trade and long-distance movement."),
+            (
+                "advanced_tools",
+                0.46,
+                "Advanced tools",
+                "Better implements raise craft output and everyday productivity.",
+            ),
+            (
+                "iron_working",
+                0.58,
+                "Iron working",
+                "Harder metal improves tools and slightly reduces preventable deaths.",
+            ),
+        ]
+
+        for key, threshold, title, blurb in invention_chain:
+            if key in self.world_inventions:
+                continue
+            if civ_w < threshold:
+                continue
+            pool = [
+                p
+                for p in alive
+                if p.age >= 17
+                and p.age < 72
+                and (p.knowledge * 0.48 + p.tool_skill * 0.52) > 0.26 + threshold * 0.22
+            ]
+            if not pool:
+                continue
+            headroom = min(1.6, (civ_w - threshold) * 3.2 + 0.08)
+            if self.rng.random() > min(0.5, 0.055 + headroom * 0.22):
+                continue
+            inventor = self.rng.choice(pool)
+            self.world_inventions.add(key)
+            inventor.inventions_made += 1
+            inventor.knowledge = min(1.0, inventor.knowledge + 0.018 + self.rng.uniform(0, 0.012))
+            inventor.tool_skill = min(1.0, inventor.tool_skill + 0.012)
+            stories.append(self._register_timeline_transition(year, f"Invention: {title}", blurb))
+            if key == "animal_husbandry":
+                self.food_system_bonus = min(0.28, self.food_system_bonus + 0.014)
+            elif key == "wheel":
+                self.food_system_bonus = min(0.28, self.food_system_bonus + 0.008)
+            elif key == "advanced_tools":
+                self.food_system_bonus = min(0.28, self.food_system_bonus + 0.012)
+            elif key == "iron_working":
+                self.mortality_reduction_bonus = min(0.18, self.mortality_reduction_bonus + 0.009)
+
+        if "animal_husbandry" in self.world_inventions:
+            for p in alive:
+                if not (8 <= p.age <= 62):
+                    continue
+                base = 0.028 + p.tool_skill * 0.038
+                if "wheel" in self.world_inventions:
+                    base += 0.014
+                if self.rng.random() < base:
+                    p.riding_skill = min(1.0, p.riding_skill + self.rng.uniform(0.012, 0.034))
+
+        return stories
 
     def _simulate_regional_diplomacy(self, alive: list[Individual], year: int) -> tuple[list[str], int]:
         stories: list[str] = []
@@ -508,11 +623,18 @@ class SimulationEngine:
                 deaths += casualties
                 if has_trade and self.world_dynamics.global_instability > 0.52:
                     self.region_trade_links.discard(pair)
+                pw_a = self._region_war_power(pa, food_a)
+                pw_b = self._region_war_power(pb, food_b)
+                conquest_note = ""
+                if pw_a > pw_b * 1.06:
+                    conquest_note = self._apply_border_conquest(ra, rb, war_intensity)
+                elif pw_b > pw_a * 1.06:
+                    conquest_note = self._apply_border_conquest(rb, ra, war_intensity)
                 stories.append(
                     self._register_timeline_transition(
                         year,
                         f"Border war: {self._region_name(ra)} vs {self._region_name(rb)}",
-                        f"Resource and territory conflict caused {casualties} deaths.",
+                        f"Resource and territory conflict caused {casualties} deaths.{conquest_note}",
                     )
                 )
             elif event == "trade_break":
@@ -609,7 +731,13 @@ class SimulationEngine:
                     + self.environments[person.region_id].resource_score() * (0.18 + person.ambition * 0.16) * gr
                 )
                 advantage = best_score - current_score
-                min_edge = max(0.008, 0.11 * (1.02 - iq) / (1.0 + person.ambition * 0.35))
+                ride_mobility = 1.0
+                if "animal_husbandry" in self.world_inventions:
+                    ride_mobility += person.riding_skill * (0.24 + (0.12 if "wheel" in self.world_inventions else 0.0))
+                min_edge = max(
+                    0.006,
+                    0.11 * (1.02 - iq) / (1.0 + person.ambition * 0.35) / max(0.75, ride_mobility),
+                )
                 clear_gain = target_region != person.region_id and advantage > min_edge and best_score > current_score
                 if clear_gain:
                     migrate_prob = min(1.0, migrate_prob * (1.45 + person.ambition * 0.9))
@@ -619,6 +747,8 @@ class SimulationEngine:
                     migrate_prob *= 1.0 + min(
                         0.32, (-person.observed_food_trend) * 1.85 * (0.42 + person.ambition * 0.28)
                     )
+                if "animal_husbandry" in self.world_inventions and bcfg.enabled:
+                    migrate_prob = min(1.0, migrate_prob * (1.0 + 0.2 * person.riding_skill))
 
             if self.rng.random() < migrate_prob:
                 if bcfg.enabled and target_region != person.region_id:
@@ -795,11 +925,44 @@ class SimulationEngine:
             person.knowledge = min(1.0, person.knowledge + rate_k * teacher.knowledge + self.knowledge_boost)
             person.tool_skill = min(1.0, person.tool_skill + rate_t * teacher.tool_skill)
 
-            # Belief diffusion: high-spiritual groups can form stable cults/religions.
-            if self.rng.random() < 0.03 * person.spiritual_tendency:
-                person.belief_group = teacher.belief_group
-            if self.rng.random() < 0.002 and person.spiritual_tendency > 0.7:
+            # Belief: spiritual learners adopt mentors; skeptics drift toward well-informed teachers; rare schisms.
+            if teacher.belief_group != person.belief_group:
+                conv = (
+                    0.034 * person.spiritual_tendency
+                    + 0.014
+                    * (1.0 - person.spiritual_tendency * 0.38)
+                    * (0.42 + teacher.knowledge * 0.58)
+                )
+                if self.rng.random() < conv:
+                    person.belief_group = teacher.belief_group
+            if self.rng.random() < 0.0022 and person.spiritual_tendency > 0.72:
                 person.belief_group = f"cult_{person.person_id}"
+
+    def _step_belief_evolution(self, alive: list[Individual]) -> None:
+        if len(alive) < 10:
+            return
+        by_region: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for p in alive:
+            if p.belief_group.startswith("cult_"):
+                continue
+            by_region[p.region_id][p.belief_group] += 1
+        majority: dict[int, str | None] = {}
+        for rid, counts in by_region.items():
+            majority[rid] = max(counts.items(), key=lambda kv: kv[1])[0] if counts else None
+        for p in alive:
+            if p.belief_group.startswith("cult_"):
+                continue
+            dom = majority.get(p.region_id)
+            if not dom or dom == p.belief_group:
+                continue
+            if p.stress > 0.69 and self.rng.random() < 0.017 + (p.stress - 0.69) * 0.065:
+                p.belief_group = dom
+                continue
+            if p.knowledge > 0.5 and self.rng.random() < 0.0088 * p.knowledge * (1.0 - p.spiritual_tendency * 0.42):
+                p.belief_group = dom
+                continue
+            if p.happiness > 0.6 and self.rng.random() < 0.0048:
+                p.belief_group = dom
 
     def _update_civilization_metrics(self, alive: list[Individual]) -> None:
         if not alive:
@@ -909,8 +1072,13 @@ class SimulationEngine:
         emotional = person.happiness * 0.45 - person.stress * 0.35 - person.aggression * 0.15
         skill = person.knowledge * 0.22 + person.tool_skill * 0.28
         assets = min(0.15, person.personal_tools * 0.01 + person.books_authored * 0.015)
+        mount = (
+            min(0.055, person.riding_skill * 0.048)
+            if "animal_husbandry" in self.world_inventions
+            else 0.0
+        )
         mutation_penalty = min(0.25, person.mutation_burden * 0.3)
-        return max(-0.45, min(0.9, social_bonus + emotional + skill + assets - mutation_penalty))
+        return max(-0.45, min(0.9, social_bonus + emotional + skill + assets + mount - mutation_penalty))
 
     def _process_world_events(self, year: int, alive: list[Individual]) -> tuple[int, list[str]]:
         stories: list[str] = []
@@ -1838,8 +2006,9 @@ class SimulationEngine:
             )
 
     def _craft_tools_and_books(self, alive: list[Individual], year: int) -> None:
+        craft_rate = 1.0 + 0.34 * int("advanced_tools" in self.world_inventions)
         for person in alive:
-            if person.tool_skill > 0.45 and self.rng.random() < (0.01 + person.tool_skill * 0.02):
+            if person.tool_skill > 0.45 and self.rng.random() < (0.01 + person.tool_skill * 0.02) * craft_rate:
                 person.personal_tools += 1
                 self.total_tools_crafted += 1
 

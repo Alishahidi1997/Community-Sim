@@ -42,6 +42,8 @@ class Individual:
     language: str
     personal_tools: int
     books_authored: int
+    riding_skill: float  # 0–1; mounts / wheels improve mobility once unlocked culturally
+    inventions_made: int  # count of breakthroughs this person originated
     mutation_burden: float
     political_power: float  # 0–1; wealth, skill, age, and office compound over time
     # Yearly replanned; migration/social use these for trend-aware, goal-directed behavior
@@ -107,6 +109,11 @@ def inherit_social_profile(
     )
     belief_group = mother.belief_group if rng.random() < 0.5 else father.belief_group
     return knowledge, tool_skill, spiritual, belief_group
+
+
+def inherit_riding(mother: Individual, father: Individual, rng: random.Random) -> float:
+    base = (mother.riding_skill + father.riding_skill) / 2.0
+    return max(0.0, min(1.0, rng.gauss(base, 0.07)))
 
 
 def inherit_emotions(
