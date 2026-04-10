@@ -33,6 +33,9 @@ class VisualAnimal:
     vy: float
     species: str
     region_id: int
+    display_name: str = ""
+    age_years: int = 0
+    is_livestock: bool = False
 
 
 @dataclass
@@ -82,6 +85,8 @@ class RealtimeVisualizer:
         self.visual_state: dict[int, VisualAgent] = {}
         self.sliders: list[UISlider] = []
         self.dragging_slider: UISlider | None = None
+        self.mouse_pos: tuple[int, int] = (0, 0)
+        self.pinned_person_id: int | None = None
 
         self.region_colors = [
             (72, 96, 70),
@@ -96,8 +101,10 @@ class RealtimeVisualizer:
         self.bg_color = (140, 185, 235)
         self.grid_color = (90, 120, 90)
         self.ground_color = (62, 130, 72)
-        self.panel_color = (25, 27, 32)
-        self.panel_text_color = (235, 235, 238)
+        self.panel_color = (28, 30, 36)
+        self.panel_text_color = (236, 238, 244)
+        self.ui_accent = (64, 148, 220)
+        self.ui_text_dim = (168, 174, 188)
         self.recent_messages: list[tuple[str, int]] = []
         self.timeline_cache: list[str] = []
         self.last_major_event_count = 0
@@ -109,6 +116,7 @@ class RealtimeVisualizer:
         self._init_cloud_layout()
         self.visual_animals: list[VisualAnimal] = []
         self._scatter_veg: list[tuple[float, float, str, float]] = []
+        self._scatter_reeds: list[tuple[float, float, float]] = []
         self._decor_crops: list[tuple[float, float, float]] = []
         self._rebuild_world_decor()
         self._sync_visual_animals()
@@ -143,30 +151,117 @@ class RealtimeVisualizer:
     def _world_rect(self) -> pygame.Rect:
         return pygame.Rect(self.left_panel_width, 0, self.width - self.panel_width - self.left_panel_width, self.height)
 
+    def _ocean_band_height(self, world_rect: pygame.Rect) -> int:
+        return max(44, min(168, int(world_rect.height * 0.14)))
+
+    def _is_point_over_water(self, wr: pygame.Rect, px: int, py: int) -> bool:
+        """True if pixel lies in drawn ocean band, left bay, or right fjord (matches _draw_ocean_and_seas)."""
+        oh = self._ocean_band_height(wr)
+        sea_top = wr.bottom - oh
+        if py >= sea_top - 6:
+            return True
+        y_mid = wr.top + int(wr.height * 0.5)
+        if py >= y_mid:
+            frac = (py - y_mid) / max(1, wr.bottom - y_mid)
+            span = int(frac * wr.width * 0.26) + 12
+            if px < wr.left + span:
+                return True
+        y0 = wr.top + int(wr.height * 0.54)
+        fj_w = max(24, int(wr.width * 0.065))
+        if py >= y0 and px >= wr.right - fj_w - 2:
+            return True
+        return False
+
     def _rebuild_world_decor(self) -> None:
         wr = self._world_rect()
         r = self.terrain_seed
         self._scatter_veg = []
+        self._scatter_reeds = []
         self._decor_crops = []
-        count = max(36, min(220, wr.width * wr.height // 9000))
-        for i in range(count):
-            nx = r.random()
-            ny = 0.22 + r.random() * 0.76
-            if 0.56 < ny < 0.72 and 0.38 < nx < 0.62:
+        count = max(48, min(280, wr.width * wr.height // 7200))
+        for _ in range(count):
+            placed = False
+            for _try in range(18):
+                nx = r.random()
+                ny = 0.22 + r.random() * 0.72
+                px = int(wr.left + nx * wr.width)
+                py = int(wr.top + ny * wr.height)
+                if self._is_point_over_water(wr, px, py):
+                    continue
+                if 0.56 < ny < 0.72 and 0.38 < nx < 0.62:
+                    continue
+                roll = r.random()
+                oh = self._ocean_band_height(wr)
+                coast_ny = (wr.bottom - oh - wr.top) / max(1, wr.height)
+                is_coast_strip = ny >= coast_ny - 0.14 and ny < coast_ny - 0.02
+                if roll < 0.28:
+                    kind = "tree"
+                    sc = r.uniform(0.75, 1.35)
+                elif roll < 0.42:
+                    kind = "pine"
+                    sc = r.uniform(0.7, 1.25)
+                elif roll < 0.52 and is_coast_strip:
+                    kind = "palm"
+                    sc = r.uniform(0.85, 1.2)
+                elif roll < 0.52:
+                    kind = "tree"
+                    sc = r.uniform(0.65, 1.1)
+                elif roll < 0.66:
+                    kind = "bush"
+                    sc = r.uniform(0.5, 1.0)
+                elif roll < 0.76:
+                    kind = "flowers"
+                    sc = r.uniform(0.55, 1.0)
+                elif roll < 0.86:
+                    kind = "grass"
+                    sc = r.uniform(0.45, 0.95)
+                elif roll < 0.93:
+                    kind = "fern"
+                    sc = r.uniform(0.5, 1.0)
+                else:
+                    kind = "rock"
+                    sc = r.uniform(0.4, 0.85)
+                self._scatter_veg.append((nx, ny, kind, sc))
+                placed = True
+                break
+            if not placed:
                 continue
-            roll = r.random()
-            if roll < 0.52:
-                kind = "tree"
-                sc = r.uniform(0.75, 1.35)
-            elif roll < 0.78:
-                kind = "bush"
-                sc = r.uniform(0.5, 1.0)
-            else:
-                kind = "rock"
-                sc = r.uniform(0.4, 0.85)
-            self._scatter_veg.append((nx, ny, kind, sc))
+        n_reeds = max(16, min(100, wr.width // 28))
+        for _ in range(n_reeds):
+            for _try in range(14):
+                nx = 0.38 + r.random() * 0.24
+                ny = 0.58 + r.random() * 0.18
+                px = int(wr.left + nx * wr.width)
+                py = int(wr.top + ny * wr.height)
+                if self._is_point_over_water(wr, px, py):
+                    continue
+                self._scatter_reeds.append((nx, ny, r.uniform(0.65, 1.15)))
+                break
         for _ in range(max(12, min(80, wr.width // 25))):
-            self._decor_crops.append((r.random(), 0.5 + r.random() * 0.44, r.uniform(0.7, 1.2)))
+            for _try in range(16):
+                nx = r.random()
+                ny = 0.42 + r.random() * 0.36
+                px = int(wr.left + nx * wr.width)
+                py = int(wr.top + ny * wr.height)
+                if self._is_point_over_water(wr, px, py):
+                    continue
+                self._decor_crops.append((nx, ny, r.uniform(0.7, 1.2)))
+                break
+
+    def _load_ui_fonts(self) -> tuple[pygame.font.Font, pygame.font.Font]:
+        avail = set(pygame.font.get_fonts())
+        for key, display in [
+            ("segoeui", "Segoe UI"),
+            ("calibri", "Calibri"),
+            ("tahoma", "Tahoma"),
+            ("arial", "Arial"),
+        ]:
+            if key in avail:
+                return (
+                    pygame.font.SysFont(display, 19),
+                    pygame.font.SysFont(display, 14),
+                )
+        return pygame.font.SysFont("consolas", 18), pygame.font.SysFont("consolas", 15)
 
     def _desktop_pixel_size(self) -> tuple[int, int]:
         """Primary monitor size in pixels (for clamping window and true fullscreen)."""
@@ -247,8 +342,7 @@ class RealtimeVisualizer:
         screen = pygame.display.set_mode((self.width, self.height), win_flags)
         pygame.display.set_caption("Population Dynamics — live world view")
         clock = pygame.time.Clock()
-        font = pygame.font.SysFont("consolas", 18)
-        small_font = pygame.font.SysFont("consolas", 15)
+        font, small_font = self._load_ui_fonts()
 
         while self.running:
             dt = clock.tick(60) / 1000.0
@@ -310,18 +404,29 @@ class RealtimeVisualizer:
                 elif event.key == pygame.K_PAGEDOWN:
                     self._scroll_city_ledger(3)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                mx, my = event.pos
+                hit_slider = False
                 for slider in self.sliders:
                     if slider.rect.collidepoint(event.pos):
                         slider.active = True
                         self.dragging_slider = slider
                         slider.set_from_x(event.pos[0])
+                        hit_slider = True
                         break
+                if not hit_slider and self.left_panel_width <= mx < self.width - self.panel_width:
+                    pick = self._pick_at(mx, my)
+                    if pick is not None and pick[0] == "person":
+                        self.pinned_person_id = pick[1].person_id
+                    else:
+                        self.pinned_person_id = None
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if self.dragging_slider is not None:
                     self.dragging_slider.active = False
                 self.dragging_slider = None
-            elif event.type == pygame.MOUSEMOTION and self.dragging_slider is not None:
-                self.dragging_slider.set_from_x(event.pos[0])
+            elif event.type == pygame.MOUSEMOTION:
+                self.mouse_pos = event.pos
+                if self.dragging_slider is not None:
+                    self.dragging_slider.set_from_x(event.pos[0])
             elif event.type == pygame.MOUSEWHEEL:
                 self._scroll_city_ledger(-event.y)
             elif event.type == pygame.VIDEORESIZE and not self._fullscreen:
@@ -372,7 +477,10 @@ class RealtimeVisualizer:
         x0 = int(world_left + region_id * region_width + 10)
         top = self._hud_top()
         bottom_margin = max(28, min(48, self.height // 22))
-        return pygame.Rect(x0, top, int(region_width - 20), max(60, self.height - top - bottom_margin))
+        world_rect = self._world_rect()
+        oh = self._ocean_band_height(world_rect)
+        land_bottom = self.height - bottom_margin - oh
+        return pygame.Rect(x0, top, int(region_width - 20), max(60, land_bottom - top))
 
     def _spawn_visual_agent(self, person_id: int, region_id: int) -> VisualAgent:
         del person_id
@@ -492,6 +600,7 @@ class RealtimeVisualizer:
         self._draw_hud(screen, font, alive_people)
         self._draw_messages(screen, small_font)
         self._draw_control_panel(screen, font, small_font)
+        self._draw_hover_tooltip(screen, small_font)
 
     def _draw_regions(self, screen: pygame.Surface) -> None:
         world_rect = pygame.Rect(self.left_panel_width, 0, self.width - self.panel_width - self.left_panel_width, self.height)
@@ -499,16 +608,20 @@ class RealtimeVisualizer:
         self._draw_sun_and_clouds(screen, world_rect)
         self._draw_hills(screen, world_rect)
         ground_top = max(56, self._hud_top() - 8)
+        ocean_h = self._ocean_band_height(world_rect)
+        land_h = max(50, self.height - ground_top - ocean_h)
         ground_rect = pygame.Rect(
             self.left_panel_width,
             ground_top,
             self.width - self.panel_width - self.left_panel_width,
-            max(40, self.height - ground_top),
+            land_h,
         )
         self._draw_ground_gradient(screen, ground_rect)
         self._draw_river(screen, world_rect)
+        self._draw_ocean_and_seas(screen, world_rect)
         self._draw_region_fields(screen)
         self._draw_world_vegetation(screen)
+        self._draw_reeds_and_shore_plants(screen, world_rect)
         self._draw_decorative_farmland(screen)
         self._draw_scattered_homesteads(screen)
         self._draw_world_structures(screen)
@@ -516,6 +629,7 @@ class RealtimeVisualizer:
         self._draw_roads(screen)
 
     def _draw_hud(self, screen: pygame.Surface, font: pygame.font.Font, alive_people: list) -> None:
+        wr = self._world_rect()
         pop = len(alive_people)
         infected = sum(
             1 for p in alive_people if any(state == DiseaseState.INFECTED for state in p.disease_states.values())
@@ -536,21 +650,37 @@ class RealtimeVisualizer:
             f"Trade routes: {len(getattr(self.engine, 'region_trade_links', []))}   Regions: {self.engine.config.demographics.region_count}",
             f"Wildlife: {getattr(self.engine, 'wildlife_index', 1.0):.2f}   Livestock: {self.engine.total_livestock():.0f}   Farms (fields): {sum(1 for s in self.engine.world_structures if s.get('kind') == 'field')}",
             f"Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}",
-            "Controls: SPACE pause | drag window edges to resize | sliders | ,/. speed | L | ESC",
+            "Hover: tooltip on people, animals, settlements & fields | Controls: SPACE | sliders | ,/. | L | ESC",
         ]
-        y = 8
         line_h = max(16, min(22, self.height // 48))
-        for line in lines:
-            text = font.render(line, True, (20, 22, 30))
-            screen.blit(text, (self.left_panel_width + 12, y))
+        plate_h = len(lines) * line_h + 16
+        plate_w = max(400, wr.width - 16)
+        blend = getattr(pygame, "BLEND_ALPHA_SDL2", 0)
+        plate = pygame.Surface((plate_w, plate_h), pygame.SRCALPHA)
+        plate.fill((252, 253, 255, 100))
+        pygame.draw.rect(plate, (255, 255, 255, 40), plate.get_rect(), border_radius=10)
+        screen.blit(plate, (wr.left + 8, 6), special_flags=blend)
+        pygame.draw.rect(
+            screen,
+            (138, 148, 168),
+            pygame.Rect(wr.left + 8, 6, plate_w, plate_h),
+            1,
+            border_radius=10,
+        )
+        y = 14
+        for i, line in enumerate(lines):
+            col = (28, 32, 42) if i < 2 else (48, 52, 62)
+            text = font.render(line, True, col)
+            screen.blit(text, (wr.left + 16, y))
             y += line_h
 
     def _draw_messages(self, screen: pygame.Surface, small_font: pygame.font.Font) -> None:
         self.recent_messages = [(m, ttl - 1) for m, ttl in self.recent_messages if ttl > 1]
-        y = self._hud_top() - 6
+        wr = self._world_rect()
+        y = self._hud_top() - 4
         for msg, _ in self.recent_messages[-6:]:
-            t = small_font.render(msg, True, (18, 20, 28))
-            screen.blit(t, (self.left_panel_width + 12, y))
+            t = small_font.render(msg, True, (42, 48, 60))
+            screen.blit(t, (wr.left + 14, y))
             y += max(14, min(20, self.height // 55))
 
     def _draw_human(self, screen: pygame.Surface, person, agent: VisualAgent) -> None:
@@ -714,38 +844,310 @@ class RealtimeVisualizer:
         small_font: pygame.font.Font,
     ) -> None:
         panel_rect = pygame.Rect(self.width - self.panel_width, 0, self.panel_width, self.height)
-        pygame.draw.rect(screen, self.panel_color, panel_rect)
-        pygame.draw.line(screen, (60, 62, 72), (panel_rect.left, 0), (panel_rect.left, self.height), 2)
+        split = int(panel_rect.height * 0.38)
+        pygame.draw.rect(
+            screen,
+            (36, 38, 46),
+            pygame.Rect(panel_rect.left, panel_rect.top, panel_rect.width, split),
+        )
+        pygame.draw.rect(
+            screen,
+            (24, 26, 32),
+            pygame.Rect(panel_rect.left, panel_rect.top + split, panel_rect.width, panel_rect.height - split),
+        )
+        pygame.draw.rect(screen, self.ui_accent, (panel_rect.left, panel_rect.top, 4, panel_rect.height))
+        pygame.draw.line(screen, (10, 11, 14), (panel_rect.left, 0), (panel_rect.left, self.height), 2)
+        pygame.draw.line(screen, (52, 56, 64), (panel_rect.left + 1, 0), (panel_rect.left + 1, self.height), 1)
 
-        title = font.render("Realtime Controls", True, self.panel_text_color)
-        screen.blit(title, (panel_rect.left + 20, 22))
-        subtitle = small_font.render("Drag sliders to tune parameters live", True, (190, 190, 198))
-        screen.blit(subtitle, (panel_rect.left + 20, 48))
+        title = font.render("Simulation controls", True, self.panel_text_color)
+        screen.blit(title, (panel_rect.left + 22, 24))
+        subtitle = small_font.render("Adjust parameters in real time", True, self.ui_text_dim)
+        screen.blit(subtitle, (panel_rect.left + 22, 50))
+        pygame.draw.line(
+            screen,
+            (52, 56, 66),
+            (panel_rect.left + 18, 74),
+            (panel_rect.right - 14, 74),
+            1,
+        )
 
         for slider in self.sliders:
-            label = small_font.render(f"{slider.label}: {slider.current():.3f}", True, self.panel_text_color)
+            label = small_font.render(f"{slider.label}  ·  {slider.current():.3f}", True, (210, 214, 224))
             screen.blit(label, (slider.rect.left, slider.rect.top - 22))
 
-            pygame.draw.rect(screen, (80, 82, 92), slider.rect, border_radius=6)
+            inset = pygame.Rect(slider.rect.left, slider.rect.top - 1, slider.rect.width, slider.rect.height + 2)
+            pygame.draw.rect(screen, (12, 13, 16), inset, border_radius=8)
+            pygame.draw.rect(screen, (44, 46, 54), slider.rect, border_radius=7)
             fill_width = int(slider.rect.width * slider.normalized())
             if fill_width > 0:
                 fill_rect = pygame.Rect(slider.rect.left, slider.rect.top, fill_width, slider.rect.height)
-                pygame.draw.rect(screen, (88, 160, 235), fill_rect, border_radius=6)
+                pygame.draw.rect(screen, (42, 118, 188), fill_rect, border_radius=7)
+                hi = pygame.Rect(fill_rect.left, fill_rect.top, fill_rect.width, max(1, fill_rect.height // 2))
+                pygame.draw.rect(screen, (88, 168, 228), hi, border_radius=7)
 
             handle_x = slider.rect.left + fill_width
-            handle = pygame.Rect(handle_x - 6, slider.rect.top - 4, 12, slider.rect.height + 8)
-            color = (245, 245, 250) if slider.active else (220, 220, 230)
-            pygame.draw.rect(screen, color, handle, border_radius=4)
+            handle = pygame.Rect(handle_x - 7, slider.rect.top - 5, 14, slider.rect.height + 10)
+            pygame.draw.rect(screen, (18, 20, 26), (handle.left + 1, handle.top + 1, handle.width, handle.height), border_radius=5)
+            hcol = (252, 252, 255) if slider.active else (232, 234, 240)
+            pygame.draw.rect(screen, hcol, handle, border_radius=5)
+            pygame.draw.rect(screen, (100, 108, 124), handle, 1, border_radius=5)
 
         tips = [
-            "World: trees/rocks, crop patches, huts, herds (sheep/cattle), wildlife",
-            "Icons: yellow=scholar, gray=toolmaker, purple=spiritual",
+            "World: coast & land plants stay separate from the sea",
+            "Hover for details; click a person to pin a following card",
         ]
         y = self.height - 52
         for tip in tips:
-            t = small_font.render(tip, True, (180, 182, 190))
-            screen.blit(t, (panel_rect.left + 20, y))
+            t = small_font.render(tip, True, (150, 156, 170))
+            screen.blit(t, (panel_rect.left + 22, y))
             y += 18
+
+    def _person_hover_radius(self, person) -> float:
+        scale = max(4, min(14, int(4 + person.age / 10)))
+        return max(18.0, float(scale) * 2.7)
+
+    def _animal_hover_radius(self, a: VisualAnimal) -> float:
+        return float({"bird": 12.0, "deer": 17.0, "sheep": 14.0, "cattle": 22.0}.get(a.species, 14.0))
+
+    def _pick_at(self, mx: int, my: int):
+        if mx < self.left_panel_width or mx >= self.width - self.panel_width:
+            return None
+
+        best_p = None
+        best_pd = 1e9
+        for p in self.engine.population:
+            if not p.alive:
+                continue
+            ag = self.visual_state.get(p.person_id)
+            if ag is None:
+                continue
+            d = math.hypot(mx - ag.x, my - ag.y)
+            r = self._person_hover_radius(p)
+            if d <= r and d < best_pd:
+                best_pd = d
+                best_p = p
+        if best_p is not None:
+            return ("person", best_p)
+
+        best_a = None
+        best_ad = 1e9
+        for a in self.visual_animals:
+            d = math.hypot(mx - a.x, my - a.y)
+            rr = self._animal_hover_radius(a)
+            if d <= rr and d < best_ad:
+                best_ad = d
+                best_a = a
+        if best_a is not None:
+            return ("animal", best_a)
+
+        best_s = None
+        best_sd = 1e9
+        for s in self.engine.world_structures:
+            sx, sy = self._structure_screen_pos(s)
+            d = math.hypot(mx - sx, my - sy)
+            if d <= 28.0 and d < best_sd:
+                best_sd = d
+                best_s = s
+        if best_s is not None:
+            return ("structure", best_s)
+        return None
+
+    def _hover_pick(self):
+        return self._pick_at(*self.mouse_pos)
+
+    def _city_name_for_region(self, region_id: int) -> str | None:
+        st = self.engine._get_settlement_structure(region_id)
+        if st is None:
+            return None
+        if str(st.get("level", "")) == "city":
+            return str(st.get("name", ""))
+        sname = str(st.get("name", ""))
+        for c in self.engine.city_summaries:
+            if str(c.get("name", "")) == sname:
+                return sname
+        return None
+
+    def _person_tooltip_lines(self, person) -> list[str]:
+        settlement = self.engine._region_name(person.region_id)
+        city = self._city_name_for_region(person.region_id)
+        loc = f"{settlement}"
+        if city:
+            loc = f"{city} ({settlement})"
+        lines = [
+            f"Person #{person.person_id}",
+            f"Age {person.age} · {person.gender.value}",
+            f"Place: {loc}",
+        ]
+        bg = person.belief_group
+        if bg.startswith("cult_"):
+            lines.append(f"Belief: cult — {bg}")
+        else:
+            lines.append(f"Belief: {bg}")
+        lines.append(f"Faction: {person.faction} · Language: {person.language}")
+        lines.append(f"Health {person.health:.2f} · Happy {person.happiness:.2f} · Stress {person.stress:.2f}")
+        inf = [k for k, st in person.disease_states.items() if st == DiseaseState.INFECTED]
+        if inf:
+            lines.append(f"Infected: {', '.join(inf)}")
+        if person.vaccinated:
+            lines.append("Vaccinated: yes")
+        lines.append(f"Goal: {person.primary_goal} · Know {person.knowledge:.2f} · Tools {person.tool_skill:.2f}")
+        if person.riding_skill > 0.08:
+            lines.append(f"Riding {person.riding_skill:.2f} · Inventions made {person.inventions_made}")
+        else:
+            lines.append(f"Inventions made {person.inventions_made}")
+        pol = self.engine.politics_by_region.get(person.region_id, {})
+        if pol.get("leader_id") == person.person_id:
+            title = str(pol.get("leader_title") or "Leader")
+            lines.append(f"Role: {title} (regional leader)")
+        return lines
+
+    def _animal_tooltip_lines(self, a: VisualAnimal) -> list[str]:
+        kind = a.species.capitalize()
+        origin = "Migratory / wild" if a.species == "bird" else ("Wild" if not a.is_livestock else "Herd / livestock")
+        region = self.engine._region_name(a.region_id) if a.species != "bird" else "Open sky"
+        lines = [
+            a.display_name or kind,
+            f"Type: {kind} · {origin}",
+            f"Age (sim years est.): {a.age_years}",
+            f"Region: {region}",
+        ]
+        return lines
+
+    def _structure_tooltip_lines(self, s: dict) -> list[str]:
+        kind = str(s.get("kind", "?"))
+        rid = int(s.get("region_id", 0))
+        reg = self.engine._region_name(rid)
+        lines = [f"{kind.title()} · {reg}"]
+        if "name" in s:
+            lines.append(f"Name: {s['name']}")
+        if "level" in s:
+            lines.append(f"Level: {s['level']}")
+        lines.append(f"Id: {s.get('id', '?')}")
+        return lines
+
+    def _clamp_tooltip_top_left(self, ox: int, oy: int, box_w: int, box_h: int) -> tuple[int, int]:
+        margin = 6
+        left = self.left_panel_width + margin
+        right = self.width - self.panel_width - margin - box_w
+        top = margin
+        bottom = self.height - margin - box_h
+        if right < left:
+            ox = left
+        else:
+            ox = max(left, min(right, ox))
+        if bottom < top:
+            oy = top
+        else:
+            oy = max(top, min(bottom, oy))
+        return ox, oy
+
+    def _draw_tooltip_card(
+        self,
+        screen: pygame.Surface,
+        small_font: pygame.font.Font,
+        lines: list[str],
+        ox: int,
+        oy: int,
+    ) -> None:
+        pad = 10
+        lh = small_font.get_height() + 4
+        rendered: list[pygame.Surface] = []
+        max_w = 0
+        for ln in lines:
+            t = small_font.render(ln[:96], True, (24, 26, 32))
+            rendered.append(t)
+            max_w = max(max_w, t.get_width())
+        box_w = max_w + pad * 2
+        box_h = len(rendered) * lh + pad * 2
+        ox, oy = self._clamp_tooltip_top_left(ox, oy, box_w, box_h)
+
+        br = 10
+        pygame.draw.rect(
+            screen,
+            (16, 18, 24),
+            pygame.Rect(ox + 4, oy + 4, box_w, box_h),
+            border_radius=br,
+        )
+        pygame.draw.rect(screen, (252, 253, 255), pygame.Rect(ox, oy, box_w, box_h), border_radius=br)
+        pygame.draw.rect(screen, (72, 118, 168), pygame.Rect(ox, oy, box_w, box_h), 1, border_radius=br)
+        cy = oy + pad
+        for idx, t in enumerate(rendered):
+            if idx == 0:
+                t0 = small_font.render(lines[idx][:96], True, (28, 72, 118))
+                screen.blit(t0, (ox + pad, cy))
+            else:
+                screen.blit(t, (ox + pad, cy))
+            cy += lh
+
+    def _pinned_person(self):
+        if self.pinned_person_id is None:
+            return None
+        for p in self.engine.population:
+            if p.alive and p.person_id == self.pinned_person_id:
+                return p
+        return None
+
+    def _draw_pinned_person_tooltip(self, screen: pygame.Surface, small_font: pygame.font.Font) -> None:
+        person = self._pinned_person()
+        if person is None:
+            self.pinned_person_id = None
+            return
+        agent = self.visual_state.get(person.person_id)
+        if agent is None:
+            return
+        lines = list(self._person_tooltip_lines(person))
+        lines.append("Following — click another person to switch; empty map clears")
+        pad = 10
+        lh = small_font.get_height() + 4
+        max_w = 0
+        for ln in lines:
+            t = small_font.render(ln[:96], True, (24, 26, 32))
+            max_w = max(max_w, t.get_width())
+        box_w = max_w + pad * 2
+        box_h = len(lines) * lh + pad * 2
+        ax, ay = int(agent.x), int(agent.y)
+        ox = ax + 16
+        oy = ay - box_h - 12
+        if oy < self._hud_top() + 4:
+            oy = ay + 22
+        self._draw_tooltip_card(screen, small_font, lines, ox, oy)
+
+    def _draw_hover_tooltip(self, screen: pygame.Surface, small_font: pygame.font.Font) -> None:
+        self._draw_pinned_person_tooltip(screen, small_font)
+
+        pick = self._hover_pick()
+        if pick is None:
+            return
+        kind, obj = pick
+        if kind == "person" and self.pinned_person_id == obj.person_id:
+            return
+        if kind == "person":
+            lines = self._person_tooltip_lines(obj)
+        elif kind == "animal":
+            lines = self._animal_tooltip_lines(obj)
+        else:
+            lines = self._structure_tooltip_lines(obj)
+
+        mx, my = self.mouse_pos
+        pad = 10
+        lh = small_font.get_height() + 4
+        max_w = 0
+        for ln in lines:
+            t = small_font.render(ln[:96], True, (24, 26, 32))
+            max_w = max(max_w, t.get_width())
+        box_w = max_w + pad * 2
+        box_h = len(lines) * lh + pad * 2
+        ox, oy = mx + 18, my + 18
+        if ox + box_w > self.width - self.panel_width - 6:
+            ox = mx - box_w - 18
+        if ox < self.left_panel_width + 6:
+            ox = self.left_panel_width + 8
+        if oy + box_h > self.height - 10:
+            oy = my - box_h - 18
+        if oy < 8:
+            oy = 8
+        ox, oy = self._clamp_tooltip_top_left(ox, oy, box_w, box_h)
+        self._draw_tooltip_card(screen, small_font, lines, ox, oy)
 
     def _push_message(self, msg: str) -> None:
         self.recent_messages.append((msg, 240))
@@ -805,11 +1207,85 @@ class RealtimeVisualizer:
             for x in range(rect.left, rect.right, 36):
                 pygame.draw.line(screen, grid, (x, rect.bottom - 22), (x + 14, rect.bottom - 2), 1)
 
+    def _draw_ocean_and_seas(self, screen: pygame.Surface, world_rect: pygame.Rect) -> None:
+        oh = self._ocean_band_height(world_rect)
+        sea_top = world_rect.bottom - oh
+        t_anim = self.year * 0.07 + self.frame_counter * 0.0028
+
+        y_mid = world_rect.top + int(world_rect.height * 0.5)
+        for y in range(y_mid, world_rect.bottom):
+            frac = (y - y_mid) / max(1, world_rect.bottom - y_mid)
+            span = int(frac * world_rect.width * 0.26) + 8
+            c = self._lerp_rgb((92, 138, 168), (34, 82, 122), min(1.0, frac * 1.05))
+            pygame.draw.line(screen, c, (world_rect.left, y), (world_rect.left + span, y), 1)
+
+        fj_w = max(24, int(world_rect.width * 0.065))
+        y0 = world_rect.top + int(world_rect.height * 0.54)
+        for y in range(y0, world_rect.bottom):
+            frac = (y - y0) / max(1, world_rect.bottom - y0)
+            c = self._lerp_rgb((78, 128, 168), (40, 88, 128), min(1.0, frac * 0.95))
+            pygame.draw.line(screen, c, (world_rect.right - fj_w, y), (world_rect.right, y), 1)
+
+        pygame.draw.rect(
+            screen,
+            (236, 218, 182),
+            pygame.Rect(world_rect.left, sea_top - 7, world_rect.width, 9),
+        )
+        pygame.draw.line(
+            screen,
+            (198, 176, 138),
+            (world_rect.left, sea_top - 1),
+            (world_rect.right, sea_top - 1),
+            2,
+        )
+
+        shallow = (88, 154, 198)
+        mid_w = (48, 118, 168)
+        deep_w = (24, 72, 118)
+        for i in range(oh):
+            t = i / max(1, oh - 1)
+            c = self._lerp_rgb(self._lerp_rgb(shallow, mid_w, t * 0.5), deep_w, t * t * 0.88)
+            y = sea_top + i
+            pygame.draw.line(screen, c, (world_rect.left, y), (world_rect.right, y), 1)
+
+        for x in range(world_rect.left, world_rect.right, 7):
+            yw = sea_top + 12 + int(5 * math.sin((x * 0.042) + t_anim * 6))
+            pygame.draw.ellipse(screen, (120, 186, 218), pygame.Rect(x - 2, yw - 1, 5, 3))
+        for x in range(world_rect.left + 4, world_rect.right, 16):
+            yf = sea_top - 4 + int(2 * math.sin((x * 0.07) + t_anim * 7))
+            pygame.draw.circle(screen, (248, 252, 255), (x, yf), 1)
+
+    def _draw_reeds_and_shore_plants(self, screen: pygame.Surface, world_rect: pygame.Rect) -> None:
+        wr = world_rect
+        for nx, ny, sc in self._scatter_reeds:
+            x = int(wr.left + nx * wr.width)
+            y = int(wr.top + ny * wr.height)
+            h = int(14 * sc)
+            for off in (-3, 0, 3):
+                pygame.draw.line(
+                    screen,
+                    (52, 108, 62),
+                    (x + off, y),
+                    (x + off - 1, y - h),
+                    2,
+                )
+            pygame.draw.circle(screen, (118, 168, 82), (x - 2, y - h + 2), 2)
+
+        oh = self._ocean_band_height(world_rect)
+        sea_top = world_rect.bottom - oh
+        for i in range(max(10, wr.width // 45)):
+            x = wr.left + 18 + (i * 53 + self.year * 7) % max(1, wr.width - 36)
+            y = sea_top - 10 + ((i * 17 + self.frame_counter // 20) % 11) - 5
+            pygame.draw.line(screen, (86, 124, 68), (x, y + 6), (x - 1, y - 8), 2)
+            pygame.draw.line(screen, (96, 138, 74), (x + 2, y + 5), (x + 1, y - 6), 1)
+
     def _draw_world_vegetation(self, screen: pygame.Surface) -> None:
         wr = self._world_rect()
         for nx, ny, kind, sc in self._scatter_veg:
             x = int(wr.left + nx * wr.width)
             y = int(wr.top + ny * wr.height)
+            if self._is_point_over_water(wr, x, y):
+                continue
             if kind == "tree":
                 trunk = self._mul_rgb((86, 62, 48), sc)
                 foliage = self._mul_rgb((48, 92, 54), sc)
@@ -817,9 +1293,51 @@ class RealtimeVisualizer:
                 pygame.draw.rect(screen, trunk, pygame.Rect(x - 2, y - 4, 4, int(14 * sc)))
                 pygame.draw.circle(screen, foliage, (x, y - int(16 * sc)), int(10 * sc))
                 pygame.draw.circle(screen, hi, (x - int(4 * sc), y - int(18 * sc)), int(5 * sc))
+            elif kind == "pine":
+                trunk = self._mul_rgb((74, 56, 42), sc)
+                pygame.draw.rect(screen, trunk, pygame.Rect(x - 2, y - 3, 4, int(12 * sc)))
+                for i, rw in enumerate([int(14 * sc), int(11 * sc), int(8 * sc)]):
+                    oy = y - int((8 + i * 7) * sc)
+                    pygame.draw.polygon(
+                        screen,
+                        (42, 88, 58),
+                        [(x, oy - int(10 * sc)), (x - rw, oy + 2), (x + rw, oy + 2)],
+                    )
+                    pygame.draw.polygon(
+                        screen,
+                        (58, 118, 76),
+                        [(x, oy - int(8 * sc)), (x - rw + 2, oy + 1), (x + rw - 2, oy + 1)],
+                    )
+            elif kind == "palm":
+                trunk = self._mul_rgb((120, 92, 58), sc)
+                pygame.draw.rect(screen, trunk, pygame.Rect(x - 2, y - int(18 * sc), 4, int(20 * sc)))
+                for ang in range(0, 360, 45):
+                    rad = math.radians(ang + self.year * 3)
+                    x2 = x + int(14 * sc * math.cos(rad))
+                    y2 = y - int(16 * sc) + int(6 * sc * math.sin(rad))
+                    pygame.draw.line(
+                        screen,
+                        (58, 122, 72),
+                        (x, y - int(18 * sc)),
+                        (x2, y2),
+                        2,
+                    )
             elif kind == "bush":
                 pygame.draw.circle(screen, (56, 98, 58), (x, y), int(7 * sc))
                 pygame.draw.circle(screen, (68, 112, 72), (x + int(4 * sc), y - 2), int(5 * sc))
+            elif kind == "flowers":
+                for fx, fy in [(0, 0), (-4, 2), (4, 1)]:
+                    ci = (x * 17 + fx * 3 + int(ny * 1000)) % 3
+                    col = [(210, 92, 118), (230, 200, 88), (168, 118, 210)][ci]
+                    pygame.draw.circle(screen, col, (x + fx, y + fy), max(2, int(3 * sc)))
+                pygame.draw.line(screen, (72, 112, 58), (x, y + 4), (x, y + int(8 * sc)), 2)
+            elif kind == "grass":
+                for gx in (-3, 0, 3):
+                    pygame.draw.line(screen, (64, 118, 64), (x + gx, y), (x + gx - 1, y - int(10 * sc)), 2)
+            elif kind == "fern":
+                pygame.draw.line(screen, (48, 98, 62), (x, y + 2), (x - int(8 * sc), y - int(10 * sc)), 2)
+                pygame.draw.line(screen, (58, 112, 72), (x, y + 2), (x + int(7 * sc), y - int(9 * sc)), 2)
+                pygame.draw.line(screen, (52, 104, 64), (x, y + 2), (x, y - int(12 * sc)), 2)
             else:
                 pygame.draw.ellipse(screen, (108, 104, 98), pygame.Rect(x - int(6 * sc), y - int(4 * sc), int(12 * sc), int(8 * sc)))
                 pygame.draw.ellipse(screen, (88, 84, 80), pygame.Rect(x - int(4 * sc), y - int(3 * sc), int(8 * sc), int(6 * sc)))
@@ -831,6 +1349,8 @@ class RealtimeVisualizer:
         for nx, ny, sc in self._decor_crops:
             x = int(wr.left + nx * wr.width)
             y = int(wr.top + ny * wr.height)
+            if self._is_point_over_water(wr, x, y):
+                continue
             w, h = max(10, int(22 * sc)), max(6, int(10 * sc))
             pygame.draw.ellipse(screen, (138, 162, 72), pygame.Rect(x - w // 2, y - h // 2, w, h))
             pygame.draw.line(screen, (110, 138, 58), (x - w // 2 + 2, y), (x + w // 2 - 2, y), 1)
@@ -897,6 +1417,19 @@ class RealtimeVisualizer:
                 sp = 12.0
             ang = rr.uniform(0, math.tau)
             r_id = 0 if species == "bird" else max(0, min(n_regions - 1, region_id))
+            livestock = species in ("sheep", "cattle")
+            if species == "bird":
+                dname = rr.choice(["Shorebird", "Gull", "Lark", "Swallow", "Kite"])
+                age_y = rr.randint(1, 9)
+            elif species == "deer":
+                dname = rr.choice(["Roe deer", "Red deer", "Fallow deer"])
+                age_y = rr.randint(2, 14)
+            elif species == "sheep":
+                age_y = rr.randint(1, 11)
+                dname = "Lamb" if age_y < 2 else rr.choice(["Ewe", "Ram", "Sheep"])
+            else:
+                age_y = rr.randint(2, 15)
+                dname = rr.choice(["Cow", "Ox", "Heifer", "Bull"])
             return VisualAnimal(
                 x=x,
                 y=y,
@@ -904,6 +1437,9 @@ class RealtimeVisualizer:
                 vy=math.sin(ang) * sp,
                 species=species,
                 region_id=r_id,
+                display_name=dname,
+                age_years=age_y,
+                is_livestock=livestock,
             )
 
         new_list: list[VisualAnimal] = []
@@ -1125,45 +1661,47 @@ class RealtimeVisualizer:
         small_font: pygame.font.Font,
     ) -> None:
         panel_rect = pygame.Rect(0, 0, self.left_panel_width, self.height)
-        pygame.draw.rect(screen, (20, 24, 30), panel_rect)
-        pygame.draw.line(screen, (55, 60, 72), (panel_rect.right - 2, 0), (panel_rect.right - 2, self.height), 2)
+        split = int(panel_rect.height * 0.35)
+        pygame.draw.rect(screen, (34, 36, 44), pygame.Rect(0, 0, panel_rect.width, split))
+        pygame.draw.rect(screen, (22, 24, 30), pygame.Rect(0, split, panel_rect.width, panel_rect.height - split))
+        pygame.draw.rect(screen, self.ui_accent, (panel_rect.right - 4, 0, 4, panel_rect.height))
+        pygame.draw.line(screen, (8, 9, 12), (panel_rect.right - 1, 0), (panel_rect.right - 1, self.height), 1)
 
-        title = font.render("World Timeline", True, (235, 235, 240))
-        screen.blit(title, (16, 16))
-        subtitle = small_font.render("Major simulation events", True, (170, 175, 188))
-        screen.blit(subtitle, (16, 42))
+        title = font.render("World timeline", True, self.panel_text_color)
+        screen.blit(title, (18, 18))
+        subtitle = small_font.render("Major events & settlements", True, self.ui_text_dim)
+        screen.blit(subtitle, (18, 44))
 
         city_header = small_font.render(
-            f"Cities: {len(self.engine.city_summaries)}",
+            f"Cities · {len(self.engine.city_summaries)}",
             True,
-            (206, 212, 228),
+            (200, 206, 220),
         )
-        screen.blit(city_header, (16, 64))
-        y_city = 84
+        screen.blit(city_header, (18, 68))
+        y_city = 88
         for city in self.engine.city_summaries[:3]:
             line = f"{city['name']} ({city['culture']}/{city['religion']})"
-            txt = small_font.render(line[:42], True, (176, 188, 220))
-            screen.blit(txt, (16, y_city))
+            txt = small_font.render(line[:42], True, (172, 184, 208))
+            screen.blit(txt, (20, y_city))
             y_city += 18
 
         if not self.timeline_cache:
-            msg = small_font.render("No major events yet.", True, (150, 155, 170))
-            screen.blit(msg, (16, 190))
+            msg = small_font.render("No major events yet.", True, (130, 136, 150))
+            screen.blit(msg, (18, 192))
         else:
-            y = 190
+            y = 192
             for item in self.timeline_cache[:12]:
-                bullet = small_font.render(f"- {item}", True, (210, 214, 224))
-                screen.blit(bullet, (16, y))
+                bullet = small_font.render(f"· {item}", True, (208, 212, 222))
+                screen.blit(bullet, (18, y))
                 y += 22
 
-        # Dedicated scrollable city ledger area (shrink on short windows).
         ledger_h = min(300, max(100, int(self.height * 0.28)))
         ledger_top = max(120, self.height - ledger_h - max(10, self.height // 80))
         ledger_rect = pygame.Rect(10, ledger_top, max(40, self.left_panel_width - 20), ledger_h)
-        pygame.draw.rect(screen, (24, 29, 36), ledger_rect, border_radius=6)
-        pygame.draw.rect(screen, (54, 62, 76), ledger_rect, 1, border_radius=6)
-        title = small_font.render("City Ledger (scroll: wheel / PgUp PgDn)", True, (220, 224, 236))
-        screen.blit(title, (ledger_rect.left + 8, ledger_rect.top + 8))
+        pygame.draw.rect(screen, (30, 33, 40), ledger_rect, border_radius=8)
+        pygame.draw.rect(screen, (62, 70, 86), ledger_rect, 1, border_radius=8)
+        lt = small_font.render("City ledger  ·  wheel / PgUp / PgDn", True, (216, 220, 232))
+        screen.blit(lt, (ledger_rect.left + 10, ledger_rect.top + 10))
         self._draw_city_ledger_rows(screen, small_font, ledger_rect)
 
     def _city_line_summary(self) -> str:
