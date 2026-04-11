@@ -1,9 +1,13 @@
+import os
+import time
+from dataclasses import replace
 from pathlib import Path
 
 from population_sim.config import (
     BehaviorConfig,
     ContactNetworkConfig,
     ConflictConfig,
+    CognitionConfig,
     DemographicsConfig,
     EnvironmentConfig,
     MigrationConfig,
@@ -14,6 +18,8 @@ from population_sim.config import (
 )
 from population_sim.simulation import SimulationEngine
 from population_sim.visualize import plot_stats
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def build_default_config() -> SimulationConfig:
@@ -177,10 +183,21 @@ def print_event_summary(engine: SimulationEngine, max_items: int = 60) -> None:
 
 def main() -> None:
     config = build_default_config()
+    if os.environ.get("SIM_FULL_COGNITION", "").lower() not in ("1", "true", "yes"):
+        config = replace(
+            config,
+            cognition=replace(config.cognition, learned_goal_network=False),
+        )
     engine = SimulationEngine(config)
-    stats = engine.run()
+    t0 = time.perf_counter()
+    stats = engine.run(console_progress=True)
+    elapsed = time.perf_counter() - t0
+    n_years = len(stats.history)
+    yps = n_years / elapsed if elapsed > 0 else 0.0
+    print(f"Simulation wall time: {elapsed:.2f}s ({yps:.1f} years/s over {n_years} steps)")
 
-    output_dir = Path("outputs")
+    output_dir = _PROJECT_ROOT / "outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "population_stats.csv"
     chart_path = output_dir / "population_trends.png"
 
@@ -191,8 +208,8 @@ def main() -> None:
     print_event_summary(engine)
     print_city_summary(engine)
     print_final_summary(rows)
-    print(f"CSV saved to: {csv_path}")
-    print(f"Chart saved to: {chart_path}")
+    print(f"CSV saved to: {csv_path.resolve()}")
+    print(f"Chart saved to: {chart_path.resolve()}")
 
 
 if __name__ == "__main__":

@@ -66,6 +66,17 @@ class UISlider:
         self.setter(value)
 
 
+# Right-panel categories: icon-style tabs, each opens its own slider set (game-style menus).
+_CONTROL_TAB_META: tuple[tuple[str, str], ...] = (
+    ("Core", "Food, people, movement, war mood, trade, speed"),
+    ("Health", "Disease, vaccines, how pathogens evolve"),
+    ("Mind", "IQ, birth spread, learned goal blend"),
+    ("Social", "Contact web, migration priorities"),
+    ("Planet", "Environment noise, harvests, disasters, density"),
+    ("Display", "Map overlays — click the large buttons"),
+)
+
+
 class RealtimeVisualizer:
     def __init__(self, engine: SimulationEngine, width: int = 2140, height: int = 1120) -> None:
         self.engine = engine
@@ -86,7 +97,12 @@ class RealtimeVisualizer:
         self.frame_counter = 0
         self.rng = random.Random(engine.config.random_seed + 999)
         self.visual_state: dict[int, VisualAgent] = {}
-        self.sliders: list[UISlider] = []
+        self.slider_groups: list[list[UISlider]] = []
+        self.control_category: int = 0
+        self.control_tab_rects: list[pygame.Rect] = []
+        self.hovered_control_tab: int | None = None
+        self._view_region_rect = pygame.Rect(0, 0, 0, 0)
+        self._view_labels_rect = pygame.Rect(0, 0, 0, 0)
         self.dragging_slider: UISlider | None = None
         self.mouse_pos: tuple[int, int] = (0, 0)
         self.pinned_person_id: int | None = None
@@ -160,10 +176,6 @@ class RealtimeVisualizer:
         h = (region_id * 0.618033988749895) % 1.0
         r, g, b = colorsys.hsv_to_rgb(h, 0.58, 0.78)
         return int(r * 255), int(g * 255), int(b * 255)
-
-    def _region_overlay_button_rect(self) -> pygame.Rect:
-        w = min(236, max(140, self.panel_width - 36))
-        return pygame.Rect(self.width - self.panel_width + 18, self.height - 108, w, 34)
 
     def _region_overlay_legend_entries(self) -> list[tuple[str, str, tuple[int, int, int]]]:
         alive = [p for p in self.engine.population if p.alive]
@@ -408,7 +420,7 @@ class RealtimeVisualizer:
                 self._decor_crops.append((nx, ny, r.uniform(0.7, 1.2)))
                 break
 
-    def _load_ui_fonts(self) -> tuple[pygame.font.Font, pygame.font.Font]:
+    def _load_ui_fonts(self) -> tuple[pygame.font.Font, pygame.font.Font, pygame.font.Font]:
         avail = set(pygame.font.get_fonts())
         for key, display in [
             ("segoeui", "Segoe UI"),
@@ -418,10 +430,15 @@ class RealtimeVisualizer:
         ]:
             if key in avail:
                 return (
-                    pygame.font.SysFont(display, 19),
-                    pygame.font.SysFont(display, 14),
+                    pygame.font.SysFont(display, 20),
+                    pygame.font.SysFont(display, 15),
+                    pygame.font.SysFont(display, 12),
                 )
-        return pygame.font.SysFont("consolas", 18), pygame.font.SysFont("consolas", 15)
+        return (
+            pygame.font.SysFont("consolas", 19),
+            pygame.font.SysFont("consolas", 15),
+            pygame.font.SysFont("consolas", 12),
+        )
 
     def _desktop_pixel_size(self) -> tuple[int, int]:
         """Primary monitor size in pixels (for clamping window and true fullscreen)."""
@@ -453,9 +470,9 @@ class RealtimeVisualizer:
     def _layout_panels(self) -> None:
         """Side panel widths scale with window size; center world column keeps a minimum."""
         w = max(400, self.width)
-        min_left, min_right = 168, 188
+        min_left, min_right = 168, 248
         lw = max(min_left, min(int(w * 0.132), 400))
-        rw = max(min_right, min(int(w * 0.166), 440))
+        rw = max(min_right, min(int(w * 0.195), 500))
         min_center = max(220, w // 5)
         while lw + rw + min_center > w and lw > min_left + 20:
             lw -= 12
@@ -503,7 +520,7 @@ class RealtimeVisualizer:
         screen = pygame.display.set_mode((self.width, self.height), win_flags)
         pygame.display.set_caption("Population Dynamics — live world view")
         clock = pygame.time.Clock()
-        font, small_font = self._load_ui_fonts()
+        font, small_font, tiny_font = self._load_ui_fonts()
 
         while self.running:
             dt = clock.tick(60) / 1000.0
@@ -538,7 +555,7 @@ class RealtimeVisualizer:
                 self._move_agents(dt)
                 self._move_visual_animals(dt)
             self._update_camera_from_input(dt)
-            self._draw(screen, font, small_font)
+            self._draw(screen, font, small_font, tiny_font)
             pygame.display.flip()
 
         pygame.quit()
@@ -578,18 +595,29 @@ class RealtimeVisualizer:
                     self._reset_camera_centered()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
-                if self._region_overlay_button_rect().collidepoint(mx, my):
-                    self.show_region_overlay = not self.show_region_overlay
-                    continue
-                hit_slider = False
-                for slider in self.sliders:
-                    if slider.rect.collidepoint(event.pos):
-                        slider.active = True
-                        self.dragging_slider = slider
-                        slider.set_from_x(event.pos[0])
-                        hit_slider = True
-                        break
-                if not hit_slider and self.left_panel_width <= mx < self.width - self.panel_width:
+                panel_left = self.width - self.panel_width
+                if mx >= panel_left:
+                    tab_hit = False
+                    for ti, tr in enumerate(self.control_tab_rects):
+                        if tr.collidepoint(mx, my):
+                            self.control_category = ti
+                            self.dragging_slider = None
+                            tab_hit = True
+                            break
+                    if not tab_hit:
+                        if self.control_category == len(_CONTROL_TAB_META) - 1:
+                            if self._view_region_rect.collidepoint(mx, my):
+                                self.show_region_overlay = not self.show_region_overlay
+                            elif self._view_labels_rect.collidepoint(mx, my):
+                                self.show_labels = not self.show_labels
+                        else:
+                            for slider in self._active_sliders():
+                                if slider.rect.collidepoint(event.pos):
+                                    slider.active = True
+                                    self.dragging_slider = slider
+                                    slider.set_from_x(event.pos[0])
+                                    break
+                elif self.left_panel_width <= mx < panel_left:
                     pick = self._pick_at(mx, my)
                     if pick is not None and pick[0] == "person":
                         self.pinned_person_id = pick[1].person_id
@@ -608,6 +636,17 @@ class RealtimeVisualizer:
                 self.world_dragging = False
             elif event.type == pygame.MOUSEMOTION:
                 self.mouse_pos = event.pos
+                mx, my = event.pos
+                pl = self.width - self.panel_width
+                if mx >= pl:
+                    ht = None
+                    for ti, tr in enumerate(self.control_tab_rects):
+                        if tr.collidepoint(mx, my):
+                            ht = ti
+                            break
+                    self.hovered_control_tab = ht
+                else:
+                    self.hovered_control_tab = None
                 if self.world_dragging:
                     mx, my = event.pos
                     lx, ly = self.world_drag_last
@@ -782,7 +821,77 @@ class RealtimeVisualizer:
             return self._lerp_rgb(sick, flesh_lo, (person.health - 0.22) / 0.23)
         return self._mul_rgb(sick, 0.92)
 
-    def _draw(self, screen: pygame.Surface, font: pygame.font.Font, small_font: pygame.font.Font) -> None:
+    def _active_sliders(self) -> list[UISlider]:
+        if not self.slider_groups:
+            return []
+        i = max(0, min(len(self.slider_groups) - 1, self.control_category))
+        return self.slider_groups[i]
+
+    def _slider_value_display(self, slider: UISlider) -> str:
+        v = slider.current()
+        low = slider.label.lower()
+        if "simulation speed" in low:
+            return f"{int(round(v))} fr/yr"
+        if "avg contacts" in low:
+            return str(int(round(v)))
+        if "vaccine starts" in low:
+            return f"yr {int(round(v))}"
+        return f"{v:.3f}"
+
+    def _draw_tab_glyph(
+        self,
+        screen: pygame.Surface,
+        tab_rect: pygame.Rect,
+        tab_index: int,
+        active: bool,
+    ) -> None:
+        cx, cy = tab_rect.centerx, tab_rect.top + 13
+        col = (230, 234, 245) if active else (160, 168, 188)
+        if tab_index == 0:
+            for ox in (-5, 0, 5):
+                pygame.draw.rect(screen, col, pygame.Rect(cx + ox - 2, cy - 6, 4, 12), border_radius=1)
+        elif tab_index == 1:
+            pygame.draw.circle(screen, col, (cx, cy), 6, 2)
+            pygame.draw.line(screen, col, (cx, cy - 8), (cx, cy + 8), 2)
+            pygame.draw.line(screen, col, (cx - 8, cy), (cx + 8, cy), 2)
+        elif tab_index == 2:
+            pygame.draw.circle(screen, col, (cx, cy - 2), 7, 2)
+            pygame.draw.arc(
+                screen,
+                col,
+                pygame.Rect(cx - 7, cy - 1, 14, 9),
+                0.28 * math.pi,
+                0.72 * math.pi,
+                2,
+            )
+        elif tab_index == 3:
+            pts = [(cx - 7, cy + 5), (cx, cy - 7), (cx + 7, cy + 5)]
+            for i, p in enumerate(pts):
+                pygame.draw.circle(screen, col, p, 3)
+                q = pts[(i + 1) % 3]
+                pygame.draw.line(screen, col, p, q, 1)
+        elif tab_index == 4:
+            pygame.draw.arc(
+                screen,
+                col,
+                pygame.Rect(cx - 9, cy - 8, 18, 16),
+                -0.12 * math.pi,
+                1.12 * math.pi,
+                2,
+            )
+            pygame.draw.arc(
+                screen,
+                col,
+                pygame.Rect(cx - 6, cy - 4, 12, 9),
+                1.05 * math.pi,
+                2.05 * math.pi,
+                2,
+            )
+        else:
+            pygame.draw.rect(screen, col, pygame.Rect(cx - 9, cy - 6, 18, 11), 2, border_radius=2)
+            pygame.draw.circle(screen, col, (cx, cy), 3)
+
+    def _draw(self, screen: pygame.Surface, font: pygame.font.Font, small_font: pygame.font.Font, tiny_font: pygame.font.Font) -> None:
         screen.fill(self.bg_color)
         self._draw_regions(screen)
         self._draw_timeline_panel(screen, font, small_font)
@@ -838,7 +947,7 @@ class RealtimeVisualizer:
             screen.set_clip(clip_leg)
 
         self._draw_hud(screen, font, alive_people)
-        self._draw_control_panel(screen, font, small_font)
+        self._draw_control_panel(screen, font, small_font, tiny_font)
         self._draw_hover_tooltip(screen, small_font)
         self._draw_messages(screen, small_font)
 
@@ -1020,22 +1129,40 @@ class RealtimeVisualizer:
     def _build_sliders(self) -> None:
         margin_x = max(12, min(28, self.panel_width // 14))
         left = self.width - self.panel_width + margin_x
-        top = max(96, min(120, int(self.height * 0.095)))
         inner_w = max(120, self.panel_width - 2 * margin_x)
         h = max(12, min(18, self.height // 70))
-        n_sliders = 11
-        footer = max(56, min(90, self.height // 12))
-        usable = max(h * n_sliders + 8, self.height - top - footer)
-        gap = max(40, min(60, usable // max(n_sliders, 1)))
+        footer_h = max(76, min(108, self.height // 10))
+        header_h = 76
+        tab_row_h = 42
+        hint_h = 18
+        tab_gap = 4
+        content_top = header_h + tab_row_h + tab_gap + hint_h + 4
+        n_tabs = len(_CONTROL_TAB_META)
+        tab_pad = 3
+        tab_w = max(30, (inner_w - (n_tabs - 1) * tab_pad) // n_tabs)
+        self.control_tab_rects = []
+        tab_y = header_h + 2
+        for ti in range(n_tabs):
+            tx = left + ti * (tab_w + tab_pad)
+            self.control_tab_rects.append(pygame.Rect(tx, tab_y, tab_w, tab_row_h - 4))
 
-        self.sliders = [
+        max_sl = 7
+        row_step = max(26, min(38, (self.height - content_top - footer_h - 6) // max_sl))
+
+        def R(i: int) -> pygame.Rect:
+            return pygame.Rect(left, content_top + row_step * i, inner_w, h)
+
+        self._view_region_rect = pygame.Rect(left, content_top + 12, inner_w, 46)
+        self._view_labels_rect = pygame.Rect(left, content_top + 66, inner_w, 46)
+
+        core = [
             UISlider(
                 label="Food supply",
                 min_value=0.2,
                 max_value=2.0,
                 getter=lambda: self.engine.config.environment.base_food_per_capita,
                 setter=lambda v: setattr(self.engine.config.environment, "base_food_per_capita", v),
-                rect=pygame.Rect(left, top + gap * 0, inner_w, h),
+                rect=R(0),
             ),
             UISlider(
                 label="Birth rate",
@@ -1043,23 +1170,7 @@ class RealtimeVisualizer:
                 max_value=0.9,
                 getter=lambda: self.engine.config.demographics.base_birth_rate,
                 setter=lambda v: setattr(self.engine.config.demographics, "base_birth_rate", v),
-                rect=pygame.Rect(left, top + gap * 1, inner_w, h),
-            ),
-            UISlider(
-                label="Infection rate",
-                min_value=0.01,
-                max_value=0.9,
-                getter=lambda: self.engine.config.pathogens[0].infection_rate if self.engine.config.pathogens else 0.01,
-                setter=lambda v: self._set_pathogen_value("infection_rate", v),
-                rect=pygame.Rect(left, top + gap * 2, inner_w, h),
-            ),
-            UISlider(
-                label="Disease mortality",
-                min_value=0.001,
-                max_value=0.3,
-                getter=lambda: self.engine.config.pathogens[0].mortality_rate if self.engine.config.pathogens else 0.001,
-                setter=lambda v: self._set_pathogen_value("mortality_rate", v),
-                rect=pygame.Rect(left, top + gap * 3, inner_w, h),
+                rect=R(1),
             ),
             UISlider(
                 label="Migration rate",
@@ -1067,7 +1178,7 @@ class RealtimeVisualizer:
                 max_value=0.2,
                 getter=lambda: self.engine.config.migration.migration_rate,
                 setter=lambda v: setattr(self.engine.config.migration, "migration_rate", v),
-                rect=pygame.Rect(left, top + gap * 4, inner_w, h),
+                rect=R(2),
             ),
             UISlider(
                 label="World aggression",
@@ -1075,39 +1186,15 @@ class RealtimeVisualizer:
                 max_value=2.5,
                 getter=lambda: float(getattr(self.engine.config.conflict, "world_aggression", 1.0)),
                 setter=lambda v: setattr(self.engine.config.conflict, "world_aggression", v),
-                rect=pygame.Rect(left, top + gap * 5, inner_w, h),
+                rect=R(3),
             ),
             UISlider(
-                label="Brain IQ (world)",
-                min_value=0.15,
-                max_value=1.0,
-                getter=lambda: self.engine.config.cognition.world_iq,
-                setter=lambda v: setattr(self.engine.config.cognition, "world_iq", v),
-                rect=pygame.Rect(left, top + gap * 6, inner_w, h),
-            ),
-            UISlider(
-                label="IQ spread (birth)",
+                label="Inter-region trade",
                 min_value=0.0,
-                max_value=1.0,
-                getter=lambda: self.engine.config.cognition.birth_iq_diversity,
-                setter=lambda v: setattr(self.engine.config.cognition, "birth_iq_diversity", v),
-                rect=pygame.Rect(left, top + gap * 7, inner_w, h),
-            ),
-            UISlider(
-                label="Learned goal mix",
-                min_value=0.0,
-                max_value=0.85,
-                getter=lambda: self.engine.config.cognition.learned_goal_mix,
-                setter=lambda v: setattr(self.engine.config.cognition, "learned_goal_mix", v),
-                rect=pygame.Rect(left, top + gap * 8, inner_w, h),
-            ),
-            UISlider(
-                label="Vaccination coverage",
-                min_value=0.0,
-                max_value=0.5,
-                getter=lambda: self.engine.config.vaccination.annual_coverage_fraction,
-                setter=lambda v: setattr(self.engine.config.vaccination, "annual_coverage_fraction", v),
-                rect=pygame.Rect(left, top + gap * 9, inner_w, h),
+                max_value=0.28,
+                getter=lambda: self.engine.config.economy.inter_region_trade_volume,
+                setter=lambda v: setattr(self.engine.config.economy, "inter_region_trade_volume", v),
+                rect=R(4),
             ),
             UISlider(
                 label="Simulation speed",
@@ -1115,9 +1202,212 @@ class RealtimeVisualizer:
                 max_value=1800.0,
                 getter=lambda: float(self.step_every_frames),
                 setter=lambda v: setattr(self, "step_every_frames", max(1, min(1800, int(round(v))))),
-                rect=pygame.Rect(left, top + gap * 10, inner_w, h),
+                rect=R(5),
             ),
         ]
+
+        health = [
+            UISlider(
+                label="Infection rate",
+                min_value=0.01,
+                max_value=0.9,
+                getter=lambda: self.engine.config.pathogens[0].infection_rate if self.engine.config.pathogens else 0.01,
+                setter=lambda v: self._set_pathogen_value("infection_rate", v),
+                rect=R(0),
+            ),
+            UISlider(
+                label="Disease mortality",
+                min_value=0.001,
+                max_value=0.3,
+                getter=lambda: self.engine.config.pathogens[0].mortality_rate if self.engine.config.pathogens else 0.001,
+                setter=lambda v: self._set_pathogen_value("mortality_rate", v),
+                rect=R(1),
+            ),
+            UISlider(
+                label="Vaccination coverage",
+                min_value=0.0,
+                max_value=0.5,
+                getter=lambda: self.engine.config.vaccination.annual_coverage_fraction,
+                setter=lambda v: setattr(self.engine.config.vaccination, "annual_coverage_fraction", v),
+                rect=R(2),
+            ),
+            UISlider(
+                label="Recovery rate",
+                min_value=0.02,
+                max_value=0.45,
+                getter=lambda: self.engine.config.pathogens[0].recovery_rate if self.engine.config.pathogens else 0.12,
+                setter=lambda v: self._set_pathogen_value("recovery_rate", v),
+                rect=R(3),
+            ),
+            UISlider(
+                label="Immunity loss",
+                min_value=0.0,
+                max_value=0.08,
+                getter=lambda: self.engine.config.pathogens[0].immunity_loss_rate if self.engine.config.pathogens else 0.01,
+                setter=lambda v: self._set_pathogen_value("immunity_loss_rate", v),
+                rect=R(4),
+            ),
+            UISlider(
+                label="Vaccine effectiveness",
+                min_value=0.2,
+                max_value=1.0,
+                getter=lambda: self.engine.config.vaccination.effectiveness,
+                setter=lambda v: setattr(self.engine.config.vaccination, "effectiveness", v),
+                rect=R(5),
+            ),
+            UISlider(
+                label="Vaccine starts (year)",
+                min_value=0.0,
+                max_value=120.0,
+                getter=lambda: float(self.engine.config.vaccination.start_year),
+                setter=lambda v: setattr(self.engine.config.vaccination, "start_year", int(round(v))),
+                rect=R(6),
+            ),
+        ]
+
+        mind = [
+            UISlider(
+                label="Brain IQ (world)",
+                min_value=0.15,
+                max_value=1.0,
+                getter=lambda: self.engine.config.cognition.world_iq,
+                setter=lambda v: setattr(self.engine.config.cognition, "world_iq", v),
+                rect=R(0),
+            ),
+            UISlider(
+                label="IQ spread (birth)",
+                min_value=0.0,
+                max_value=1.0,
+                getter=lambda: self.engine.config.cognition.birth_iq_diversity,
+                setter=lambda v: setattr(self.engine.config.cognition, "birth_iq_diversity", v),
+                rect=R(1),
+            ),
+            UISlider(
+                label="Learned goal mix",
+                min_value=0.0,
+                max_value=0.85,
+                getter=lambda: self.engine.config.cognition.learned_goal_mix,
+                setter=lambda v: setattr(self.engine.config.cognition, "learned_goal_mix", v),
+                rect=R(2),
+            ),
+            UISlider(
+                label="Stress vs births",
+                min_value=0.0,
+                max_value=1.2,
+                getter=lambda: self.engine.config.behavior.stress_birth_penalty_weight,
+                setter=lambda v: setattr(self.engine.config.behavior, "stress_birth_penalty_weight", v),
+                rect=R(3),
+            ),
+        ]
+
+        social = [
+            UISlider(
+                label="Cross-region contact",
+                min_value=0.0,
+                max_value=0.35,
+                getter=lambda: self.engine.config.migration.cross_region_contact_rate,
+                setter=lambda v: setattr(self.engine.config.migration, "cross_region_contact_rate", v),
+                rect=R(0),
+            ),
+            UISlider(
+                label="Avg contacts",
+                min_value=3.0,
+                max_value=22.0,
+                getter=lambda: float(self.engine.config.contact_network.avg_contacts),
+                setter=lambda v: setattr(
+                    self.engine.config.contact_network,
+                    "avg_contacts",
+                    int(max(3, min(40, round(v)))),
+                ),
+                rect=R(1),
+            ),
+            UISlider(
+                label="Network rewiring",
+                min_value=0.0,
+                max_value=0.5,
+                getter=lambda: self.engine.config.contact_network.rewiring_rate,
+                setter=lambda v: setattr(self.engine.config.contact_network, "rewiring_rate", v),
+                rect=R(2),
+            ),
+            UISlider(
+                label="Migrate for food",
+                min_value=0.0,
+                max_value=1.0,
+                getter=lambda: self.engine.config.behavior.migration_food_weight,
+                setter=lambda v: setattr(self.engine.config.behavior, "migration_food_weight", v),
+                rect=R(3),
+            ),
+            UISlider(
+                label="Flee infection",
+                min_value=0.0,
+                max_value=1.0,
+                getter=lambda: self.engine.config.behavior.migration_infection_weight,
+                setter=lambda v: setattr(self.engine.config.behavior, "migration_infection_weight", v),
+                rect=R(4),
+            ),
+            UISlider(
+                label="Avoid sick (bias)",
+                min_value=0.0,
+                max_value=1.0,
+                getter=lambda: self.engine.config.behavior.contact_avoid_infected_bias,
+                setter=lambda v: setattr(self.engine.config.behavior, "contact_avoid_infected_bias", v),
+                rect=R(5),
+            ),
+        ]
+
+        planet = [
+            UISlider(
+                label="Food variability",
+                min_value=0.0,
+                max_value=0.55,
+                getter=lambda: self.engine.config.environment.food_variability,
+                setter=lambda v: setattr(self.engine.config.environment, "food_variability", v),
+                rect=R(0),
+            ),
+            UISlider(
+                label="Environmental stress",
+                min_value=0.0,
+                max_value=0.35,
+                getter=lambda: self.engine.config.environment.environmental_stress,
+                setter=lambda v: setattr(self.engine.config.environment, "environmental_stress", v),
+                rect=R(1),
+            ),
+            UISlider(
+                label="Shock probability",
+                min_value=0.0,
+                max_value=0.2,
+                getter=lambda: self.engine.config.environment.shock_probability,
+                setter=lambda v: setattr(self.engine.config.environment, "shock_probability", v),
+                rect=R(2),
+            ),
+            UISlider(
+                label="Harvest volatility",
+                min_value=0.0,
+                max_value=0.35,
+                getter=lambda: self.engine.config.world_realism.harvest_volatility,
+                setter=lambda v: setattr(self.engine.config.world_realism, "harvest_volatility", v),
+                rect=R(3),
+            ),
+            UISlider(
+                label="Disaster chance",
+                min_value=0.0,
+                max_value=0.18,
+                getter=lambda: self.engine.config.world_realism.regional_disaster_probability,
+                setter=lambda v: setattr(self.engine.config.world_realism, "regional_disaster_probability", v),
+                rect=R(4),
+            ),
+            UISlider(
+                label="Urban disease boost",
+                min_value=0.0,
+                max_value=0.22,
+                getter=lambda: self.engine.config.world_realism.urban_crowding_disease_boost,
+                setter=lambda v: setattr(self.engine.config.world_realism, "urban_crowding_disease_boost", v),
+                rect=R(5),
+            ),
+        ]
+
+        self.slider_groups = [core, health, mind, social, planet, []]
+        self.control_category = max(0, min(len(self.slider_groups) - 1, self.control_category))
 
     def _set_pathogen_value(self, key: str, value: float) -> None:
         if not self.engine.config.pathogens:
@@ -1129,6 +1419,7 @@ class RealtimeVisualizer:
         screen: pygame.Surface,
         font: pygame.font.Font,
         small_font: pygame.font.Font,
+        tiny_font: pygame.font.Font,
     ) -> None:
         panel_rect = pygame.Rect(self.width - self.panel_width, 0, self.panel_width, self.height)
         split = int(panel_rect.height * 0.38)
@@ -1147,61 +1438,93 @@ class RealtimeVisualizer:
         pygame.draw.line(screen, (52, 56, 64), (panel_rect.left + 1, 0), (panel_rect.left + 1, self.height), 1)
 
         title = font.render("Simulation controls", True, self.panel_text_color)
-        screen.blit(title, (panel_rect.left + 22, 24))
-        subtitle = small_font.render("Adjust parameters in real time", True, self.ui_text_dim)
-        screen.blit(subtitle, (panel_rect.left + 22, 50))
+        screen.blit(title, (panel_rect.left + 22, 22))
+        subtitle = small_font.render("Pick a category, then drag sliders", True, self.ui_text_dim)
+        screen.blit(subtitle, (panel_rect.left + 22, 48))
         pygame.draw.line(
             screen,
             (52, 56, 66),
-            (panel_rect.left + 18, 74),
-            (panel_rect.right - 14, 74),
+            (panel_rect.left + 18, 72),
+            (panel_rect.right - 14, 72),
             1,
         )
 
-        for slider in self.sliders:
-            label = small_font.render(f"{slider.label}  ·  {slider.current():.3f}", True, (210, 214, 224))
-            screen.blit(label, (slider.rect.left, slider.rect.top - 22))
+        for ti, tr in enumerate(self.control_tab_rects):
+            active = ti == self.control_category
+            hover = ti == self.hovered_control_tab
+            bg = (52, 58, 72) if active else ((46, 50, 62) if hover else (34, 36, 44))
+            pygame.draw.rect(screen, bg, tr, border_radius=7)
+            brd = self.ui_accent if active else ((88, 98, 118) if hover else (56, 60, 72))
+            pygame.draw.rect(screen, brd, tr, 2, border_radius=7)
+            self._draw_tab_glyph(screen, tr, ti, active)
+            tab_name = _CONTROL_TAB_META[ti][0]
+            short = tab_name if len(tab_name) <= 6 else tab_name[:5] + "."
+            tlab = tiny_font.render(short, True, (220, 224, 232) if active else (168, 174, 188))
+            screen.blit(tlab, (tr.centerx - tlab.get_width() // 2, tr.bottom - tlab.get_height() - 3))
 
-            inset = pygame.Rect(slider.rect.left, slider.rect.top - 1, slider.rect.width, slider.rect.height + 2)
-            pygame.draw.rect(screen, (12, 13, 16), inset, border_radius=8)
-            pygame.draw.rect(screen, (44, 46, 54), slider.rect, border_radius=7)
-            fill_width = int(slider.rect.width * slider.normalized())
-            if fill_width > 0:
-                fill_rect = pygame.Rect(slider.rect.left, slider.rect.top, fill_width, slider.rect.height)
-                pygame.draw.rect(screen, (42, 118, 188), fill_rect, border_radius=7)
-                hi = pygame.Rect(fill_rect.left, fill_rect.top, fill_rect.width, max(1, fill_rect.height // 2))
-                pygame.draw.rect(screen, (88, 168, 228), hi, border_radius=7)
+        hint_y = 76 + 42 + 4
+        cat_title = _CONTROL_TAB_META[self.control_category][0]
+        hint = _CONTROL_TAB_META[self.control_category][1]
+        ht1 = tiny_font.render(cat_title.upper(), True, (190, 196, 210))
+        screen.blit(ht1, (panel_rect.left + 22, hint_y))
+        ht2 = tiny_font.render(hint, True, (138, 144, 158))
+        screen.blit(ht2, (panel_rect.left + 22, hint_y + 14))
 
-            handle_x = slider.rect.left + fill_width
-            handle = pygame.Rect(handle_x - 7, slider.rect.top - 5, 14, slider.rect.height + 10)
-            pygame.draw.rect(screen, (18, 20, 26), (handle.left + 1, handle.top + 1, handle.width, handle.height), border_radius=5)
-            hcol = (252, 252, 255) if slider.active else (232, 234, 240)
-            pygame.draw.rect(screen, hcol, handle, border_radius=5)
-            pygame.draw.rect(screen, (100, 108, 124), handle, 1, border_radius=5)
+        if self.control_category == len(_CONTROL_TAB_META) - 1:
+            for btn, on, lbl_on, lbl_off in (
+                (self._view_region_rect, self.show_region_overlay, "Region map overlay ON", "Region map overlay OFF"),
+                (self._view_labels_rect, self.show_labels, "Sample person labels ON", "Sample person labels OFF"),
+            ):
+                pygame.draw.rect(screen, (14, 16, 22), btn, border_radius=10)
+                pygame.draw.rect(
+                    screen,
+                    self._lerp_rgb(self.ui_accent, (120, 200, 120), 0.5) if on else (48, 52, 62),
+                    btn,
+                    2,
+                    border_radius=10,
+                )
+                lbl = lbl_on if on else lbl_off
+                bt = small_font.render(lbl, True, (232, 234, 240))
+                screen.blit(bt, (btn.left + 14, btn.top + (btn.height - bt.get_height()) // 2))
+            keys = tiny_font.render("Keys: R toggle regions · L toggle labels", True, (120, 126, 140))
+            screen.blit(keys, (panel_rect.left + 22, self._view_labels_rect.bottom + 14))
+        else:
+            for slider in self._active_sliders():
+                val = self._slider_value_display(slider)
+                label = small_font.render(f"{slider.label}  ·  {val}", True, (210, 214, 224))
+                screen.blit(label, (slider.rect.left, slider.rect.top - 20))
 
-        btn = self._region_overlay_button_rect()
-        on = self.show_region_overlay
-        pygame.draw.rect(screen, (14, 16, 22), btn, border_radius=8)
-        pygame.draw.rect(
-            screen,
-            self._lerp_rgb(self.ui_accent, (120, 200, 120), 0.55) if on else (48, 52, 62),
-            btn,
-            2,
-            border_radius=8,
-        )
-        lbl = "Region colors: ON" if on else "Region colors: OFF"
-        bt = small_font.render(lbl, True, (232, 234, 240))
-        screen.blit(bt, (btn.left + 12, btn.top + (btn.height - bt.get_height()) // 2))
+                inset = pygame.Rect(slider.rect.left, slider.rect.top - 1, slider.rect.width, slider.rect.height + 2)
+                pygame.draw.rect(screen, (12, 13, 16), inset, border_radius=8)
+                pygame.draw.rect(screen, (44, 46, 54), slider.rect, border_radius=7)
+                fill_width = int(slider.rect.width * slider.normalized())
+                if fill_width > 0:
+                    fill_rect = pygame.Rect(slider.rect.left, slider.rect.top, fill_width, slider.rect.height)
+                    pygame.draw.rect(screen, (42, 118, 188), fill_rect, border_radius=7)
+                    hi = pygame.Rect(fill_rect.left, fill_rect.top, fill_rect.width, max(1, fill_rect.height // 2))
+                    pygame.draw.rect(screen, (88, 168, 228), hi, border_radius=7)
+
+                handle_x = slider.rect.left + fill_width
+                handle = pygame.Rect(handle_x - 7, slider.rect.top - 5, 14, slider.rect.height + 10)
+                pygame.draw.rect(
+                    screen,
+                    (18, 20, 26),
+                    (handle.left + 1, handle.top + 1, handle.width, handle.height),
+                    border_radius=5,
+                )
+                hcol = (252, 252, 255) if slider.active else (232, 234, 240)
+                pygame.draw.rect(screen, hcol, handle, border_radius=5)
+                pygame.draw.rect(screen, (100, 108, 124), handle, 1, border_radius=5)
 
         tips = [
-            "Zoom: Ctrl+wheel or +/- keys · 0 resets view",
-            "Pan: WASD · wheel · middle-drag · R: region map",
+            "Zoom: Ctrl+wheel or +/- · 0 resets view",
+            "Pan: WASD · wheel · middle-drag",
         ]
         y = self.height - 52
         for tip in tips:
-            t = small_font.render(tip, True, (150, 156, 170))
+            t = tiny_font.render(tip, True, (150, 156, 170))
             screen.blit(t, (panel_rect.left + 22, y))
-            y += 18
+            y += 16
 
     def _person_hover_radius(self, person) -> float:
         scale = max(4, min(14, int(4 + person.age / 10)))

@@ -60,6 +60,8 @@ Most of the world still runs on **equations, thresholds, and config**:
 
 - Individuals with:
   - age, gender, region
+  - **`living_context`** — `rural` / `village` / `town` / `city` within a region (mixed populations; migration and yearly drift update bands)
+  - **`nutrition_ema`** — slow smoothed diet adequacy vs regional food; chronic stress and health when low; newborns inherit from the mother with noise
   - health, disease susceptibility
   - inherited genetic traits (`resilience`, `fertility`, `immunity`)
 - Life cycle mechanics:
@@ -124,9 +126,10 @@ Outcomes are **unpredictable but not meaningless**: the same snapshot rarely gua
 
 ### Environment and Disasters
 
-- Food supply with variability, stress, and shocks
-- Natural disasters with multi-year consequences (drought, flood, volcanic winter)
-- Policy adaptation feeds back into migration, mortality, and fertility
+- Food supply with variability, stress, and environment shocks (`EnvironmentConfig`)
+- **Regional harvest weather** — persistent per-region harvest multipliers layered on food (`WorldRealismConfig`, `region_harvest_factor`)
+- **Regional disaster events** — rare multi-year food penalties (drought, flood, crop blight, etc.) with timeline entries (`regional_disaster_*` in config)
+- World-event system and auto-adjust can still apply temporary global effects
 
 ### Events and Timeline
 
@@ -146,13 +149,13 @@ Core parameters can self-adjust from state signals (population, health, infectio
 - **Border diplomacy** — `WorldDynamics.step_border` factors in **regional resource scores**, **military/economic power asymmetry** (population × health × tools × food × wealth), and **material + food pressure**, so trade goodwill and war tension respond to scarcity and predation-like gaps, not only food per capita.
 - **Country and empire** — Settlements that reach **city** can mature into a **country** (renamed *Republic* or *Kingdom* by local civ; democracy vs oligarchy bias) and then an **Empire** (monarchy/autocracy bias, leader title **Emperor**). Tuned via `PoliticsConfig` (`polity_progression`, population and civ thresholds, `country_requires_state_milestone`, `empire_ambition_threshold`).
 - **Faith, love, violence, jail** — Under `SocialLifeConfig`: a **prophet** can emerge (high spirituality, temples or spiritual age), founding a `way_of_<id>` movement; **conversions** and **shrine** structures appear as followings grow. **Love bonds** form between trusted same-region contacts; **assaults** harm victims and may **jail** aggressors when enforcement catches them; repeat **theft** with strong enforcement can also **jail**. Incarceration blocks migration and social learning and cuts yearly wealth gain until the sentence ticks down at year end.
-- **World realism layer** — `WorldRealismConfig`: **marriage** after stable love + trust (with **breakups** from distance, stress, feuds); **married** couples get a small **fertility** boost. **Maternal mortality** can follow birth (higher in early eras, lower after **country** milestone). **Schools** add extra **knowledge** gain for younger people. **Weak enforcement** lets **treasury corruption** skim regional treasuries. **Civic unrest** when a region is hungry and stressed raises **global instability** and local mood shocks. **Sanitation** (after **writing** + more urban settlement mix) slightly **lowers contagious transmission** alongside seasons. **Elder support**: cohabiting partners in the same region slow **health decline** for older adults.
+- **World realism layer** — `WorldRealismConfig`: **marriage** / **breakups**; **maternal mortality**; **schools**; **treasury corruption**; **civic unrest**; **sanitation** (with writing + urban mix); **elder support**. Also: **nutrition tracking** (EMA), **urban crowding** (disease), **dense housing** wealth pressure when food is tight, **partner jail stress**, **contact bereavement**, **mutual aid** under scarcity, **work fatigue** (ambition), plus **harvest weather** and **regional disasters** (see Environment and Disasters).
 
 ### Tests and Benchmark
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/
+python -m pytest tests/          # includes test_world_realism, test_tech_society, test_realism_extras
 python benchmark_sim.py --years 50 --pop 220
 ```
 
@@ -171,19 +174,33 @@ The window opens **fitted to your primary monitor** (it will not be wider or tal
 
 ### Realtime UI Layout
 
-- **Left panel**: world timeline, city ledger, recent events
-- **Center world**: regions, terrain, structures, NPCs, social links
-- **Right panel**: live sliders for policy/parameter tuning (including **Brain IQ (world)**, **IQ spread (birth)**, and **Learned goal mix** when the MLP is enabled in config)
+- **Left panel**: timeline, city ledger, major events (mouse wheel scrolls the ledger when the cursor is over the panel)
+- **Center world**: regions, terrain, structures, people, animals, optional social link samples, HUD strip (year, era, season, population, politics summary, etc.)
+- **Right panel** (“Simulation controls”):
+  - **Sliders** (each shows name and live numeric value): **Food supply**, **Birth rate**, **Infection rate**, **Disease mortality**, **Migration rate**, **World aggression**, **Brain IQ (world)**, **IQ spread (birth)**, **Learned goal mix**, **Vaccination coverage**, **Simulation speed** (frames per sim year; lower = faster years)
+  - **Region colors** button (or **`R`**): toggles distinct colors per region and a **legend** on the map (settlement level, polity, government, `living_context` mix, food, treasury)
+  - Footer **hints** for zoom, pan, and region map
+- **Typography**: prefers **Segoe UI**, **Calibri**, **Tahoma**, or **Arial** when installed; otherwise **Consolas**
 
 ### Realtime Controls
 
-- `SPACE` pause/resume
-- Mouse drag sliders to tune live parameters
-- `,` / `.` slower/faster simulation stepping
-- `L` toggle labels
-- `PgUp` / `PgDn` scroll city ledger
-- `F11` toggle **fullscreen** (uses native desktop resolution; press again to return to windowed)
-- `ESC` **exit fullscreen** when fullscreen; otherwise **quit** the application
+| Input | Action |
+|--------|--------|
+| `SPACE` | Pause / resume simulation stepping |
+| Drag slider | Change parameter (click track or drag handle) |
+| `,` / `.` | Slower / faster sim speed (more / fewer frames per year) |
+| `L` | Toggle sparse per-person debug labels on the map |
+| `R` | Toggle **region color overlay** and on-map legend (same as the button) |
+| `W` `A` `S` `D` | Pan the world |
+| Mouse wheel | Over map: pan vertically; **Ctrl+wheel**: zoom toward cursor |
+| Middle mouse drag | Pan |
+| `+` / `-` (or numpad) | Zoom in / out |
+| `0` | Reset zoom and center camera |
+| `PgUp` / `PgDn` | Scroll city ledger (when cursor over left panel, wheel also scrolls) |
+| `F11` | Fullscreen on / off |
+| `ESC` | Exit fullscreen, or quit if windowed |
+
+Hover or click people on the map for a **tooltip** (belief, health, goals, **Living** band, **Diet (long-run)** / `nutrition_ema`, etc.).
 
 ## Batch Simulation
 

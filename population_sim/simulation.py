@@ -297,8 +297,11 @@ class SimulationEngine:
         self._initialize_world_structures()
         self._bootstrap_living_contexts([p for p in self.population if p.alive])
 
-    def run(self) -> StatsTracker:
-        for year in range(self.config.years):
+    def run(self, *, console_progress: bool = False) -> StatsTracker:
+        total_years = self.config.years
+        for year in range(total_years):
+            if console_progress:
+                print(f"\rYear {year + 1:,} / {total_years:,}  ", end="", flush=True)
             births, deaths, available_food = self.step(year)
             self.stats.record(
                 year,
@@ -312,6 +315,8 @@ class SimulationEngine:
 
             if self.stats.history and self.stats.history[-1].population == 0:
                 break
+        if console_progress:
+            print()
         return self.stats
 
     def step(self, year: int) -> tuple[int, int, float]:
