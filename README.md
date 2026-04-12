@@ -2,21 +2,21 @@
 
 This project simulates a human population from early hunter-gatherer origins toward organized civilization, with realtime strategy-style visualization and event-driven world changes.
 
-The model emphasizes **emergent outcomes**: pressure, memory, and resource geography accumulate over time—so wars, alliances, and trade arise from **world state**, not only one-off random rolls.
+The model emphasizes **emergent outcomes**: pressure, memory, and resource geography accumulate over time, so wars, alliances, and trade arise from **world state**, not only one-off random rolls.
 
 ## How the system works: “brain” vs rules
 
 ### What “intelligence” means here
 
-There is **no** large language model. Goal choice uses **softmax sampling** with **temperature** from IQ. The hand-designed **heuristic** produces teacher logits; a **small learned MLP** (NumPy, trained in the loop) contributes blended logits when enabled—so part of the policy is **actually optimized** (imitation + REINFORCE), not only fixed rules. This is still **not** frontier deep RL—tiny network, simple reward—but it is legitimate **learned** structure, not “AI” as marketing-only language.
+There is **no** large language model. Goal choice uses **softmax sampling** with **temperature** from IQ. The hand-designed **heuristic** produces teacher logits; a **small learned MLP** (NumPy, trained in the loop) contributes blended logits when enabled, so part of the policy is **actually optimized** (imitation + REINFORCE), not only fixed rules. This is still **not** frontier deep RL, tiny network, simple reward, but it is legitimate **learned** structure, not “AI” as marketing-only language.
 
 ### Brain-like (softmax) decisions
 
 Implemented in `population_sim/agent_cognition.py` and wired from `simulation.py`:
 
-- **Yearly primary goal** — Each living person picks among six goals: `survive`, `prosper`, `status`, `trade`, `connect`, `accumulate`. Logits combine **personal state** (health, stress, ambition, age, happiness, knowledge, tools, remembered food, wealth, reputation) with **`WorldGoalContext`**: civilization level, global instability, food inequality, mean food across regions, local settlement tier (camp→city), and how poor the person is versus the regional median wealth. **Macro layer (same context):** local food vs world mean, **resource endowment vs other regions**, **public treasury per capita** (normalized), **local policies** (income tax, theft enforcement, institutional openness), whether the **region has an open border trade route**, **faction strength in that region** (coalition/country-like bloc), and **within-region wealth spread**.
-- **Learned policy (optional but on by default)** — `population_sim/learned_policy.py` defines a **small NumPy MLP** (two layers, softmax over the same six goals). Each year its logits are **blended** with the hand-designed heuristic logits (`learned_goal_mix`), then sampled with the same IQ temperature. The network is trained **online**: first **behavioral cloning** (cross-entropy toward the heuristic distribution) for `learned_goal_imitation_years`, then **REINFORCE** using a simple end-of-year reward from health, happiness, and wealth change (penalty if the agent died). That is a **real learned policy**, not the same thing as fixed if/then rules—though it is small, not deep RL at scale. Set `CognitionConfig.learned_goal_network = False` to disable and use only the heuristic teacher.
-- **Migration destination** — Each region gets a score from food, infection, resources, and goal weights, plus a **goal-weighted institution bonus** (treasury stability, low-tax attractiveness for accumulators, trade-route hubs for traders, openness for “connect”). The engine **samples** a destination with softmax temperature from **effective IQ** (world + personal), instead of always moving to the single best region.
+- **Yearly primary goal**:  Each living person picks among six goals: `survive`, `prosper`, `status`, `trade`, `connect`, `accumulate`. Logits combine **personal state** (health, stress, ambition, age, happiness, knowledge, tools, remembered food, wealth, reputation) with **`WorldGoalContext`**: civilization level, global instability, food inequality, mean food across regions, local settlement tier (camp→city), and how poor the person is versus the regional median wealth. **Macro layer (same context):** local food vs world mean, **resource endowment vs other regions**, **public treasury per capita** (normalized), **local policies** (income tax, theft enforcement, institutional openness), whether the **region has an open border trade route**, **faction strength in that region** (coalition/country-like bloc), and **within-region wealth spread**.
+- **Learned policy (optional but on by default)** :  `population_sim/learned_policy.py` defines a **small NumPy MLP** (two layers, softmax over the same six goals). Each year its logits are **blended** with the hand-designed heuristic logits (`learned_goal_mix`), then sampled with the same IQ temperature. The network is trained **online**: first **behavioral cloning** (cross-entropy toward the heuristic distribution) for `learned_goal_imitation_years`, then **REINFORCE** using a simple end-of-year reward from health, happiness, and wealth change (penalty if the agent died). That is a **real learned policy**, not the same thing as fixed if/then rules, though it is small, not deep RL at scale. Set `CognitionConfig.learned_goal_network = False` to disable and use only the heuristic teacher.
+- **Migration destination** :  Each region gets a score from food, infection, resources, and goal weights, plus a **goal-weighted institution bonus** (treasury stability, low-tax attractiveness for accumulators, trade-route hubs for traders, openness for “connect”). The engine **samples** a destination with softmax temperature from **effective IQ** (world + personal), instead of always moving to the single best region.
 
 ### IQ-related settings
 
@@ -60,8 +60,8 @@ Most of the world still runs on **equations, thresholds, and config**:
 
 - Individuals with:
   - age, gender, region
-  - **`living_context`** — `rural` / `village` / `town` / `city` within a region (mixed populations; migration and yearly drift update bands)
-  - **`nutrition_ema`** — slow smoothed diet adequacy vs regional food; chronic stress and health when low; newborns inherit from the mother with noise
+  - **`living_context`** ,  `rural` / `village` / `town` / `city` within a region (mixed populations; migration and yearly drift update bands)
+  - **`nutrition_ema`** ,  slow smoothed diet adequacy vs regional food; chronic stress and health when low; newborns inherit from the mother with noise
   - health, disease susceptibility
   - inherited genetic traits (`resilience`, `fertility`, `immunity`)
 - Life cycle mechanics:
@@ -98,15 +98,15 @@ Outcomes are **unpredictable but not meaningless**: the same snapshot rarely gua
 
 ### Geography, Resources, and Migration
 
-- **Seasons** — Each simulated year advances one phase in a **four-season cycle** (`SeasonConfig`: spring / summer / autumn / winter by default). Tunable multipliers adjust **regional food**, **wildlife/forage** (ecology bonus), **migration pressure**, and **disease transmission**. Disable with `seasons.enabled = False` or shift the calendar with `phase_offset`.
-- **Multiple regions** (configurable `region_count`) act as a larger map; migration uses **scored** regions (food, infection, resources, goal weights) and **softmax sampling** over those scores when behavior is enabled—not only a single “best tile” rule
+- **Seasons** ,  Each simulated year advances one phase in a **four-season cycle** (`SeasonConfig`: spring / summer / autumn / winter by default). Tunable multipliers adjust **regional food**, **wildlife/forage** (ecology bonus), **migration pressure**, and **disease transmission**. Disable with `seasons.enabled = False` or shift the calendar with `phase_offset`.
+- **Multiple regions** (configurable `region_count`) act as a larger map; migration uses **scored** regions (food, infection, resources, goal weights) and **softmax sampling** over those scores when behavior is enabled, not only a single “best tile” rule
 - Each region’s `Environment` carries **natural resource richness** (water, fertile land, timber, ore) and **territory size**, feeding into food and attractiveness
 - **Carrying-capacity-style** food scaling avoids runaway population that would make the sim unusably slow in late years
 
 ### Geopolitics: Trade, Diplomacy, and War
 
 - **Trade links** between adjacent regions; food can flow along trade routes (surplus toward deficit)
-- **Border wars** and **trade ruptures** emerge from latent border tension and scarcity—not a single yearly coin flip
+- **Border wars** and **trade ruptures** emerge from latent border tension and scarcity, not a single yearly coin flip
 - **Belief-group alliances** and **resource wars** use accumulation/discharge mechanics where possible
 
 ### Civilization and Settlements
@@ -127,8 +127,8 @@ Outcomes are **unpredictable but not meaningless**: the same snapshot rarely gua
 ### Environment and Disasters
 
 - Food supply with variability, stress, and environment shocks (`EnvironmentConfig`)
-- **Regional harvest weather** — persistent per-region harvest multipliers layered on food (`WorldRealismConfig`, `region_harvest_factor`)
-- **Regional disaster events** — rare multi-year food penalties (drought, flood, crop blight, etc.) with timeline entries (`regional_disaster_*` in config)
+- **Regional harvest weather** ,  persistent per-region harvest multipliers layered on food (`WorldRealismConfig`, `region_harvest_factor`)
+- **Regional disaster events** ,  rare multi-year food penalties (drought, flood, crop blight, etc.) with timeline entries (`regional_disaster_*` in config)
 - World-event system and auto-adjust can still apply temporary global effects
 
 ### Events and Timeline
@@ -143,13 +143,13 @@ Core parameters can self-adjust from state signals (population, health, infectio
 
 ### Technology, Resources, and Diplomacy
 
-- **Dynamic eras** — Labels such as hunter-gatherer → agrarian → classical → industrial → modern → information age follow **civilization level**, **unlocked inventions** (husbandry, wheel, advanced tools, iron), and **milestones** (writing, country, etc.), with a light calendar bias. Set `TechnologyConfig.dynamic_eras = False` to restore the old **year-only** era table.
-- **Resource-gated inventions** — Breakthroughs require sufficient **timber / ore / fertile land** in the inventor’s region and **draw down** those stocks when they fire (`TechnologyConfig.resource_gated_inventions`, `resource_drain_scale`).
-- **Tool crafting** — New personal tools consume **ore and timber** when `resource_gated_tool_crafting` is enabled; depleted regions craft slowly until regrowth catches up (environments slowly **regenerate** richness each year).
-- **Border diplomacy** — `WorldDynamics.step_border` factors in **regional resource scores**, **military/economic power asymmetry** (population × health × tools × food × wealth), and **material + food pressure**, so trade goodwill and war tension respond to scarcity and predation-like gaps, not only food per capita.
-- **Country and empire** — Settlements that reach **city** can mature into a **country** (renamed *Republic* or *Kingdom* by local civ; democracy vs oligarchy bias) and then an **Empire** (monarchy/autocracy bias, leader title **Emperor**). Tuned via `PoliticsConfig` (`polity_progression`, population and civ thresholds, `country_requires_state_milestone`, `empire_ambition_threshold`).
-- **Faith, love, violence, jail** — Under `SocialLifeConfig`: a **prophet** can emerge (high spirituality, temples or spiritual age), founding a `way_of_<id>` movement; **conversions** and **shrine** structures appear as followings grow. **Love bonds** form between trusted same-region contacts; **assaults** harm victims and may **jail** aggressors when enforcement catches them; repeat **theft** with strong enforcement can also **jail**. Incarceration blocks migration and social learning and cuts yearly wealth gain until the sentence ticks down at year end.
-- **World realism layer** — `WorldRealismConfig`: **marriage** / **breakups**; **maternal mortality**; **schools**; **treasury corruption**; **civic unrest**; **sanitation** (with writing + urban mix); **elder support**. Also: **nutrition tracking** (EMA), **urban crowding** (disease), **dense housing** wealth pressure when food is tight, **partner jail stress**, **contact bereavement**, **mutual aid** under scarcity, **work fatigue** (ambition), plus **harvest weather** and **regional disasters** (see Environment and Disasters).
+- **Dynamic eras** ,  Labels such as hunter-gatherer → agrarian → classical → industrial → modern → information age follow **civilization level**, **unlocked inventions** (husbandry, wheel, advanced tools, iron), and **milestones** (writing, country, etc.), with a light calendar bias. Set `TechnologyConfig.dynamic_eras = False` to restore the old **year-only** era table.
+- **Resource-gated inventions** ,  Breakthroughs require sufficient **timber / ore / fertile land** in the inventor’s region and **draw down** those stocks when they fire (`TechnologyConfig.resource_gated_inventions`, `resource_drain_scale`).
+- **Tool crafting** ,  New personal tools consume **ore and timber** when `resource_gated_tool_crafting` is enabled; depleted regions craft slowly until regrowth catches up (environments slowly **regenerate** richness each year).
+- **Border diplomacy** ,  `WorldDynamics.step_border` factors in **regional resource scores**, **military/economic power asymmetry** (population × health × tools × food × wealth), and **material + food pressure**, so trade goodwill and war tension respond to scarcity and predation-like gaps, not only food per capita.
+- **Country and empire** ,  Settlements that reach **city** can mature into a **country** (renamed *Republic* or *Kingdom* by local civ; democracy vs oligarchy bias) and then an **Empire** (monarchy/autocracy bias, leader title **Emperor**). Tuned via `PoliticsConfig` (`polity_progression`, population and civ thresholds, `country_requires_state_milestone`, `empire_ambition_threshold`).
+- **Faith, love, violence, jail** ,  Under `SocialLifeConfig`: a **prophet** can emerge (high spirituality, temples or spiritual age), founding a `way_of_<id>` movement; **conversions** and **shrine** structures appear as followings grow. **Love bonds** form between trusted same-region contacts; **assaults** harm victims and may **jail** aggressors when enforcement catches them; repeat **theft** with strong enforcement can also **jail**. Incarceration blocks migration and social learning and cuts yearly wealth gain until the sentence ticks down at year end.
+- **World realism layer** ,  `WorldRealismConfig`: **marriage** / **breakups**; **maternal mortality**; **schools**; **treasury corruption**; **civic unrest**; **sanitation** (with writing + urban mix); **elder support**. Also: **nutrition tracking** (EMA), **urban crowding** (disease), **dense housing** wealth pressure when food is tight, **partner jail stress**, **contact bereavement**, **mutual aid** under scarcity, **work fatigue** (ambition), plus **harvest weather** and **regional disasters** (see Environment and Disasters).
 
 ### Tests and Benchmark
 
@@ -268,7 +268,7 @@ Dependencies:
 ## Notes
 
 - **Goals** use **heuristic logits blended with a learned MLP** (optional), then **softmax + IQ temperature**; **migration** uses scored regions + softmax. Almost everything else is **rule-based** or **rule-based with random draws**.
-- **Diplomacy and war** still come from **accumulated border tension and thresholds** in `world_dynamics.py`, with **`world_iq` scaling** those dynamics—not a separate neural model.
+- **Diplomacy and war** still come from **accumulated border tension and thresholds** in `world_dynamics.py`, with **`world_iq` scaling** those dynamics, not a separate neural model.
 
 ## Suggested Next Extensions
 
