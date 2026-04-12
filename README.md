@@ -6,10 +6,6 @@ The model emphasizes **emergent outcomes**: pressure, memory, and resource geogr
 
 ## How the system works: “brain” vs rules
 
-### What “intelligence” means here
-
-There is **no** large language model. Goal choice uses **softmax sampling** with **temperature** from IQ. The hand-designed **heuristic** produces teacher logits; a **small learned MLP** (NumPy, trained in the loop) contributes blended logits when enabled, so part of the policy is **actually optimized** (imitation + REINFORCE), not only fixed rules. This is still **not** frontier deep RL, tiny network, simple reward, but it is legitimate **learned** structure, not “AI” as marketing-only language.
-
 ### Brain-like (softmax) decisions
 
 Implemented in `population_sim/agent_cognition.py` and wired from `simulation.py`:
@@ -50,9 +46,13 @@ Most of the world still runs on **equations, thresholds, and config**:
 | Person fields, inheritance | `models.py` |
 | Config (cognition, economy, technology, …) | `config.py` |
 
+## Video Demo
+
+![Demo](Demo.mp4) 
+
 ## Demo
 
-![Demo](Demo.mp4)
+![Demo](Demo.gif)
 
 ## What The Simulation Includes
 
@@ -264,19 +264,6 @@ Dependencies:
 - civilization index
 - knowledge / tool skill / emotional averages
 - friendships / enmities
-
-## Notes
-
-- **Goals** use **heuristic logits blended with a learned MLP** (optional), then **softmax + IQ temperature**; **migration** uses scored regions + softmax. Almost everything else is **rule-based** or **rule-based with random draws**.
-- **Diplomacy and war** still come from **accumulated border tension and thresholds** in `world_dynamics.py`, with **`world_iq` scaling** those dynamics, not a separate neural model.
-
-## Suggested Next Extensions
-
-- Visual **border ownership** and explicit **map tiles**
-- **Goods-specific** trade (grain, timber, ore) with prices
-- **Dynasties** and named family lines
-- **Save/load** and replay
-- Richer **peace treaties** and sanctions after wars
 
 ## Disclaimer
 
