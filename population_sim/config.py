@@ -205,6 +205,12 @@ class CognitionConfig:
     world_iq: float = 0.65
     # 0 ≈ newborns cluster near average IQ; 1 ≈ full spread (matches legacy wide uniform).
     birth_iq_diversity: float = 1.0
+    # Slow global "science stock" from civ + inventions + books; speeds learning and tool innovation.
+    science_accumulation: bool = True
+    # Adults' cognitive_iq drifts from nutrition, stress, instability, civ, science, and mild competition.
+    dynamic_brain_feedback: bool = True
+    # Regions below average food see slightly higher aggression (resource pressure).
+    resource_competition_aggression: bool = True
     # Learned MLP over agent+macro features (NumPy REINFORCE + imitation); see learned_policy.py.
     learned_goal_network: bool = True
     # Blend: (1-mix)*heuristic_logits + mix*MLP_logits before softmax sample.

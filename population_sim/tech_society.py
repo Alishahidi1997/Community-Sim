@@ -18,6 +18,9 @@ INVENTION_RESOURCE_FLOORS: dict[str, dict[str, float]] = {
     "wheel": {"timber": 0.26, "ore": 0.14},
     "advanced_tools": {"ore": 0.2, "timber": 0.18},
     "iron_working": {"ore": 0.32, "timber": 0.14},
+    "printing": {"timber": 0.28, "ore": 0.12},
+    "scientific_society": {"ore": 0.22, "fertile_land": 0.14},
+    "precision_tools": {"ore": 0.38, "timber": 0.16},
 }
 
 # One-time draw on the inventor's region when a global invention fires.
@@ -26,6 +29,9 @@ INVENTION_RESOURCE_DRAIN: dict[str, dict[str, float]] = {
     "wheel": {"timber": 0.045, "ore": 0.028},
     "advanced_tools": {"ore": 0.04, "timber": 0.032},
     "iron_working": {"ore": 0.055, "timber": 0.025},
+    "printing": {"timber": 0.04, "ore": 0.022},
+    "scientific_society": {"ore": 0.032, "fertile_land": 0.018},
+    "precision_tools": {"ore": 0.048, "timber": 0.03},
 }
 
 TOOL_CRAFT_DRAIN = {"ore": 0.014, "timber": 0.018}
@@ -84,6 +90,10 @@ def invention_roll_multiplier(
         need = 1.0 + 0.55 * max(0.0, 0.42 - fr)
     elif invention_key == "advanced_tools" or invention_key == "iron_working":
         need = 1.0 + 0.25 * max(0.0, 0.55 - t)
+    elif invention_key in ("printing", "scientific_society"):
+        need = 1.0 + 0.28 * max(0.0, 0.52 - k)
+    elif invention_key == "precision_tools":
+        need = 1.0 + 0.22 * max(0.0, 0.58 - t) + 0.12 * max(0.0, 0.5 - k)
     return _clamp(base * skill_edge * calm * need, 0.15, 2.2)
 
 
@@ -148,6 +158,12 @@ def compute_era_profile(
         tech_tier += 0.14
     if "iron_working" in world_inventions:
         tech_tier += 0.17
+    if "printing" in world_inventions:
+        tech_tier += 0.07
+    if "scientific_society" in world_inventions:
+        tech_tier += 0.08
+    if "precision_tools" in world_inventions:
+        tech_tier += 0.09
     if "writing" in unlocked_milestones:
         tech_tier += 0.09
     if "country" in unlocked_milestones:

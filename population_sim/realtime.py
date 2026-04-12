@@ -133,6 +133,12 @@ class RealtimeVisualizer:
         self.timeline_cache: list[str] = []
         self.last_major_event_count = 0
         self.city_scroll_offset = 0
+        self.selected_region_id: int | None = None
+        self.region_god_sliders: list[UISlider] = []
+        self._god_slider_rid: int | None = None
+        self._god_btn_rects: list[tuple[str, pygame.Rect]] = []
+        self._govern_panel_y0 = 0
+        self._govern_panel_y1 = 0
         self.terrain_seed = random.Random(engine.config.random_seed + 2026)
         self.hills = self._build_hills()
         self._build_sliders()
@@ -144,6 +150,7 @@ class RealtimeVisualizer:
         self._decor_crops: list[tuple[float, float, float]] = []
         self._rebuild_world_decor()
         self._sync_visual_animals()
+        self._map_fx: list[dict[str, object]] = []
 
     def _init_cloud_layout(self) -> None:
         r = self.terrain_seed
@@ -183,7 +190,7 @@ class RealtimeVisualizer:
         for p in alive:
             by_reg[p.region_id].append(p)
         food_by = self.engine._food_ratio_by_region(alive)
-        n_reg = self.engine.config.demographics.region_count
+        n_reg = self._region_count()
         out: list[tuple[str, str, tuple[int, int, int]]] = []
         for rid in range(n_reg):
             col = self._region_distinct_color(rid)
@@ -244,6 +251,9 @@ class RealtimeVisualizer:
         """Viewport (screen) rectangle where the map is drawn — fixed to window."""
         return pygame.Rect(self.left_panel_width, 0, self.width - self.panel_width - self.left_panel_width, self.height)
 
+    def _region_count(self) -> int:
+        return max(1, len(self.engine.environments))
+
     def _viewport_size(self) -> tuple[int, int]:
         vw = max(80, self.width - self.panel_width - self.left_panel_width)
         vh = self.height
@@ -252,7 +262,7 @@ class RealtimeVisualizer:
     def _map_dimensions(self) -> tuple[int, int]:
         """Logical world size in pixels (wider than the viewport for scrolling)."""
         vw, vh = self._viewport_size()
-        regions = max(1, self.engine.config.demographics.region_count)
+        regions = self._region_count()
         map_w = max(int(vw * 3.0), int(vw * min(5.0, 1.15 * regions)))
         map_h = int(vh * 2.05)
         return map_w, map_h
@@ -596,7 +606,10 @@ class RealtimeVisualizer:
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
                 panel_left = self.width - self.panel_width
-                if mx >= panel_left:
+                if mx < self.left_panel_width:
+                    if self._left_panel_god_click_down(mx, my):
+                        pass
+                elif mx >= panel_left:
                     tab_hit = False
                     for ti, tr in enumerate(self.control_tab_rects):
                         if tr.collidepoint(mx, my):
@@ -621,8 +634,18 @@ class RealtimeVisualizer:
                     pick = self._pick_at(mx, my)
                     if pick is not None and pick[0] == "person":
                         self.pinned_person_id = pick[1].person_id
+                        self.selected_region_id = None
+                    elif pick is not None and pick[0] == "structure":
+                        self.pinned_person_id = None
+                        self.selected_region_id = int(pick[1].get("region_id", 0))
+                    elif pick is not None and pick[0] == "animal":
+                        self.pinned_person_id = None
+                        a = pick[1]
+                        self.selected_region_id = None if a.species == "bird" else int(a.region_id)
                     else:
                         self.pinned_person_id = None
+                        wx, wy = self._s2w(mx, my)
+                        self.selected_region_id = self._pick_region_id_at_world(wx, wy)
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if self.dragging_slider is not None:
                     self.dragging_slider.active = False
@@ -701,6 +724,7 @@ class RealtimeVisualizer:
         if self.frame_counter % self.step_every_frames != 0:
             return
         births, deaths, available_food = self.engine.step(self.year)
+        self._ingest_engine_map_fx()
         self.engine.stats.record(
             self.year,
             self.engine.population,
@@ -735,7 +759,7 @@ class RealtimeVisualizer:
         return max(64, min(88, map_h // 14))
 
     def _region_rect(self, region_id: int) -> pygame.Rect:
-        regions = max(1, self.engine.config.demographics.region_count)
+        regions = self._region_count()
         mw, mh = self._map_dimensions()
         region_width = mw / regions
         x0 = int(region_id * region_width + 10)
@@ -745,6 +769,180 @@ class RealtimeVisualizer:
         oh = self._ocean_band_height(mmap)
         land_bottom = mh - bottom_margin - oh
         return pygame.Rect(x0, top, int(region_width - 20), max(60, land_bottom - top))
+
+    def _pick_region_id_at_world(self, wx: float, wy: float) -> int | None:
+        n = self._region_count()
+        for rid in range(n):
+            if self._region_rect(rid).collidepoint(wx, wy):
+                return rid
+        return None
+
+    def _neighbor_right_id(self, region_id: int) -> int | None:
+        n = self._region_count()
+        if region_id + 1 < n:
+            return region_id + 1
+        return None
+
+    def _sync_region_god_sliders(self) -> None:
+        rid = self.selected_region_id
+        if rid is None:
+            self.region_god_sliders = []
+            self._god_slider_rid = None
+            return
+        if self._god_slider_rid == rid and self.region_god_sliders:
+            return
+        rc = self.engine._player_rc(rid)
+        self.region_god_sliders = [
+            UISlider(
+                "Army",
+                0.0,
+                1.0,
+                lambda: float(rc["invest_army"]),
+                lambda v: rc.__setitem__("invest_army", max(0.0, min(1.0, float(v)))),
+                pygame.Rect(0, 0, 0, 0),
+            ),
+            UISlider(
+                "Welfare",
+                0.0,
+                1.0,
+                lambda: float(rc["invest_welfare"]),
+                lambda v: rc.__setitem__("invest_welfare", max(0.0, min(1.0, float(v)))),
+                pygame.Rect(0, 0, 0, 0),
+            ),
+            UISlider(
+                "Science",
+                0.0,
+                1.0,
+                lambda: float(rc["invest_science"]),
+                lambda v: rc.__setitem__("invest_science", max(0.0, min(1.0, float(v)))),
+                pygame.Rect(0, 0, 0, 0),
+            ),
+            UISlider(
+                "Trade routes",
+                0.0,
+                1.0,
+                lambda: float(rc["invest_trade"]),
+                lambda v: rc.__setitem__("invest_trade", max(0.0, min(1.0, float(v)))),
+                pygame.Rect(0, 0, 0, 0),
+            ),
+            UISlider(
+                "Famine",
+                0.0,
+                1.0,
+                lambda: float(rc["famine"]),
+                lambda v: rc.__setitem__("famine", max(0.0, min(1.0, float(v)))),
+                pygame.Rect(0, 0, 0, 0),
+            ),
+            UISlider(
+                "Bandit camps",
+                0.0,
+                1.0,
+                lambda: float(rc["bandits"]),
+                lambda v: rc.__setitem__("bandits", max(0.0, min(1.0, float(v)))),
+                pygame.Rect(0, 0, 0, 0),
+            ),
+            UISlider(
+                "Stock index",
+                0.38,
+                2.1,
+                lambda: float(rc["stock_index"]),
+                lambda v: rc.__setitem__("stock_index", max(0.38, min(2.1, float(v)))),
+                pygame.Rect(0, 0, 0, 0),
+            ),
+        ]
+        self._god_slider_rid = rid
+
+    def _layout_region_govern(self, small_font: pygame.font.Font) -> None:
+        self._sync_region_god_sliders()
+        self._god_btn_rects = []
+        pw = self.left_panel_width
+        y0 = self._govern_panel_y0
+        y1 = self._govern_panel_y1
+        if self.selected_region_id is None or y1 <= y0 + 40:
+            for s in self.region_god_sliders:
+                s.rect = pygame.Rect(0, 0, 0, 0)
+            return
+        pad = 8
+        x = pad
+        w = max(80, pw - pad * 2)
+        sh = 18
+        gap = 4
+        y = y0 + 70
+        for s in self.region_god_sliders:
+            s.rect = pygame.Rect(x, y, w, sh)
+            y += sh + gap
+        bw = max(52, (w - 8) // 2)
+        bh = 22
+        rid = self.selected_region_id
+        nb = self._neighbor_right_id(rid)
+        row1 = y + 4
+        self._god_btn_rects.append(("gov", pygame.Rect(x, row1, w, bh)))
+        if nb is not None:
+            self._god_btn_rects.append(("trade", pygame.Rect(x, row1 + bh + 4, bw, bh)))
+            self._god_btn_rects.append(("war", pygame.Rect(x + bw + 8, row1 + bh + 4, bw, bh)))
+            self._god_btn_rects.append(("siege", pygame.Rect(x, row1 + (bh + 4) * 2, bw, bh)))
+            self._god_btn_rects.append(("clear_sieges", pygame.Rect(x + bw + 8, row1 + (bh + 4) * 2, bw, bh)))
+            self._god_btn_rects.append(("annex", pygame.Rect(x, row1 + (bh + 4) * 3, w, bh)))
+        else:
+            self._god_btn_rects.append(("clear_sieges", pygame.Rect(x, row1 + bh + 4, w, bh)))
+
+    def _left_panel_god_click_down(self, mx: int, my: int) -> bool:
+        if self.selected_region_id is None:
+            return False
+        for s in self.region_god_sliders:
+            if s.rect.width > 0 and s.rect.collidepoint(mx, my):
+                s.active = True
+                self.dragging_slider = s
+                s.set_from_x(mx)
+                return True
+        for action, rect in self._god_btn_rects:
+            if rect.collidepoint(mx, my):
+                self._run_god_action(action)
+                return True
+        return False
+
+    def _run_god_action(self, action: str) -> None:
+        rid = self.selected_region_id
+        if rid is None:
+            return
+        eng = self.engine
+        nb = self._neighbor_right_id(rid)
+        if action == "gov":
+            nxt = eng.player_cycle_government(rid)
+            self._push_message(f"Region {rid}: government → {nxt}")
+        elif action == "trade" and nb is not None:
+            st = eng.player_cycle_trade_with_neighbor(rid, nb)
+            lab = {0: "auto", 1: "open", -1: "closed"}[st]
+            self._push_message(f"Trade R{rid}↔R{nb}: {lab}")
+            if st == 1:
+                self._push_map_fx({"kind": "trade_route", "ra": rid, "rb": nb, "open": True})
+            elif st == -1:
+                self._push_map_fx({"kind": "trade_route", "ra": rid, "rb": nb, "open": False})
+        elif action == "war" and nb is not None:
+            eng.player_spike_war_with_neighbor(rid, nb)
+            self._push_message(f"Raised war pressure: R{rid} vs R{nb}")
+            self._push_map_fx({"kind": "war_tension", "ra": rid, "rb": nb})
+        elif action == "siege" and nb is not None:
+            on = eng.player_toggle_siege_on_neighbor(rid, nb)
+            self._push_message(f"Siege on R{nb} by R{rid}: {'on' if on else 'off'}")
+            self._push_map_fx({"kind": "siege_toggle", "defender": nb, "attacker": rid, "on": on})
+        elif action == "clear_sieges":
+            if eng.player_siege:
+                eng.player_siege.clear()
+                self._push_message("Cleared all sieges")
+        elif action == "annex" and nb is not None:
+            story = eng.annex_eastern_neighbor(rid, self.year)
+            if story:
+                self._push_message(story)
+                self._push_map_fx({"kind": "annex", "keeper": rid})
+            victim = rid + 1
+            sel = self.selected_region_id
+            if sel is not None:
+                if sel == victim:
+                    self.selected_region_id = rid
+                elif sel > victim:
+                    self.selected_region_id = sel - 1
+            self._god_slider_rid = None
 
     def _spawn_visual_agent(self, person_id: int, region_id: int) -> VisualAgent:
         del person_id
@@ -892,6 +1090,7 @@ class RealtimeVisualizer:
             pygame.draw.circle(screen, col, (cx, cy), 3)
 
     def _draw(self, screen: pygame.Surface, font: pygame.font.Font, small_font: pygame.font.Font, tiny_font: pygame.font.Font) -> None:
+        self._tick_map_fx()
         screen.fill(self.bg_color)
         self._draw_regions(screen)
         self._draw_timeline_panel(screen, font, small_font)
@@ -939,6 +1138,12 @@ class RealtimeVisualizer:
                 lx, ly = self._w2s(agent.x, agent.y)
                 screen.blit(text, (lx + 8, ly - 26))
 
+        wr_fx = self._world_rect()
+        clip_fx = screen.get_clip()
+        screen.set_clip(wr_fx)
+        self._draw_map_fx_world(screen)
+        screen.set_clip(clip_fx)
+
         if self.show_region_overlay:
             wr = self._world_rect()
             clip_leg = screen.get_clip()
@@ -962,6 +1167,8 @@ class RealtimeVisualizer:
         self._draw_river_world(screen)
         self._draw_ocean_and_seas_world(screen)
         self._draw_region_fields(screen)
+        self._draw_border_tension_world(screen)
+        self._draw_trade_routes_world(screen)
         self._draw_world_vegetation(screen)
         mmap = self._map_world_rect()
         self._draw_reeds_and_shore_plants(screen, mmap)
@@ -992,10 +1199,15 @@ class RealtimeVisualizer:
             f"Cities: {len(self.engine.city_summaries)} {self._city_line_summary()}",
             f"Politics: {self._politics_summary()}",
             f"Factions: {self._faction_summary_line()}   Preset: {self.engine.config.conflict.preset}   World aggression: {self.engine._world_aggression():.2f}",
-            f"Trade routes: {len(getattr(self.engine, 'region_trade_links', []))}   Regions: {self.engine.config.demographics.region_count}",
+            f"Trade routes: {len(getattr(self.engine, 'region_trade_links', []))}   Regions: {self._region_count()}"
+            + (
+                f"   Selected R{self.selected_region_id}"
+                if self.selected_region_id is not None
+                else "   (click map: govern a region)"
+            ),
             f"Wildlife: {getattr(self.engine, 'wildlife_index', 1.0):.2f}   Livestock: {self.engine.total_livestock():.0f}   Farms (fields): {sum(1 for s in self.engine.world_structures if s.get('kind') == 'field')}",
             f"Avg health: {avg_health:.2f}   Food: {self.engine.config.environment.base_food_per_capita:.2f}   Birth rate: {self.engine.config.demographics.base_birth_rate:.2f}   Infection rate: {pathogen_rate:.2f}",
-            "Map: WASD pan · wheel (Ctrl+zoom) · +/- keys · 0=reset · middle-drag | SPACE ,/. L ESC",
+            "Map: WASD pan · wheel (Ctrl+zoom) · +/- · 0=reset · middle-drag | SPACE ,/. L | region: govern panel | hover border: diplomacy",
         ]
         line_h = max(16, min(22, self.height // 48))
         plate_h = len(lines) * line_h + 16
@@ -1531,6 +1743,57 @@ class RealtimeVisualizer:
         z = max(0.001, self.zoom)
         return max(18.0, float(scale) * 2.7) / z
 
+    @staticmethod
+    def _dist_point_segment(
+        px: float, py: float, x1: float, y1: float, x2: float, y2: float
+    ) -> float:
+        dx, dy = x2 - x1, y2 - y1
+        L2 = dx * dx + dy * dy
+        if L2 < 1e-12:
+            return math.hypot(px - x1, py - y1)
+        t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / L2))
+        qx, qy = x1 + t * dx, y1 + t * dy
+        return math.hypot(px - qx, py - qy)
+
+    def _pick_adjacent_border_at_world(self, wx: float, wy: float) -> tuple[int, int] | None:
+        thresh = 28.0 / max(0.001, self.zoom)
+        best: tuple[int, int] | None = None
+        best_d = thresh
+        n = self._region_count()
+        for a in range(max(0, n - 1)):
+            b = a + 1
+            ca, cb = self._pair_world_centers(a, b)
+            d = self._dist_point_segment(wx, wy, ca[0], ca[1], cb[0], cb[1])
+            if d < best_d:
+                best_d = d
+                best = (a, b)
+        return best
+
+    def _border_tooltip_lines(self, ra: int, rb: int) -> list[str]:
+        eng = self.engine
+        pair = eng._ordered_region_pair(ra, rb)
+        na = eng._region_name(ra)
+        nb = eng._region_name(rb)
+        tens = float(eng.world_dynamics.border_tension.get(pair, 0.0))
+        gw = float(eng.world_dynamics.border_trade_goodwill.get(pair, 0.0))
+        trade = pair in eng.region_trade_links
+        tf = eng.player_trade_force.get(pair, 0)
+        tlab = {0: "auto", 1: "player: open", -1: "player: closed"}[tf]
+        lyw = int(eng.world_dynamics.last_border_war_year.get(pair, 0) or 0)
+        alive = [p for p in eng.population if p.alive]
+        pop_a = sum(1 for p in alive if p.region_id == ra)
+        pop_b = sum(1 for p in alive if p.region_id == rb)
+        lines = [
+            f"Border: {na} ↔ {nb}",
+            f"Tension {tens:.2f} · trade goodwill {gw:.2f}",
+            f"Trade route: {'yes' if trade else 'no'} · route policy: {tlab}",
+            f"Populations: R{ra}={pop_a}  R{rb}={pop_b}",
+        ]
+        if lyw > 0:
+            lines.append(f"Last border war (this pair): sim year {lyw}")
+        lines.append("Annex: govern panel — Annex → merges east into selected region.")
+        return lines
+
     def _animal_hover_radius(self, a: VisualAnimal) -> float:
         z = max(0.001, self.zoom)
         return float({"bird": 12.0, "deer": 17.0, "sheep": 14.0, "cattle": 22.0}.get(a.species, 14.0)) / z
@@ -1577,6 +1840,9 @@ class RealtimeVisualizer:
                 best_s = s
         if best_s is not None:
             return ("structure", best_s)
+        border = self._pick_adjacent_border_at_world(wx, wy)
+        if border is not None:
+            return ("border", border)
         return None
 
     def _hover_pick(self):
@@ -1787,6 +2053,9 @@ class RealtimeVisualizer:
             lines = self._person_tooltip_lines(obj)
         elif kind == "animal":
             lines = self._animal_tooltip_lines(obj)
+        elif kind == "border":
+            ra, rb = obj
+            lines = self._border_tooltip_lines(ra, rb)
         else:
             lines = self._structure_tooltip_lines(obj)
 
@@ -1813,6 +2082,206 @@ class RealtimeVisualizer:
 
     def _push_message(self, msg: str) -> None:
         self.recent_messages.append((msg, 240))
+
+    _MAP_FX_TTL: dict[str, int] = {
+        "border_war": 1080,
+        "trade_route": 480,
+        "siege_strike": 420,
+        "siege_toggle": 360,
+        "civil_war": 780,
+        "alliance": 900,
+        "disaster": 600,
+        "war_tension": 300,
+        "annex": 780,
+    }
+
+    def _push_map_fx(self, raw: dict[str, object]) -> None:
+        k = str(raw.get("kind", ""))
+        ttl = int(self._MAP_FX_TTL.get(k, 520))
+        d = dict(raw)
+        d["ttl"] = ttl
+        d["birth"] = int(self.frame_counter)
+        self._map_fx.append(d)
+
+    def _ingest_engine_map_fx(self) -> None:
+        for raw in self.engine.map_visual_events:
+            self._push_map_fx(dict(raw))
+
+    def _tick_map_fx(self) -> None:
+        for fx in self._map_fx:
+            fx["ttl"] = int(fx["ttl"]) - 1
+        self._map_fx = [fx for fx in self._map_fx if int(fx["ttl"]) > 0]
+
+    def _pair_world_centers(self, ra: int, rb: int) -> tuple[tuple[float, float], tuple[float, float]]:
+        a = self._region_rect(ra).center
+        b = self._region_rect(rb).center
+        return (float(a[0]), float(a[1])), (float(b[0]), float(b[1]))
+
+    def _draw_map_fx_world(self, screen: pygame.Surface) -> None:
+        z = max(0.001, self.zoom)
+        n_reg = self._region_count()
+        for fx in self._map_fx:
+            k = str(fx.get("kind", ""))
+            birth = int(fx.get("birth", self.frame_counter))
+            age = self.frame_counter - birth
+            if k in ("border_war", "war_tension", "trade_route", "alliance"):
+                ra = int(fx["ra"])
+                rb = int(fx["rb"])
+                ca, cb = self._pair_world_centers(ra, rb)
+                if not self._world_on_screen(ca[0], ca[1], 120) and not self._world_on_screen(cb[0], cb[1], 120):
+                    continue
+                sa = self._w2s(ca[0], ca[1])
+                sb = self._w2s(cb[0], cb[1])
+                if k == "border_war":
+                    pulse = 0.45 + 0.55 * math.sin(age * 0.17)
+                    inten = max(0.15, min(1.0, float(fx.get("intensity", 0.5))))
+                    jx = math.sin(age * 0.11) * 5 * z
+                    jy = math.cos(age * 0.13) * 4 * z
+                    w_main = max(3, int((5 + 9 * pulse * inten) * z))
+                    pygame.draw.line(
+                        screen,
+                        (220, 72, 38),
+                        (int(sa[0] + jx), int(sa[1] + jy)),
+                        (int(sb[0] - jx), int(sb[1] - jy)),
+                        w_main,
+                    )
+                    pygame.draw.line(screen, (255, 210, 92), sa, sb, max(1, w_main // 3))
+                    for i in range(20 + int(14 * inten)):
+                        t = (i * 0.061 + age * 0.038) % 1.0
+                        ox = math.sin(age * 0.14 + i * 0.7) * 16 * inten
+                        oy = math.cos(age * 0.12 + i * 0.5) * 14 * inten
+                        wx = ca[0] + (cb[0] - ca[0]) * t + ox
+                        wy = ca[1] + (cb[1] - ca[1]) * t + oy
+                        px, py = self._w2s(wx, wy)
+                        rad = max(1, int((3.5 * (1.0 - t * 0.65) * inten + 1) * z))
+                        pygame.draw.circle(screen, (255, 160 + i % 80, 60), (px, py), rad)
+                elif k == "war_tension":
+                    w = max(2, int(3 * z))
+                    c = (255, 140 + (age * 3) % 60, 50)
+                    pygame.draw.line(screen, c, sa, sb, w)
+                    mx, my = (sa[0] + sb[0]) // 2, (sa[1] + sb[1]) // 2
+                    pygame.draw.circle(screen, (255, 200, 120), (int(mx), int(my)), max(3, int(6 * z)), 1)
+                elif k == "trade_route":
+                    op = bool(fx.get("open", True))
+                    if op:
+                        c0, c1 = (72, 188, 118), (190, 240, 200)
+                        w = max(2, int((3 + 2 * math.sin(age * 0.2)) * z))
+                        pygame.draw.line(screen, c0, sa, sb, w + 2)
+                        pygame.draw.line(screen, c1, sa, sb, w)
+                    else:
+                        for off in (-3, 0, 3):
+                            pygame.draw.line(
+                                screen,
+                                (140, 62, 58),
+                                (sa[0] + off, sa[1]),
+                                (sb[0] + off, sb[1]),
+                                max(1, int(2 * z)),
+                            )
+                        cx, cy = (sa[0] + sb[0]) // 2, (sa[1] + sb[1]) // 2
+                        arm = max(6, int(10 * z))
+                        pygame.draw.line(screen, (90, 40, 40), (cx - arm, cy - arm), (cx + arm, cy + arm), 2)
+                        pygame.draw.line(screen, (90, 40, 40), (cx - arm, cy + arm), (cx + arm, cy - arm), 2)
+                elif k == "alliance":
+                    pulse = 0.5 + 0.5 * math.sin(age * 0.14)
+                    w = max(2, int((4 + 3 * pulse) * z))
+                    pygame.draw.line(screen, (36, 110, 140), sa, sb, w + max(3, int(4 * z)))
+                    pygame.draw.line(screen, (140, 232, 252), sa, sb, w)
+                    pygame.draw.circle(screen, (200, 248, 255), sa, max(2, int(5 * z)), 1)
+                    pygame.draw.circle(screen, (200, 248, 255), sb, max(2, int(5 * z)), 1)
+            elif k == "civil_war":
+                rr = random.Random(birth // 4 + age // 2 + 9029)
+                for _ in range(9):
+                    r1 = rr.randint(0, n_reg - 1)
+                    r2 = rr.randint(0, n_reg - 1)
+                    rect1 = self._region_rect(r1)
+                    rect2 = self._region_rect(r2)
+                    x1 = rr.uniform(rect1.left + 8, rect1.right - 8)
+                    y1 = rr.uniform(rect1.top + 8, rect1.bottom - 8)
+                    x2 = rr.uniform(rect2.left + 8, rect2.right - 8)
+                    y2 = rr.uniform(rect2.top + 8, rect2.bottom - 8)
+                    if not self._world_on_screen(x1, y1, 40) and not self._world_on_screen(x2, y2, 40):
+                        continue
+                    p1 = self._w2s(x1, y1)
+                    p2 = self._w2s(x2, y2)
+                    br = rr.randint(0, 35)
+                    pygame.draw.line(screen, (220, 60 + br, 35), p1, p2, max(1, int(2 * z)))
+                veil_a = int(22 + 18 * math.sin(age * 0.07))
+                mw, mh = self._map_dimensions()
+                vx0, vy0 = self._w2s(0, self._map_hud_top(mh))
+                vx1, vy1 = self._w2s(float(mw), float(mh - self._ocean_band_height(self._map_world_rect()) - 20))
+                vr = pygame.Rect(
+                    min(vx0, vx1),
+                    min(vy0, vy1),
+                    max(1, abs(vx1 - vx0)),
+                    max(1, abs(vy1 - vy0)),
+                )
+                v = pygame.Surface((vr.w, vr.h), pygame.SRCALPHA)
+                v.fill((120, 20, 20, min(55, veil_a)))
+                screen.blit(v, vr.topleft)
+            elif k == "disaster":
+                rid = int(fx["region"])
+                rect = self._region_rect(rid)
+                if not self._world_on_screen(rect.centerx, rect.centery, 80):
+                    continue
+                cx, cy = self._w2s(float(rect.centerx), float(rect.top + rect.height * 0.28))
+                rot = age * 0.04
+                for i in range(5):
+                    ang = rot + i * 1.2
+                    rad = max(12, int((18 + i * 7) * z))
+                    ox = int(math.cos(ang) * rad * 0.35)
+                    oy = int(math.sin(ang) * rad * 0.25)
+                    pygame.draw.ellipse(
+                        screen,
+                        (88 + i * 8, 72 - i * 6, 52),
+                        pygame.Rect(cx - rad // 2 + ox, cy - rad // 3 + oy, rad, rad // 2 + 4),
+                    )
+                pygame.draw.circle(screen, (60, 48, 40), (cx, cy), max(3, int(5 * z)))
+            elif k == "annex":
+                kr = int(fx.get("keeper", 0))
+                if kr < 0 or kr >= self._region_count():
+                    continue
+                rect = self._region_rect(kr)
+                if not self._world_on_screen(rect.centerx, rect.centery, 120):
+                    continue
+                cx, cy = self._w2s(float(rect.centerx), float(rect.centery))
+                pulse = 0.5 + 0.5 * math.sin(age * 0.11)
+                for i in range(5):
+                    rad = max(6, int((8 + i * 13 + pulse * 8) * z))
+                    pygame.draw.circle(
+                        screen,
+                        (255, 214, 100 + i * 10),
+                        (int(cx), int(cy)),
+                        rad,
+                        max(1, int(2 * z)),
+                    )
+            elif k in ("siege_strike", "siege_toggle"):
+                defender = int(fx.get("defender", fx.get("rb", 0)))
+                rect = self._region_rect(defender)
+                if not self._world_on_screen(rect.centerx, rect.centery, 100):
+                    continue
+                cx, cy = self._w2s(float(rect.centerx), float(rect.centery))
+                siege_on = bool(fx.get("on", True)) if k == "siege_toggle" else True
+                rings = 3 if k == "siege_strike" else (3 if siege_on else 2)
+                for i in range(rings):
+                    rad = int((12 + i * 14 + (age % 20) * 0.8) * z)
+                    if k == "siege_toggle" and not siege_on:
+                        c = (100, 140, 180)
+                    else:
+                        c = (240, 120 - i * 25, 50)
+                    pygame.draw.circle(
+                        screen,
+                        c,
+                        (int(cx), int(cy)),
+                        max(1, rad),
+                        max(1, int(2 * z)),
+                    )
+                sparks = 10 if k == "siege_strike" or siege_on else 4
+                for j in range(sparks):
+                    ang = j * 0.785 + age * 0.12
+                    dist = max(8, int((20 + j * 5) * z))
+                    px = int(cx + math.cos(ang) * dist)
+                    py = int(cy + math.sin(ang) * dist)
+                    pygame.draw.circle(screen, (255, 200, 100), (px, py), max(1, int(2 * z)))
 
     def _build_hills(self) -> list[list[tuple[int, int]]]:
         mw, mh = self._map_dimensions()
@@ -1884,7 +2353,7 @@ class RealtimeVisualizer:
 
     def _draw_region_fields(self, screen: pygame.Surface) -> None:
         z = max(0.001, self.zoom)
-        for region_id in range(self.engine.config.demographics.region_count):
+        for region_id in range(self._region_count()):
             rect = self._region_rect(region_id)
             if self.show_region_overlay:
                 base = self._region_distinct_color(region_id)
@@ -1900,10 +2369,95 @@ class RealtimeVisualizer:
             tint_draw = pygame.transform.smoothscale(tint, (zw, zh)) if (zw, zh) != tint.get_size() else tint
             sl, st = self._w2s(rect.left, rect.top)
             screen.blit(tint_draw, (sl, st))
+            fam = float(self.engine._player_rc(region_id).get("famine", 0.0))
+            if fam > 0.05:
+                drought = pygame.Surface((zw, zh), pygame.SRCALPHA)
+                a = min(160, int(35 + fam * 130))
+                drought.fill((112, 72, 38, a))
+                screen.blit(drought, (sl, st))
             edge_mix = (28, 32, 38) if self.show_region_overlay else (52, 58, 54)
             edge_w = max(2, self._zi(2)) if self.show_region_overlay else max(1, self._zi(1))
             edge = self._lerp_rgb(base, edge_mix, 0.38 if self.show_region_overlay else 0.42)
-            pygame.draw.rect(screen, edge, pygame.Rect(sl, st, zw, zh), edge_w)
+            r_screen = pygame.Rect(sl, st, zw, zh)
+            pygame.draw.rect(screen, edge, r_screen, edge_w)
+            if self.selected_region_id == region_id:
+                pygame.draw.rect(screen, (238, 196, 64), r_screen, max(2, self._zi(3)))
+            band = float(self.engine._player_rc(region_id).get("bandits", 0.0))
+            if band > 0.12 and self._world_on_screen(rect.centerx, rect.centery, 120):
+                n_tents = max(1, min(6, int(1.5 + band * 5)))
+                for ti in range(n_tents):
+                    u = (region_id * 17 + ti * 13 + self.year) % 997 / 997.0
+                    v = (region_id * 31 + ti * 7) % 991 / 991.0
+                    tx = rect.left + 0.14 * rect.width + u * 0.72 * rect.width
+                    ty = rect.top + 0.22 * rect.height + v * 0.55 * rect.height
+                    if not self._world_on_screen(tx, ty, 40):
+                        continue
+                    cx, cy = self._w2s(tx, ty)
+                    tw = max(3, self._zi(7))
+                    col = (112, 82, 58) if ti % 2 == 0 else (98, 74, 52)
+                    pygame.draw.polygon(
+                        screen,
+                        col,
+                        [(cx - tw, cy + self._zi(3)), (cx, cy - tw), (cx + tw, cy + self._zi(3))],
+                    )
+            if region_id in self.engine.player_siege and self._world_on_screen(rect.centerx, rect.top + 20, 80):
+                ax, ay = self._w2s(rect.left + rect.width * 0.5, rect.top + self._zi(18))
+                pygame.draw.circle(screen, (180, 52, 48), (ax, ay), max(4, self._zi(10)), max(2, self._zi(2)))
+
+    def _draw_trade_routes_world(self, screen: pygame.Surface) -> None:
+        eng = self.engine
+        n = len(eng.environments)
+        for a in range(max(0, n - 1)):
+            b = a + 1
+            pair = (a, b) if a < b else (b, a)
+            if pair not in eng.region_trade_links:
+                continue
+            ra = self._region_rect(a)
+            rb = self._region_rect(b)
+            ca = (float(ra.centerx), float(ra.centery))
+            cb = (float(rb.centerx), float(rb.centery))
+            if not self._world_on_screen(ca[0], ca[1], 100) and not self._world_on_screen(cb[0], cb[1], 100):
+                continue
+            sa = self._w2s(ca[0], ca[1])
+            sb = self._w2s(cb[0], cb[1])
+            tf = eng.player_trade_force.get(pair, 0)
+            if tf == 1:
+                col = (238, 200, 88)
+            elif tf == -1:
+                col = (120, 108, 82)
+            else:
+                col = (210, 180, 92)
+            pygame.draw.line(screen, col, sa, sb, max(1, self._zi(3)))
+
+    def _draw_border_tension_world(self, screen: pygame.Surface) -> None:
+        eng = self.engine
+        n = len(eng.environments)
+        wd = eng.world_dynamics
+        z = max(0.001, self.zoom)
+        for a in range(max(0, n - 1)):
+            b = a + 1
+            key = (a, b) if a < b else (b, a)
+            t = float(wd.border_tension.get(key, 0.0))
+            if t < 0.22:
+                continue
+            ra = self._region_rect(a)
+            rb = self._region_rect(b)
+            ca = (float(ra.centerx), float(ra.centery))
+            cb = (float(rb.centerx), float(rb.centery))
+            if not self._world_on_screen(ca[0], ca[1], 100) and not self._world_on_screen(cb[0], cb[1], 100):
+                continue
+            sa = self._w2s(ca[0], ca[1])
+            sb = self._w2s(cb[0], cb[1])
+            u = max(0.0, min(1.0, (t - 0.22) / 0.78))
+            flicker = 0.85 + 0.15 * math.sin(self.frame_counter * 0.11 + a * 0.7)
+            col = (
+                int(90 + 130 * u * flicker),
+                int(35 + 25 * u),
+                int(28 + 20 * u),
+            )
+            w = max(1, int((1.0 + 4.5 * u * u) * z))
+            off = max(2, int(5 * z))
+            pygame.draw.line(screen, col, (sa[0], sa[1] + off), (sb[0], sb[1] + off), w)
 
     def _draw_ocean_and_seas(self, screen: pygame.Surface, world_rect: pygame.Rect) -> None:
         oh = self._ocean_band_height(world_rect)
@@ -2144,7 +2698,7 @@ class RealtimeVisualizer:
             pygame.draw.line(screen, (98, 128, 62), (x - w // 2 + max(1, self._zi(2)), y), (x + w // 2 - max(1, self._zi(2)), y), max(1, self._zi(1)))
 
     def _draw_scattered_homesteads(self, screen: pygame.Surface) -> None:
-        by_region: dict[int, int] = {i: 0 for i in range(self.engine.config.demographics.region_count)}
+        by_region: dict[int, int] = {i: 0 for i in range(self._region_count())}
         for p in self.engine.population:
             if p.alive:
                 by_region[p.region_id] = by_region.get(p.region_id, 0) + 1
@@ -2169,7 +2723,7 @@ class RealtimeVisualizer:
 
     def _draw_livestock_enclosures(self, screen: pygame.Surface) -> None:
         lv_map = getattr(self.engine, "livestock_by_region", {})
-        for region_id in range(self.engine.config.demographics.region_count):
+        for region_id in range(self._region_count()):
             lv = float(lv_map.get(region_id, 0.0))
             if lv < 6.0:
                 continue
@@ -2189,7 +2743,7 @@ class RealtimeVisualizer:
         wr = self._map_world_rect()
         wi = float(getattr(self.engine, "wildlife_index", 1.0))
         total_lv = self.engine.total_livestock()
-        n_regions = max(1, self.engine.config.demographics.region_count)
+        n_regions = self._region_count()
         n_bird = int(8 + 16 * min(1.5, wi))
         n_deer = int(2 + int(7 * min(1.3, wi) * 0.55))
         n_sheep = min(42, int(total_lv * 0.14 + 2))
@@ -2285,7 +2839,7 @@ class RealtimeVisualizer:
                     a.y = wr.top + wr.height * 0.62
                     a.vy *= -0.85
             else:
-                rect = self._region_rect(max(0, min(self.engine.config.demographics.region_count - 1, a.region_id)))
+                rect = self._region_rect(max(0, min(self._region_count() - 1, a.region_id)))
                 pad = 10.0
                 if a.x < rect.left + pad:
                     a.x = rect.left + pad
@@ -2486,7 +3040,7 @@ class RealtimeVisualizer:
         small_font: pygame.font.Font,
     ) -> None:
         panel_rect = pygame.Rect(0, 0, self.left_panel_width, self.height)
-        split = int(panel_rect.height * 0.35)
+        split = int(panel_rect.height * 0.28)
         pygame.draw.rect(screen, (34, 36, 44), pygame.Rect(0, 0, panel_rect.width, split))
         pygame.draw.rect(screen, (22, 24, 30), pygame.Rect(0, split, panel_rect.width, panel_rect.height - split))
         pygame.draw.rect(screen, self.ui_accent, (panel_rect.right - 4, 0, 4, panel_rect.height))
@@ -2504,7 +3058,7 @@ class RealtimeVisualizer:
         )
         screen.blit(city_header, (18, 68))
         y_city = 88
-        for city in self.engine.city_summaries[:3]:
+        for city in self.engine.city_summaries[:2]:
             pol = city.get("polity", "city")
             line = f"{city['name']} [{pol}] ({city['culture']}/{city['religion']})"
             txt = small_font.render(line[:42], True, (172, 184, 208))
@@ -2516,13 +3070,100 @@ class RealtimeVisualizer:
             screen.blit(msg, (18, 192))
         else:
             y = 192
-            for item in self.timeline_cache[:12]:
+            for item in self.timeline_cache[:5]:
                 bullet = small_font.render(f"· {item}", True, (208, 212, 222))
                 screen.blit(bullet, (18, y))
                 y += 22
 
-        ledger_h = min(300, max(100, int(self.height * 0.28)))
-        ledger_top = max(120, self.height - ledger_h - max(10, self.height // 80))
+        ledger_h = min(280, max(96, int(self.height * 0.24)))
+        min_govern_h = 286
+        ledger_top = self.height - ledger_h - max(8, self.height // 90)
+        if ledger_top < split + min_govern_h:
+            ledger_top = split + min_govern_h
+            ledger_h = max(72, self.height - ledger_top - 8)
+        self._govern_panel_y0 = split + 4
+        self._govern_panel_y1 = ledger_top - 4
+        self._layout_region_govern(small_font)
+        gp = pygame.Rect(
+            8,
+            self._govern_panel_y0,
+            max(40, self.left_panel_width - 16),
+            max(0, self._govern_panel_y1 - self._govern_panel_y0),
+        )
+        if gp.height > 24:
+            plate = pygame.Surface((gp.w, gp.h), pygame.SRCALPHA)
+            plate.fill((32, 36, 44, 228))
+            screen.blit(plate, gp.topleft)
+            pygame.draw.rect(screen, (78, 96, 122), gp, 1, border_radius=6)
+            gy = gp.top + 8
+            hdr = small_font.render("Govern region (map click)", True, (210, 214, 224))
+            screen.blit(hdr, (gp.left + 8, gy))
+            gy += 20
+            nc = self._region_count()
+            if self.selected_region_id is not None and self.selected_region_id >= nc:
+                self.selected_region_id = None
+            rid = self.selected_region_id
+            if rid is not None:
+                nm = self.engine._region_name(rid)
+                line = small_font.render(f"R{rid} · {nm[:28]}", True, (236, 238, 244))
+                screen.blit(line, (gp.left + 8, gy))
+                gy += 18
+                gov_o = self.engine.player_government_override.get(rid, "auto")
+                nb = self._neighbor_right_id(rid)
+                if nb is not None:
+                    pair = self.engine._ordered_region_pair(rid, nb)
+                    tf = self.engine.player_trade_force.get(pair, 0)
+                    tr_lab = {0: "auto", 1: "open", -1: "closed"}[tf]
+                    siege_on = self.engine.player_siege.get(nb) == rid
+                    sub = small_font.render(
+                        f"Gov lock: {gov_o}  ·  trade R{nb}: {tr_lab}  ·  siege→: {'on' if siege_on else 'off'}",
+                        True,
+                        (150, 162, 178),
+                    )
+                else:
+                    sub = small_font.render(f"Gov lock: {gov_o}  ·  no eastern neighbor", True, (150, 162, 178))
+                screen.blit(sub, (gp.left + 8, gy))
+                gy += 16
+                label_x = gp.left + 8
+                for slider in self.region_god_sliders:
+                    if slider.rect.top <= 0:
+                        continue
+                    lab = small_font.render(slider.label, True, (188, 194, 206))
+                    screen.blit(lab, (label_x, slider.rect.top - 1))
+                    pygame.draw.rect(screen, (48, 52, 60), slider.rect, border_radius=6)
+                    fill_w = int(slider.rect.width * slider.normalized())
+                    if fill_w > 0:
+                        fr = pygame.Rect(slider.rect.left, slider.rect.top, fill_w, slider.rect.height)
+                        pygame.draw.rect(screen, (52, 128, 188), fr, border_radius=6)
+                    hx = slider.rect.left + fill_w
+                    handle = pygame.Rect(hx - 5, slider.rect.top - 3, 10, slider.rect.height + 6)
+                    pygame.draw.rect(screen, (232, 236, 244), handle, border_radius=4)
+                    val = small_font.render(self._slider_value_display(slider), True, (140, 148, 160))
+                    screen.blit(val, (slider.rect.right - val.get_width(), slider.rect.top - 1))
+                for action, rect in self._god_btn_rects:
+                    pygame.draw.rect(screen, (48, 56, 68), rect, border_radius=4)
+                    pygame.draw.rect(screen, (96, 110, 132), rect, 1, border_radius=4)
+                    if action == "gov":
+                        txt = small_font.render("Government →", True, (220, 224, 232))
+                    elif action == "trade":
+                        txt = small_font.render("Trade route →", True, (220, 224, 232))
+                    elif action == "war":
+                        txt = small_font.render("War pressure →", True, (220, 224, 232))
+                    elif action == "siege":
+                        txt = small_font.render("Army siege →", True, (220, 224, 232))
+                    elif action == "clear_sieges":
+                        txt = small_font.render("Clear sieges", True, (220, 224, 232))
+                    elif action == "annex":
+                        txt = small_font.render("Annex east → (merge)", True, (238, 224, 200))
+                    else:
+                        txt = small_font.render(action, True, (220, 224, 232))
+                    screen.blit(txt, (rect.left + 6, rect.centery - txt.get_height() // 2))
+            else:
+                hint = small_font.render("Click a land region on the map.", True, (140, 148, 162))
+                screen.blit(hint, (gp.left + 8, gy))
+                hint2 = small_font.render("Hover region borders for trade & tension. Annex merges east.", True, (120, 128, 142))
+                screen.blit(hint2, (gp.left + 8, gy + 18))
+
         ledger_rect = pygame.Rect(10, ledger_top, max(40, self.left_panel_width - 20), ledger_h)
         pygame.draw.rect(screen, (30, 33, 40), ledger_rect, border_radius=8)
         pygame.draw.rect(screen, (62, 70, 86), ledger_rect, 1, border_radius=8)

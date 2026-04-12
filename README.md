@@ -52,7 +52,7 @@ Most of the world still runs on **equations, thresholds, and config**:
 
 ## Demo
 
-![Demo](Demo.gif)
+![Demo](Demo.mp4)
 
 ## What The Simulation Includes
 
