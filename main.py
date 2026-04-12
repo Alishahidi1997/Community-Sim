@@ -7,24 +7,25 @@ from population_sim.config import (
     BehaviorConfig,
     ContactNetworkConfig,
     ConflictConfig,
-    CognitionConfig,
     DemographicsConfig,
     EnvironmentConfig,
     MigrationConfig,
     PathogenConfig,
     PoliticsConfig,
+    CognitionConfig,
     SimulationConfig,
     VaccinationPolicyConfig,
 )
 from population_sim.simulation import SimulationEngine
-from population_sim.visualize import plot_stats
+from population_sim.visualize import plot_stats, plot_supplementary_charts
 
+# Batch outputs always go here (not relative to the shell working directory).
 _PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def build_default_config() -> SimulationConfig:
     return SimulationConfig(
-        years=1000,
+        years=200,
         random_seed=7,
         demographics=DemographicsConfig(
             initial_population=90,
@@ -183,6 +184,7 @@ def print_event_summary(engine: SimulationEngine, max_items: int = 60) -> None:
 
 def main() -> None:
     config = build_default_config()
+    # Headless batch: turn off learned goal MLP (NumPy each year) unless SIM_FULL_COGNITION=1.
     if os.environ.get("SIM_FULL_COGNITION", "").lower() not in ("1", "true", "yes"):
         config = replace(
             config,
@@ -203,6 +205,7 @@ def main() -> None:
 
     stats.export_csv(csv_path)
     plot_stats(stats, chart_path)
+    extra_charts = plot_supplementary_charts(stats, output_dir)
     rows = stats.to_rows()
     print_decadal_logs(rows, step=25, max_year=config.years)
     print_event_summary(engine)
@@ -210,6 +213,8 @@ def main() -> None:
     print_final_summary(rows)
     print(f"CSV saved to: {csv_path.resolve()}")
     print(f"Chart saved to: {chart_path.resolve()}")
+    for p in extra_charts:
+        print(f"Chart saved to: {p.resolve()}")
 
 
 if __name__ == "__main__":
