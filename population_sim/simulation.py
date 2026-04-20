@@ -104,6 +104,8 @@ class SimulationEngine:
         self.food_system_bonus = 0.0
         self.mortality_reduction_bonus = 0.0
         self.knowledge_boost = 0.0
+        # Cumulative science / institutions (feeds learning rates and late tech pressure).
+        self.world_science_stock = 0.0
         self.temp_food_penalty = 0.0
         self.temp_birth_penalty = 0.0
         self.temp_mortality_penalty = 0.0
@@ -140,6 +142,12 @@ class SimulationEngine:
         self.region_policies: dict[int, dict[str, float]] = {
             i: default_region_policy(0) for i in range(rc)
         }
+        # God-mode knobs (realtime UI): investment, crisis, trade route locks, sieges, government.
+        self.player_region_controls: dict[int, dict[str, float]] = {}
+        self.player_government_override: dict[int, str] = {}
+        self.player_siege: dict[int, int] = {}
+        self.player_trade_force: dict[tuple[int, int], int] = {}
+        self.map_visual_events: list[dict[str, object]] = []
         self.goal_policy: LearnedGoalMLP | None = None
         self._goal_policy_batch: list[dict[str, object]] = []
         if self.config.cognition.learned_goal_network:
@@ -328,6 +336,7 @@ class SimulationEngine:
         if not alive:
             return 0, 0, 0.0
 
+        self.map_visual_events = []
         self._sync_season(year)
         self._tick_regional_harvest_weather()
         stories.extend(self._roll_new_regional_disasters(year))
@@ -352,6 +361,25 @@ class SimulationEngine:
         diplomacy_stories, diplomacy_deaths = self._simulate_regional_diplomacy(alive, year)
         stories.extend(diplomacy_stories)
         deaths += diplomacy_deaths
+        siege_k = self._apply_player_siege_casualties(alive)
+        deaths += siege_k
+        if siege_k:
+            for defender_id, attacker_id in list(self.player_siege.items()):
+                self.map_visual_events.append(
+                    {
+                        "kind": "siege_strike",
+                        "defender": int(defender_id),
+                        "attacker": int(attacker_id),
+                    }
+                )
+        if siege_k and self.rng.random() < 0.34:
+            stories.append(
+                self._register_timeline_transition(
+                    year,
+                    "Siege attrition",
+                    f"Ongoing sieges killed {siege_k} people in encircled regions.",
+                )
+            )
         available_food = self._available_food_total(alive)
         available_food *= max(0.2, 1.0 + self.food_system_bonus - self.temp_food_penalty)
         food_ratio_by_region = self._food_ratio_by_region(alive)
@@ -366,6 +394,7 @@ class SimulationEngine:
         self._prune_social_edges(alive)
         food_rr_aid = self._food_ratio_by_region(alive)
         self._step_mutual_aid_scarcity(alive, food_rr_aid)
+        self._step_resource_competition_and_cognition(alive, food_rr_aid, civ_w)
         self._simulate_social_dynamics(alive)
         self._rebuild_social_degree_cache()
         stories.extend(self._step_economy(alive, year, civ_w))
@@ -455,6 +484,7 @@ class SimulationEngine:
         alive_now = [p for p in self.population if p.alive]
         self.contact_graph = self._build_contact_graph(alive_now)
         self._update_civilization_metrics(alive_now)
+        self._tick_world_science_accumulation(alive_now)
         transition_stories = self._update_world_structures(year, alive_now)
         stories.extend(transition_stories)
         food_for_living = self._food_ratio_by_region(alive_now)
@@ -771,6 +801,239 @@ class SimulationEngine:
             ),
         )
 
+    @staticmethod
+    def _ordered_region_pair(ra: int, rb: int) -> tuple[int, int]:
+        return (ra, rb) if ra < rb else (rb, ra)
+
+    def _player_rc(self, region_id: int) -> dict[str, float]:
+        d = self.player_region_controls.get(region_id)
+        if d is None:
+            d = {
+                "invest_army": 0.35,
+                "invest_welfare": 0.35,
+                "invest_science": 0.35,
+                "invest_trade": 0.35,
+                "famine": 0.0,
+                "bandits": 0.0,
+                "stock_index": 1.0,
+            }
+            self.player_region_controls[region_id] = d
+        return d
+
+    def _player_food_crisis_mult(self, region_id: int) -> float:
+        gs = self._player_rc(region_id)
+        famine = max(0.0, min(1.0, float(gs.get("famine", 0.0))))
+        m = 1.0 - 0.62 * famine
+        if region_id in self.player_siege:
+            m *= 0.52
+        return max(0.12, m)
+
+    def player_cycle_government(self, region_id: int) -> str:
+        order = ("auto", "chiefdom", "oligarchy", "democracy", "republic", "monarchy", "autocracy")
+        cur = self.player_government_override.get(region_id, "auto")
+        try:
+            i = order.index(cur)
+        except ValueError:
+            i = 0
+        nxt = order[(i + 1) % len(order)]
+        if nxt == "auto":
+            self.player_government_override.pop(region_id, None)
+        else:
+            self.player_government_override[region_id] = nxt
+        return nxt
+
+    def player_cycle_trade_with_neighbor(self, region_id: int, neighbor_id: int) -> int:
+        pair = self._ordered_region_pair(region_id, neighbor_id)
+        cur = self.player_trade_force.get(pair, 0)
+        nxt = {-1: 0, 0: 1, 1: -1}[cur]
+        if nxt == 0:
+            self.player_trade_force.pop(pair, None)
+        else:
+            self.player_trade_force[pair] = nxt
+        return nxt
+
+    def player_spike_war_with_neighbor(self, region_id: int, neighbor_id: int) -> None:
+        ra, rb = self._ordered_region_pair(region_id, neighbor_id)
+        key = (ra, rb)
+        self.world_dynamics.border_tension[key] = min(
+            1.0, self.world_dynamics.border_tension.get(key, 0.0) + 0.62
+        )
+
+    def player_toggle_siege_on_neighbor(self, region_id: int, defender_id: int) -> bool:
+        """region_id attacks defender_id; food and yearly attrition apply to the defender."""
+        if self.player_siege.get(defender_id) == region_id:
+            del self.player_siege[defender_id]
+            return False
+        self.player_siege[defender_id] = region_id
+        return True
+
+    def _apply_player_trade_route_locks(self) -> None:
+        for pair, tf in self.player_trade_force.items():
+            if tf == 1:
+                self.region_trade_links.add(pair)
+            elif tf == -1:
+                self.region_trade_links.discard(pair)
+
+    def _sync_region_count_config(self) -> None:
+        self.config.demographics.region_count = len(self.environments)
+
+    def _ensure_region_slot_initialized(self, rid: int) -> None:
+        """When a new region index appears (secession), fill per-region state dicts."""
+        if rid < 0 or rid >= len(self.environments):
+            return
+        self.region_treasury.setdefault(rid, 0.0)
+        if rid not in self.region_policies:
+            self.region_policies[rid] = default_region_policy(0)
+        self.region_harvest_factor.setdefault(rid, 1.0)
+        self._sync_region_count_config()
+
+    @staticmethod
+    def _remap_region_id_after_slot_delete(old: int, deleted: int) -> int | None:
+        if old == deleted:
+            return None
+        if old > deleted:
+            return old - 1
+        return old
+
+    def _remap_pair_key_dict_after_delete(self, d: dict[tuple[int, int], object], deleted: int) -> None:
+        new_d: dict[tuple[int, int], object] = {}
+        for (a, b), v in d.items():
+            ra = self._remap_region_id_after_slot_delete(a, deleted)
+            rb = self._remap_region_id_after_slot_delete(b, deleted)
+            if ra is None or rb is None or ra == rb:
+                continue
+            key = (ra, rb) if ra < rb else (rb, ra)
+            new_d[key] = v
+        d.clear()
+        d.update(new_d)
+
+    def _shift_down_int_dict_keys(self, d: dict[int, object], deleted: int) -> None:
+        new_d: dict[int, object] = {}
+        for k, v in d.items():
+            if k == deleted:
+                continue
+            nk = k - 1 if k > deleted else k
+            new_d[nk] = v
+        d.clear()
+        d.update(new_d)
+
+    def _combine_environment_into(self, keeper: int, victim: int) -> None:
+        ek = self.environments[keeper]
+        ev = self.environments[victim]
+        ek.territory_size = min(2.35, ek.territory_size + ev.territory_size * 0.88)
+        for k in ek.resource_richness:
+            ek.resource_richness[k] = min(
+                1.0,
+                ek.resource_richness[k] * 0.52 + ev.resource_richness[k] * 0.48,
+            )
+
+    def annex_eastern_neighbor(self, keeper_rid: int, year: int) -> str | None:
+        """Merge region keeper_rid+1 into keeper_rid (full annex). Returns timeline line or None."""
+        victim = keeper_rid + 1
+        if victim >= len(self.environments) or keeper_rid < 0:
+            return None
+        self._combine_environment_into(keeper_rid, victim)
+        self.region_treasury[keeper_rid] = self.region_treasury.get(keeper_rid, 0.0) + self.region_treasury.get(
+            victim, 0.0
+        )
+        self.region_policies.pop(victim, None)
+        self.region_harvest_factor.pop(victim, None)
+        self.region_disaster_years_left.pop(victim, None)
+        self.region_disaster_food_mult.pop(victim, None)
+        self.livestock_by_region.pop(victim, None)
+        self.player_government_override.pop(victim, None)
+        self.player_region_controls.pop(victim, None)
+        self.politics_by_region.pop(victim, None)
+        for s in list(self.world_structures):
+            rid = int(s.get("region_id", -1))
+            if rid != victim:
+                continue
+            if str(s.get("kind")) == "settlement":
+                self.world_structures.remove(s)
+            else:
+                s["region_id"] = keeper_rid
+        for p in self.population:
+            if p.alive and p.region_id == victim:
+                p.region_id = keeper_rid
+                p.living_context = self._sample_living_context(keeper_rid)
+                self._clamp_living_context(p)
+        self.player_siege = {
+            d: att for d, att in self.player_siege.items() if d != victim and att != victim
+        }
+        self.player_trade_force = {
+            k: v for k, v in self.player_trade_force.items() if k[0] != victim and k[1] != victim
+        }
+        del self.environments[victim]
+        self._sync_region_count_config()
+        for p in self.population:
+            if p.alive and p.region_id > victim:
+                p.region_id -= 1
+        for s in self.world_structures:
+            rid = int(s.get("region_id", -1))
+            if rid > victim:
+                s["region_id"] = rid - 1
+        self._shift_down_int_dict_keys(self.region_treasury, victim)
+        self._shift_down_int_dict_keys(self.region_policies, victim)
+        self._shift_down_int_dict_keys(self.region_harvest_factor, victim)
+        self._shift_down_int_dict_keys(self.region_disaster_years_left, victim)
+        self._shift_down_int_dict_keys(self.region_disaster_food_mult, victim)
+        self._shift_down_int_dict_keys(self.livestock_by_region, victim)
+        self._shift_down_int_dict_keys(self.player_government_override, victim)
+        self._shift_down_int_dict_keys(self.player_region_controls, victim)
+        self._shift_down_int_dict_keys(self.politics_by_region, victim)
+        self._shift_down_int_dict_keys(self._region_food_prev, victim)
+        self._shift_down_int_dict_keys(self._region_food_trend, victim)
+        remapped_siege: dict[int, int] = {}
+        for d, a in self.player_siege.items():
+            nd = d - 1 if d > victim else d
+            na = a - 1 if a > victim else a
+            if nd != na:
+                remapped_siege[nd] = na
+        self.player_siege = remapped_siege
+        remapped_tf: dict[tuple[int, int], int] = {}
+        for (x, y), tfv in self.player_trade_force.items():
+            nx = x - 1 if x > victim else x
+            ny = y - 1 if y > victim else y
+            if nx != ny:
+                remapped_tf[self._ordered_region_pair(nx, ny)] = tfv
+        self.player_trade_force = remapped_tf
+        new_links: set[tuple[int, int]] = set()
+        for p in self.region_trade_links:
+            if p[0] == victim or p[1] == victim:
+                continue
+            a = p[0] - 1 if p[0] > victim else p[0]
+            b = p[1] - 1 if p[1] > victim else p[1]
+            if a != b:
+                new_links.add(self._ordered_region_pair(a, b))
+        self.region_trade_links = new_links
+        wd = self.world_dynamics
+        for attr in ("border_tension", "border_tension_prev", "border_trade_goodwill", "last_border_war_year"):
+            self._remap_pair_key_dict_after_delete(getattr(wd, attr), victim)
+        title = f"Annexation: {self._region_name(keeper_rid)} absorbed its eastern neighbor"
+        details = "Regions merged; borders, trade links, and diplomacy state were remapped."
+        return self._register_timeline_transition(year, title, details)
+
+    def _apply_player_siege_casualties(self, alive: list[Individual]) -> int:
+        if not self.player_siege:
+            return 0
+        by_region: dict[int, list[Individual]] = defaultdict(list)
+        for p in alive:
+            if p.alive:
+                by_region[p.region_id].append(p)
+        killed = 0
+        for defender_id, _attacker in self.player_siege.items():
+            pool = by_region.get(defender_id, [])
+            if len(pool) < 2:
+                continue
+            frac = 0.004 + 0.014 * self.rng.random()
+            n = max(1, int(len(pool) * frac))
+            victims = self.rng.sample(pool, min(n, len(pool)))
+            for p in victims:
+                if p.alive:
+                    p.alive = False
+                    killed += 1
+        return killed
+
     def _available_food_total(self, alive: list[Individual]) -> float:
         by_region = defaultdict(int)
         for person in alive:
@@ -783,6 +1046,7 @@ class SimulationEngine:
             regional_food *= self._season_food_mult
             regional_food *= self._region_harvest_mult(region_id)
             regional_food *= self._region_disaster_food_mult(region_id)
+            regional_food *= self._player_food_crisis_mult(region_id)
             total += regional_food
         return total
 
@@ -804,13 +1068,17 @@ class SimulationEngine:
             available *= self._region_disaster_food_mult(region_id)
             modifier = max(0.2, 1.0 + self.food_system_bonus - self.temp_food_penalty)
             ratios[region_id] = (available * modifier) / count if count else 0.0
+        for rid in list(ratios.keys()):
+            ratios[rid] *= self._player_food_crisis_mult(rid)
         return ratios
 
     def _adjacent_region_pairs(self) -> list[tuple[int, int]]:
         n = self.config.demographics.region_count
         return [(i, i + 1) for i in range(max(0, n - 1))]
 
-    def _region_war_power(self, people: list[Individual], food_ratio: float) -> float:
+    def _region_war_power(
+        self, people: list[Individual], food_ratio: float, region_id: int | None = None
+    ) -> float:
         if not people:
             return 0.0
         n = len(people)
@@ -823,7 +1091,7 @@ class SimulationEngine:
         mount = 0.06 * r if "animal_husbandry" in self.world_inventions else 0.0
         wheel = 0.04 * r if "wheel" in self.world_inventions else 0.0
         iron = 0.05 if "iron_working" in self.world_inventions else 0.0
-        return (
+        base = (
             n
             * h
             * (0.82 + 0.18 * a)
@@ -831,6 +1099,10 @@ class SimulationEngine:
             * (0.88 + 0.24 * food_ratio)
             * (1.0 + 0.06 * min(1.0, w))
         )
+        if region_id is not None:
+            ia = max(0.0, min(1.0, float(self._player_rc(region_id).get("invest_army", 0.35))))
+            base *= 0.78 + 0.44 * ia
+        return base
 
     def _apply_border_conquest(self, winner_rid: int, loser_rid: int, intensity: float) -> str:
         env_w = self.environments[winner_rid]
@@ -884,6 +1156,24 @@ class SimulationEngine:
                 "Iron working",
                 "Harder metal improves tools and slightly reduces preventable deaths.",
             ),
+            (
+                "printing",
+                0.62,
+                "Printing",
+                "Mass-produced texts accelerate shared learning across regions.",
+            ),
+            (
+                "scientific_society",
+                0.72,
+                "Experimental methods",
+                "Repeatable inquiry turns craft into cumulative science.",
+            ),
+            (
+                "precision_tools",
+                0.8,
+                "Precision tooling",
+                "Standardized parts and gauges lift craft output and reliability.",
+            ),
         ]
 
         for key, threshold, title, blurb in invention_chain:
@@ -908,6 +1198,8 @@ class SimulationEngine:
                 continue
             headroom = min(1.6, (civ_w - threshold) * 3.2 + 0.08)
             base_p = min(0.52, 0.055 + headroom * 0.22)
+            if self.config.cognition.science_accumulation:
+                base_p *= 1.0 + 0.09 * min(1.0, self.world_science_stock / 1.55)
             inventor = self.rng.choice(pool)
             fr = food_ratio_by_region.get(inventor.region_id, 1.0)
             need_mul = invention_roll_multiplier(
@@ -938,6 +1230,15 @@ class SimulationEngine:
                 self.food_system_bonus = min(0.28, self.food_system_bonus + 0.012)
             elif key == "iron_working":
                 self.mortality_reduction_bonus = min(0.18, self.mortality_reduction_bonus + 0.009)
+            elif key == "printing":
+                self.knowledge_boost = min(0.035, self.knowledge_boost + 0.0011)
+            elif key == "scientific_society":
+                self.knowledge_boost = min(0.035, self.knowledge_boost + 0.0016)
+                if self.config.cognition.science_accumulation:
+                    self.world_science_stock = min(2.6, self.world_science_stock + 0.14)
+            elif key == "precision_tools":
+                self.food_system_bonus = min(0.28, self.food_system_bonus + 0.011)
+                self.mortality_reduction_bonus = min(0.18, self.mortality_reduction_bonus + 0.004)
 
         if "animal_husbandry" in self.world_inventions:
             for p in alive:
@@ -968,7 +1269,15 @@ class SimulationEngine:
             if not pa or not pb:
                 continue
             pair = (ra, rb) if ra < rb else (rb, ra)
-            has_trade = pair in self.region_trade_links
+            tf = self.player_trade_force.get(pair, 0)
+            if tf == 1:
+                has_trade = True
+                self.region_trade_links.add(pair)
+            elif tf == -1:
+                has_trade = False
+                self.region_trade_links.discard(pair)
+            else:
+                has_trade = pair in self.region_trade_links
 
             avg_ambition = (
                 (sum(p.ambition for p in pa) / len(pa)) + (sum(p.ambition for p in pb) / len(pb))
@@ -977,8 +1286,8 @@ class SimulationEngine:
             food_a = food_ratio_by_region.get(ra, 1.0)
             food_b = food_ratio_by_region.get(rb, 1.0)
             same_faction = self._dominant_label(pa, "faction") == self._dominant_label(pb, "faction")
-            pw_a = self._region_war_power(pa, food_a)
-            pw_b = self._region_war_power(pb, food_b)
+            pw_a = self._region_war_power(pa, food_a, ra)
+            pw_b = self._region_war_power(pb, food_b, rb)
             rs_a = self.environments[ra].resource_score()
             rs_b = self.environments[rb].resource_score()
             pr = max(pw_a, pw_b) / max(1e-6, min(pw_a, pw_b))
@@ -1003,7 +1312,9 @@ class SimulationEngine:
             )
 
             if event == "trade_open":
-                self.region_trade_links.add(pair)
+                if tf != -1:
+                    self.region_trade_links.add(pair)
+                self.map_visual_events.append({"kind": "trade_route", "ra": ra, "rb": rb, "open": True})
                 stories.append(
                     self._register_timeline_transition(
                         year,
@@ -1014,13 +1325,22 @@ class SimulationEngine:
             elif event == "war":
                 casualties = self._regional_war_casualties(pa, pb, war_intensity)
                 deaths += casualties
-                if has_trade and self.world_dynamics.global_instability > 0.52:
+                if tf != 1 and has_trade and self.world_dynamics.global_instability > 0.52:
                     self.region_trade_links.discard(pair)
                 conquest_note = ""
                 if pw_a > pw_b * 1.06:
                     conquest_note = self._apply_border_conquest(ra, rb, war_intensity)
                 elif pw_b > pw_a * 1.06:
                     conquest_note = self._apply_border_conquest(rb, ra, war_intensity)
+                self.map_visual_events.append(
+                    {
+                        "kind": "border_war",
+                        "ra": ra,
+                        "rb": rb,
+                        "intensity": float(war_intensity),
+                        "casualties": int(casualties),
+                    }
+                )
                 stories.append(
                     self._register_timeline_transition(
                         year,
@@ -1029,8 +1349,9 @@ class SimulationEngine:
                     )
                 )
             elif event == "trade_break":
-                if pair in self.region_trade_links:
+                if tf != 1 and pair in self.region_trade_links:
                     self.region_trade_links.discard(pair)
+                self.map_visual_events.append({"kind": "trade_route", "ra": ra, "rb": rb, "open": False})
                 stories.append(
                     self._register_timeline_transition(
                         year,
@@ -1047,6 +1368,7 @@ class SimulationEngine:
                 else:
                     self.region_food_adjustments[rb] = self.region_food_adjustments.get(rb, 0.0) - transfer * 0.45
                     self.region_food_adjustments[ra] = self.region_food_adjustments.get(ra, 0.0) + transfer
+        self._apply_player_trade_route_locks()
         return stories, deaths
 
     def _regional_war_casualties(self, pa: list[Individual], pb: list[Individual], intensity: float) -> int:
@@ -1340,10 +1662,21 @@ class SimulationEngine:
             fr = food_rr.get(p.region_id, 1.0)
             prod = self._individual_productivity(p)
             wm = jw if slc.enabled and p.jail_years_remaining > 0 else 1.0
-            p.wealth += 0.017 * prod * (0.55 + 0.45 * fr) * wm
+            gs = self._player_rc(p.region_id)
+            stock = max(0.38, min(2.1, float(gs.get("stock_index", 1.0))))
+            wf = max(0.0, min(1.0, float(gs.get("invest_welfare", 0.35))))
+            sci = max(0.0, min(1.0, float(gs.get("invest_science", 0.35))))
+            band = max(0.0, min(1.0, float(gs.get("bandits", 0.0))))
+            delta = 0.017 * prod * (0.55 + 0.45 * fr) * wm * (0.72 + 0.52 * stock)
+            p.wealth += delta
+            p.happiness = min(1.0, p.happiness + 0.0019 * wf * (0.55 + 0.18 * civ_w))
+            p.knowledge = min(1.0, p.knowledge + 0.0014 * sci * (0.5 + 0.5 * civ_w))
             if rent_drag > 0 and p.living_context in ("town", "city") and fr < 0.92:
                 scarcity = max(0.0, (0.92 - fr) / 0.92)
                 p.wealth *= max(0.92, 1.0 - rent_drag * scarcity * (1.15 + p.stress * 0.35))
+            if band > 0.02:
+                p.wealth *= max(0.86, 1.0 - band * (0.08 + 0.06 * self.rng.random()))
+                p.stress = min(1.0, p.stress + 0.0045 * band)
             p.wealth = min(40.0, max(0.0, p.wealth))
         id_map = {p.person_id: p for p in alive}
         for person in alive:
@@ -1406,12 +1739,16 @@ class SimulationEngine:
         apply_income_taxes(alive, medians, self.region_policies, self.region_treasury)
         rc = self.config.demographics.region_count
         rscores = [self.environments[i].resource_score() for i in range(rc)]
+        trade_boost = sum(
+            max(0.0, min(1.0, float(self._player_rc(i).get("invest_trade", 0.35)))) for i in range(rc)
+        ) / max(1, rc)
+        vol = ecfg.inter_region_trade_volume * (0.55 + 0.85 * trade_boost)
         inter_region_trade(
             self.rng,
             self.region_treasury,
             rc,
             rscores,
-            ecfg.inter_region_trade_volume,
+            vol,
             civ_w,
         )
         if wrx.enabled and wrx.treasury_corruption_enabled:
@@ -1556,6 +1893,7 @@ class SimulationEngine:
                     f"Food production reduced for about {dur} year(s).",
                 )
             )
+            self.map_visual_events.append({"kind": "disaster", "region": rid, "label": str(kind)})
         return out
 
     def _decay_regional_disaster_years(self) -> None:
@@ -1889,8 +2227,11 @@ class SimulationEngine:
             learn_scale = 0.48 + 0.58 * wiq
             rate_k = learn_scale * 0.012 * (1.0 + 0.5 * iq) * min(1.2, head_k * 1.75)
             rate_t = learn_scale * 0.01 * (1.0 + 0.45 * iq) * min(1.2, head_t * 1.75)
-            person.knowledge = min(1.0, person.knowledge + rate_k * teacher.knowledge + self.knowledge_boost)
-            person.tool_skill = min(1.0, person.tool_skill + rate_t * teacher.tool_skill)
+            sci_mult = 1.0
+            if self.config.cognition.science_accumulation:
+                sci_mult = 1.0 + 0.16 * min(1.0, self.world_science_stock / 1.65)
+            person.knowledge = min(1.0, person.knowledge + rate_k * teacher.knowledge * sci_mult + self.knowledge_boost)
+            person.tool_skill = min(1.0, person.tool_skill + rate_t * teacher.tool_skill * sci_mult)
             wrlearn = self.config.world_realism
             if (
                 wrlearn.enabled
@@ -2344,6 +2685,69 @@ class SimulationEngine:
         self.civilization_index = (avg_knowledge * 0.55) + (avg_tools * 0.45)
         cult_names = {p.belief_group for p in alive if p.belief_group.startswith("cult_")}
         self.cult_count = len(cult_names)
+
+    def _tick_world_science_accumulation(self, alive: list[Individual]) -> None:
+        if not self.config.cognition.science_accumulation:
+            return
+        if not alive:
+            return
+        civ = max(0.0, min(1.0, self.civilization_index))
+        n_inv = len(self.world_inventions)
+        n_mil = len(self.unlocked_milestones)
+        book_term = math.log1p(max(0, self.total_books_written)) * 0.00014
+        delta = 0.00022 + civ * 0.00085 + n_inv * 0.00011 + n_mil * 0.000048 + book_term
+        self.world_science_stock = min(2.6, self.world_science_stock + delta)
+
+    def _step_resource_competition_and_cognition(
+        self,
+        alive: list[Individual],
+        food_ratio_by_region: dict[int, float],
+        civ_w: float,
+    ) -> None:
+        """Couple regional food stress to aggression; drift cognitive_iq from nutrition, civ, science, conflict."""
+        cc = self.config.cognition
+        if not alive:
+            return
+        fr_vals = [float(v) for v in food_ratio_by_region.values()]
+        mean_fr = sum(fr_vals) / len(fr_vals) if fr_vals else 1.0
+        instab = max(0.0, min(1.0, self.world_dynamics.global_instability))
+        civ = max(0.0, min(1.0, civ_w))
+        wss = max(0.0, min(2.6, self.world_science_stock))
+
+        for p in alive:
+            fr = max(0.15, min(1.8, float(food_ratio_by_region.get(p.region_id, mean_fr))))
+            depriv = max(0.0, mean_fr - fr) if cc.resource_competition_aggression else 0.0
+
+            if cc.resource_competition_aggression and depriv > 0.02 and 12 <= p.age < 68:
+                p.stress = min(1.0, p.stress + 0.0009 * depriv * (0.55 + 0.45 * p.ambition))
+                p.aggression = min(1.0, p.aggression + 0.0014 * depriv * (0.45 + 0.35 * p.aggression))
+
+            if not cc.dynamic_brain_feedback:
+                continue
+            if not (5 <= p.age <= 72):
+                continue
+
+            base_nutrition = min(1.15, fr) / 1.15
+            nutrition_bonus = 0.00075 * (base_nutrition - 0.52)
+            stress_penalty = -0.0010 * p.stress
+            civ_pull = 0.0005 * civ * (0.38 + 0.62 * p.cognitive_iq)
+            science_pull = 0.00032 * min(1.4, wss / 1.5) * (0.25 + 0.75 * p.knowledge)
+            war_instab = -0.00065 * instab * (0.45 + 0.55 * p.stress)
+            cog_delta = nutrition_bonus + stress_penalty + civ_pull + science_pull + war_instab
+
+            if 0.68 <= fr < 1.02 and p.ambition > 0.52:
+                cog_delta += 0.00035 * (0.5 * p.knowledge + 0.35 * p.tool_skill)
+
+            if fr < 0.62:
+                cog_delta -= 0.0014 * (0.62 - fr)
+
+            if depriv > 0.06:
+                cog_delta -= 0.00055 * depriv
+
+            p.cognitive_iq = max(0.08, min(0.98, p.cognitive_iq + cog_delta))
+
+            if depriv > 0.07 and 14 <= p.age < 65 and self.rng.random() < 0.04 * depriv:
+                p.knowledge = min(1.0, p.knowledge + 0.001 * (0.4 + p.cognitive_iq * 0.55))
 
     def _simulate_social_dynamics(self, alive: list[Individual]) -> None:
         cfg = self._conflict_params()
@@ -3051,6 +3455,8 @@ class SimulationEngine:
             prev_leader_int = int(prev_leader) if isinstance(prev_leader, int) else None
 
             gov = self._effective_government(level, self.civilization_index, polity)
+            if level != "camp" and region_id in self.player_government_override:
+                gov = str(self.player_government_override[region_id])
             elite_n = max(2, min(len(residents), int(len(residents) * cfg.elite_fraction) + 1))
 
             for person in residents:
@@ -3393,6 +3799,7 @@ class SimulationEngine:
             self.environments.append(Environment(self.config.environment, self.rng))
             self.config.demographics.region_count = len(self.environments)
             self.region_harvest_factor[newcomer_region] = self.rng.uniform(0.86, 1.07)
+            self._ensure_region_slot_initialized(newcomer_region)
 
             split_by_faction: dict[str, list[Individual]] = defaultdict(list)
             for p in residents:
@@ -3536,6 +3943,9 @@ class SimulationEngine:
     def _craft_tools_and_books(self, alive: list[Individual], year: int) -> None:
         tcfg = self.config.technology
         craft_rate = 1.0 + 0.34 * int("advanced_tools" in self.world_inventions)
+        if self.config.cognition.science_accumulation:
+            craft_rate *= 1.0 + 0.22 * min(1.0, self.world_science_stock / 1.5)
+            craft_rate *= 1.0 + 0.12 * int("precision_tools" in self.world_inventions)
         drain_s = max(0.0, tcfg.resource_drain_scale)
         for person in alive:
             env = self.environments[person.region_id]
@@ -3554,7 +3964,11 @@ class SimulationEngine:
                     apply_tool_craft_drain(env, scale=drain_s)
 
             writing_unlocked = "writing" in self.unlocked_milestones
-            if writing_unlocked and person.knowledge > 0.6 and self.rng.random() < (0.004 + person.knowledge * 0.01):
+            book_p = 0.004 + person.knowledge * 0.01
+            if self.config.cognition.science_accumulation:
+                book_p *= 1.0 + 0.26 * min(1.0, self.world_science_stock / 1.45)
+                book_p *= 1.0 + 0.15 * int("printing" in self.world_inventions)
+            if writing_unlocked and person.knowledge > 0.6 and self.rng.random() < book_p:
                 person.books_authored += 1
                 self.total_books_written += 1
                 self.knowledge_boost = min(0.01, self.knowledge_boost + 0.00008)
@@ -3593,6 +4007,17 @@ class SimulationEngine:
                 s2 = sum(p.stress for p in by_belief[g2]) / len(by_belief[g2])
                 if self.world_dynamics.step_belief_alliance(g1, g2, a1, a2, s1, s2):
                     self.alliances.add(key)
+                    p1 = self.rng.choice(by_belief[g1])
+                    p2 = self.rng.choice(by_belief[g2])
+                    self.map_visual_events.append(
+                        {
+                            "kind": "alliance",
+                            "ra": int(p1.region_id),
+                            "rb": int(p2.region_id),
+                            "g1": str(g1)[:24],
+                            "g2": str(g2)[:24],
+                        }
+                    )
                     msg = self._register_timeline_transition(
                         year,
                         "Alliance formed",
@@ -3612,6 +4037,7 @@ class SimulationEngine:
             deaths = self._apply_direct_deaths(alive, casualty_fraction, 1)
             self.temp_birth_penalty += 0.08
             self.temp_effect_years_left = max(self.temp_effect_years_left, 3)
+            self.map_visual_events.append({"kind": "civil_war", "deaths": int(deaths)})
             msg = self._register_timeline_transition(
                 year,
                 "Resource war",
